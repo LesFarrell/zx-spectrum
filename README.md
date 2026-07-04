@@ -65,6 +65,14 @@ With no arguments, the emulator looks for `128.rom` in the working folder first 
 - `File -> Exit` closes the emulator
 - `Machine -> 48K` / `Machine -> 128K` rebuilds the emulator for that model and remembers the choice between runs
 - `Input -> Paste Text` types clipboard text through the Spectrum keyboard matrix
+- `Tools -> Assembler...` opens a small RAM patching assembler with support for common Z80 instructions plus `ORG`, `DB`, and `DW`
+- `Tools -> Debugger...` opens a separate debugger window with pause, run, single-step, register state, and memory/disassembly views
+
+## Assembler Notes
+
+- The built-in assembler is intentionally small: it supports labels and a practical subset of Z80 mnemonics, not a full macro assembler
+- Assembler writes are limited to RAM at `0x4000`-`0xFFFF`; ROM addresses are read-only in the running machine
+- A working sample is included at [examples/hello.asm](</C:/Users/Les Farrell/OneDrive/Desktop/emu/examples/hello.asm>)
 
 ## Text Entry Notes
 

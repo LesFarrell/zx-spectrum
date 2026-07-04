@@ -319,7 +319,11 @@ void spectrum_render_frame(Spectrum *spec) {
         const uint8_t *src_row = src + y * pitch;
         uint32_t *dst_row = &spec->framebuffer[y * ZX_SCREEN_WIDTH];
         for (int x = 0; x < ZX_SCREEN_WIDTH; ++x) {
-            dst_row[x] = palette[src_row[x] & 0x0F];
+            uint32_t color = palette[src_row[x] & 0x0F];
+            dst_row[x] =
+                ((color & 0x000000FFu) << 16) |
+                (color & 0x0000FF00u) |
+                ((color & 0x00FF0000u) >> 16);
         }
     }
 }
