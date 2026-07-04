@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "spectrum.h"
@@ -56,6 +57,7 @@ enum {
     APP_MENU_ASM_FILE_NEW = 2200,
     APP_MENU_ASM_FILE_LOAD = 2201,
     APP_MENU_ASM_FILE_SAVE = 2202,
+    APP_MENU_ASM_FILE_SAVE_AS = 2203,
     APP_MENU_ASM_EDIT_UNDO = 2210,
     APP_MENU_ASM_EDIT_CUT = 2211,
     APP_MENU_ASM_EDIT_COPY = 2212,
@@ -63,7 +65,8 @@ enum {
     APP_MENU_ASM_EDIT_DELETE = 2214,
     APP_MENU_ASM_EDIT_SELECT_ALL = 2215,
     APP_MENU_ASM_BUILD_ASSEMBLE = 2221,
-    APP_MENU_ASM_HELP_SHOW = 2231
+    APP_MENU_ASM_HELP_SHOW = 2231,
+    APP_TIMER_MODAL_LOOP = 3001
 };
 
 typedef struct AudioBuffer {
@@ -111,6 +114,7 @@ typedef struct DebugState {
     WNDPROC assembler_source_wndproc;
     bool assembler_dirty;
     bool assembler_ignore_change;
+    size_t assembler_error_line;
     char assembler_current_path[MAX_PATH];
     bool paused;
     bool stepping;
@@ -154,11 +158,13 @@ struct AppState {
     HWND main_hwnd;
     LARGE_INTEGER perf_freq;
     LARGE_INTEGER last_tick;
+    double emulation_accumulator_ms;
     AudioState audio;
     AutoTypeState auto_type;
     DebugState debug;
     int active_key_codes[256];
     bool running;
+    bool modal_loop_timer_active;
 };
 
 /* Stores the selected machine type and the resolved ROM paths after command
@@ -170,6 +176,20 @@ typedef struct RomSelection {
     bool has_rom_a;
     bool has_rom_b;
 } RomSelection;
+
+typedef struct AssemblerSourceLocation {
+    char path[MAX_PATH];
+    size_t line_number;
+} AssemblerSourceLocation;
+
+typedef struct AssemblerPreparedSource {
+    char *text;
+    size_t text_length;
+    size_t text_capacity;
+    AssemblerSourceLocation *locations;
+    size_t line_count;
+    size_t line_capacity;
+} AssemblerPreparedSource;
 
 static const KeyMap SPECIAL_KEY_MAP[] = {
     {VK_SHIFT, ZX_KEY_CAPS_SHIFT},
@@ -185,7 +205,12 @@ static const KeyMap SPECIAL_KEY_MAP[] = {
 static void app_show_error(const char *message);
 static bool app_start_autotype(AppState *app, const WCHAR *text);
 static bool app_parent_dir(char *path);
+static bool app_file_exists(const char *path);
+static bool app_join_path(char *out, size_t out_size, const char *left, const char *right);
 static bool app_parse_number(const char *text, int *value);
+static double app_model_frame_duration_ms(SpectrumModel model);
+static void app_tick_emulator(AppState *app);
+static void app_set_modal_loop_timer(AppState *app, HWND hwnd, bool enabled);
 static bool app_debug_has_breakpoint(const AppState *app, uint16_t address);
 static bool app_debug_toggle_breakpoint(AppState *app, uint16_t address, bool *enabled);
 static void app_debug_run_frame(AppState *app);
@@ -208,14 +233,35 @@ static bool app_assembler_load_last_path(char *out_path, size_t out_size);
 static void app_assembler_save_last_path(const char *path);
 static bool app_assembler_load_source_path(const char *path, AppState *app, char *status_buffer, size_t status_buffer_size);
 static bool app_assembler_load_source(HWND hwnd, AppState *app, char *status_buffer, size_t status_buffer_size);
+static bool app_assembler_write_source_to_path(AppState *app, const char *path, char *status_buffer, size_t status_buffer_size);
 static bool app_assembler_save_source(HWND hwnd, AppState *app, char *status_buffer, size_t status_buffer_size);
+static bool app_assembler_save_source_as(HWND hwnd, AppState *app, char *status_buffer, size_t status_buffer_size);
 static bool app_assembler_new_source(HWND hwnd, AppState *app, char *status_buffer, size_t status_buffer_size);
 static void app_assembler_apply_source(HWND hwnd, AppState *app);
 static bool app_assembler_confirm_close(HWND hwnd, AppState *app);
+static void app_assembler_free_prepared_source(AssemblerPreparedSource *prepared);
+static bool app_assembler_prepare_source(
+    AppState *app,
+    const char *source,
+    AssemblerPreparedSource *prepared,
+    char *status_buffer,
+    size_t status_buffer_size
+);
+static void app_assembler_format_location_error(
+    const AssemblerSourceLocation *location,
+    size_t fallback_line,
+    const char *message,
+    char *out_error,
+    size_t out_error_size
+);
 static bool app_assembler_find_source_org(const char *source, uint16_t *out_address);
 static HFONT app_create_monospace_font(void);
 static bool app_assembler_handle_edit_command(AppState *app, UINT command_id);
+static void app_assembler_clear_error_marker(AppState *app);
+static void app_assembler_focus_line(AppState *app, size_t line_number);
+static void app_assembler_sync_error_from_status(AppState *app, const char *status_text);
 static void app_assembler_update_line_numbers(AppState *app);
+static LRESULT CALLBACK app_assembler_gutter_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
 static LRESULT CALLBACK app_assembler_source_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
 
 /* Creates the application's menu bar so snapshot loading and other emulator
@@ -246,19 +292,19 @@ static HMENU app_create_menu(void) {
         return NULL;
     }
 
-    AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_OPEN_SNAPSHOT, "Open .z80 Snapshot...");
-    AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_RESET, "Reset");
+    AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_OPEN_SNAPSHOT, "&Open .z80 Snapshot...\tCtrl+O");
+    AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_RESET, "&Reset\tCtrl+R");
     AppendMenuA(file_menu, MF_SEPARATOR, 0, NULL);
-    AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_EXIT, "Exit");
-    AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_48K, "48K");
-    AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_128K, "128K");
-    AppendMenuA(input_menu, MF_STRING, APP_MENU_INPUT_PASTE_TEXT, "Paste Text\tCtrl+V");
-    AppendMenuA(tools_menu, MF_STRING, APP_MENU_TOOLS_ASSEMBLER, "Assembler...");
-    AppendMenuA(tools_menu, MF_STRING, APP_MENU_TOOLS_DEBUGGER, "Debugger...");
-    AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)file_menu, "File");
-    AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)machine_menu, "Machine");
-    AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)input_menu, "Input");
-    AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)tools_menu, "Tools");
+    AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_EXIT, "E&xit\tAlt+F4");
+    AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_48K, "&48K\tCtrl+1");
+    AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_128K, "&128K\tCtrl+2");
+    AppendMenuA(input_menu, MF_STRING, APP_MENU_INPUT_PASTE_TEXT, "&Paste Text\tCtrl+V");
+    AppendMenuA(tools_menu, MF_STRING, APP_MENU_TOOLS_ASSEMBLER, "&Assembler...\tCtrl+Shift+A");
+    AppendMenuA(tools_menu, MF_STRING, APP_MENU_TOOLS_DEBUGGER, "&Debugger...\tCtrl+Shift+D");
+    AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)file_menu, "&File");
+    AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)machine_menu, "&Machine");
+    AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)input_menu, "&Input");
+    AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)tools_menu, "&Tools");
     return menu_bar;
 }
 
@@ -290,9 +336,10 @@ static HMENU app_create_assembler_menu(void) {
         return NULL;
     }
 
-    AppendMenuA(file_menu, MF_STRING, APP_MENU_ASM_FILE_NEW, "New");
-    AppendMenuA(file_menu, MF_STRING, APP_MENU_ASM_FILE_LOAD, "Load...");
-    AppendMenuA(file_menu, MF_STRING, APP_MENU_ASM_FILE_SAVE, "Save...");
+    AppendMenuA(file_menu, MF_STRING, APP_MENU_ASM_FILE_NEW, "&New\tCtrl+N");
+    AppendMenuA(file_menu, MF_STRING, APP_MENU_ASM_FILE_LOAD, "&Load...\tCtrl+O");
+    AppendMenuA(file_menu, MF_STRING, APP_MENU_ASM_FILE_SAVE, "&Save\tCtrl+S");
+    AppendMenuA(file_menu, MF_STRING, APP_MENU_ASM_FILE_SAVE_AS, "Save &As...\tCtrl+Shift+S");
     AppendMenuA(edit_menu, MF_STRING, APP_MENU_ASM_EDIT_UNDO, "Undo\tCtrl+Z");
     AppendMenuA(edit_menu, MF_SEPARATOR, 0, NULL);
     AppendMenuA(edit_menu, MF_STRING, APP_MENU_ASM_EDIT_CUT, "Cut\tCtrl+X");
@@ -301,12 +348,12 @@ static HMENU app_create_assembler_menu(void) {
     AppendMenuA(edit_menu, MF_STRING, APP_MENU_ASM_EDIT_DELETE, "Delete\tDel");
     AppendMenuA(edit_menu, MF_SEPARATOR, 0, NULL);
     AppendMenuA(edit_menu, MF_STRING, APP_MENU_ASM_EDIT_SELECT_ALL, "Select All\tCtrl+A");
-    AppendMenuA(build_menu, MF_STRING, APP_MENU_ASM_BUILD_ASSEMBLE, "Assemble\tCtrl+B");
-    AppendMenuA(help_menu, MF_STRING, APP_MENU_ASM_HELP_SHOW, "Assembler Help");
+    AppendMenuA(build_menu, MF_STRING, APP_MENU_ASM_BUILD_ASSEMBLE, "&Assemble\tCtrl+B");
+    AppendMenuA(help_menu, MF_STRING, APP_MENU_ASM_HELP_SHOW, "Assembler &Help\tF1");
     AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)file_menu, "File");
     AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)edit_menu, "Edit");
     AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)build_menu, "Build");
-    AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)help_menu, "Help");
+    AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)help_menu, "&Help");
     return menu_bar;
 }
 
@@ -1042,6 +1089,8 @@ static void app_debug_callback(void *user_data, uint64_t pins) {
 /* Executes exactly one instruction from the current paused machine state and
    then refreshes both the display and debugger snapshot text. */
 static void app_debug_step_instruction(AppState *app) {
+    uint32_t step_us;
+
     if (!app->spec.machine_ready) {
         return;
     }
@@ -1053,7 +1102,8 @@ static void app_debug_step_instruction(AppState *app) {
     app->spec.machine.debug.callback.func = app_debug_callback;
     app->spec.machine.debug.callback.user_data = app;
     app->spec.machine.debug.stopped = &app->debug.stop_requested;
-    zx_exec(&app->spec.machine, 20000);
+    step_us = (uint32_t)(app_model_frame_duration_ms(app->spec.model) * 1000.0 + 0.5);
+    zx_exec(&app->spec.machine, step_us);
     app->spec.machine.debug.callback.func = NULL;
     app->spec.machine.debug.callback.user_data = NULL;
     app->spec.machine.debug.stopped = NULL;
@@ -1063,9 +1113,11 @@ static void app_debug_step_instruction(AppState *app) {
     app_debug_refresh_window(app);
 }
 
-/* Runs one normal 50 Hz execution slice with debugger breakpoints armed, then
+/* Runs one model-accurate frame slice with debugger breakpoints armed, then
    pauses and refreshes the debugger if any enabled address was reached. */
 static void app_debug_run_frame(AppState *app) {
+    uint32_t frame_us;
+
     if (!app->spec.machine_ready) {
         return;
     }
@@ -1096,7 +1148,8 @@ static void app_debug_run_frame(AppState *app) {
         app->spec.machine.debug.callback.user_data = app;
         app->spec.machine.debug.stopped = &app->debug.stop_requested;
     }
-    zx_exec(&app->spec.machine, 20000);
+    frame_us = (uint32_t)(app_model_frame_duration_ms(app->spec.model) * 1000.0 + 0.5);
+    zx_exec(&app->spec.machine, frame_us);
     if (app->debug.breakpoint_count > 0) {
         app->spec.machine.debug.callback.func = NULL;
         app->spec.machine.debug.callback.user_data = NULL;
@@ -2439,7 +2492,7 @@ static bool app_assemble_line(
 static bool app_assemble_source(
     AppState *app,
     uint16_t start_address,
-    const char *source,
+    const AssemblerPreparedSource *source,
     char *status_buffer,
     size_t status_buffer_size
 ) {
@@ -2456,7 +2509,7 @@ static bool app_assemble_source(
     ctx.address = start_address;
     ctx.pass = 1;
 
-    mutable_source = _strdup(source);
+    mutable_source = _strdup(source->text);
     if (mutable_source == NULL) {
         snprintf(status_buffer, status_buffer_size, "Out of memory.");
         return false;
@@ -2481,7 +2534,13 @@ static bool app_assemble_source(
         line_number++;
         if (!app_assemble_line(&ctx, line, status_buffer, status_buffer_size)) {
             char final_error[512];
-            snprintf(final_error, sizeof(final_error), "Line %zu: %s", line_number, status_buffer);
+            app_assembler_format_location_error(
+                line_number <= source->line_count ? &source->locations[line_number - 1] : NULL,
+                line_number,
+                status_buffer,
+                final_error,
+                sizeof(final_error)
+            );
             snprintf(status_buffer, status_buffer_size, "%s", final_error);
             success = false;
             break;
@@ -2497,7 +2556,7 @@ static bool app_assemble_source(
     ctx.total_written = 0;
     ctx.pass = 2;
 
-    mutable_source = _strdup(source);
+    mutable_source = _strdup(source->text);
     if (mutable_source == NULL) {
         snprintf(status_buffer, status_buffer_size, "Out of memory.");
         return false;
@@ -2523,7 +2582,13 @@ static bool app_assemble_source(
         line_number++;
         if (!app_assemble_line(&ctx, line, status_buffer, status_buffer_size)) {
             char final_error[512];
-            snprintf(final_error, sizeof(final_error), "Line %zu: %s", line_number, status_buffer);
+            app_assembler_format_location_error(
+                line_number <= source->line_count ? &source->locations[line_number - 1] : NULL,
+                line_number,
+                status_buffer,
+                final_error,
+                sizeof(final_error)
+            );
             snprintf(status_buffer, status_buffer_size, "%s", final_error);
             free(mutable_source);
             return false;
@@ -2586,69 +2651,170 @@ static bool app_assembler_confirm_close(HWND hwnd, AppState *app) {
     return true;
 }
 
-/* Rebuilds the assembler gutter text from the first visible source line so
-   the left-hand line numbers stay aligned while the user edits or scrolls. */
+/* Clears the current assembler error marker and repaints the gutter when
+   stale diagnostics should no longer be shown to the user. */
+static void app_assembler_clear_error_marker(AppState *app) {
+    if (app == NULL) {
+        return;
+    }
+    app->debug.assembler_error_line = 0;
+    if (app->debug.assembler_line_numbers != NULL) {
+        InvalidateRect(app->debug.assembler_line_numbers, NULL, TRUE);
+    }
+}
+
+/* Moves the assembler caret to the requested 1-based source line and scrolls
+   the edit control so the target becomes visible immediately after errors. */
+static void app_assembler_focus_line(AppState *app, size_t line_number) {
+    LRESULT start_index;
+
+    if (app == NULL || app->debug.assembler_source == NULL || line_number == 0) {
+        return;
+    }
+    start_index = SendMessageA(app->debug.assembler_source, EM_LINEINDEX, (WPARAM)(line_number - 1), 0);
+    if (start_index < 0) {
+        return;
+    }
+    SendMessageA(app->debug.assembler_source, EM_SETSEL, (WPARAM)start_index, (LPARAM)start_index);
+    SendMessageA(app->debug.assembler_source, EM_SCROLLCARET, 0, 0);
+    SetFocus(app->debug.assembler_source);
+}
+
+/* Parses a formatted assembler diagnostic and, when it refers to the current
+   editor buffer, moves the caret there and paints one gutter error marker. */
+static void app_assembler_sync_error_from_status(AppState *app, const char *status_text) {
+    const char *line_text = NULL;
+    unsigned long long parsed_line;
+    char *end = NULL;
+
+    if (app == NULL || status_text == NULL || *status_text == '\0') {
+        return;
+    }
+    if (strncmp(status_text, "Line ", 5) == 0) {
+        line_text = status_text + 5;
+    } else if (app->debug.assembler_current_path[0] != '\0') {
+        size_t path_length = strlen(app->debug.assembler_current_path);
+        if (_strnicmp(status_text, app->debug.assembler_current_path, path_length) == 0 &&
+            _strnicmp(status_text + path_length, " line ", 6) == 0) {
+            line_text = status_text + path_length + 6;
+        }
+    }
+    if (line_text == NULL) {
+        return;
+    }
+    parsed_line = strtoull(line_text, &end, 10);
+    if (parsed_line == 0 || end == line_text || end == NULL || *end != ':') {
+        return;
+    }
+    app->debug.assembler_error_line = (size_t)parsed_line;
+    if (app->debug.assembler_line_numbers != NULL) {
+        InvalidateRect(app->debug.assembler_line_numbers, NULL, TRUE);
+    }
+    app_assembler_focus_line(app, app->debug.assembler_error_line);
+}
+
+/* Repaints the assembler gutter after source edits or scroll activity so line
+   numbers and the current error marker stay visually synchronized. */
 static void app_assembler_update_line_numbers(AppState *app) {
-    RECT rect;
-    HDC dc;
-    TEXTMETRICA metrics;
-    int first_line;
-    int line_count;
-    int visible_lines;
-    int char_height;
-    int needed;
-    char *buffer;
-    size_t used = 0;
-
-    if (app == NULL || app->debug.assembler_line_numbers == NULL || app->debug.assembler_source == NULL) {
+    if (app == NULL || app->debug.assembler_line_numbers == NULL) {
         return;
     }
+    InvalidateRect(app->debug.assembler_line_numbers, NULL, TRUE);
+}
 
-    first_line = (int)SendMessageA(app->debug.assembler_source, EM_GETFIRSTVISIBLELINE, 0, 0);
-    line_count = (int)SendMessageA(app->debug.assembler_source, EM_GETLINECOUNT, 0, 0);
-    if (line_count < 1) {
-        line_count = 1;
-    }
+/* Paints the assembler gutter with right-aligned line numbers plus one red
+   dot beside the active error line when the last compile failed locally. */
+static LRESULT CALLBACK app_assembler_gutter_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    AppState *app = (AppState *)GetWindowLongPtrA(GetParent(hwnd), GWLP_USERDATA);
 
-    GetClientRect(app->debug.assembler_source, &rect);
-    dc = GetDC(app->debug.assembler_source);
-    if (dc == NULL) {
-        return;
-    }
-    SelectObject(dc, app->debug.assembler_font != NULL ? app->debug.assembler_font : GetStockObject(ANSI_FIXED_FONT));
-    GetTextMetricsA(dc, &metrics);
-    ReleaseDC(app->debug.assembler_source, dc);
+    switch (msg) {
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            RECT rect;
+            RECT source_rect;
+            HDC hdc;
+            HGDIOBJ old_font;
+            HBRUSH background_brush;
+            HBRUSH error_brush;
+            HPEN error_pen;
+            HGDIOBJ old_brush;
+            HGDIOBJ old_pen;
+            TEXTMETRICA metrics;
+            int first_line;
+            int line_count;
+            int char_height;
+            int visible_lines;
 
-    char_height = metrics.tmHeight + metrics.tmExternalLeading;
-    if (char_height <= 0) {
-        char_height = 16;
-    }
-    visible_lines = (rect.bottom - rect.top) / char_height + 2;
-    if (visible_lines < 1) {
-        visible_lines = 1;
-    }
-    if (first_line + visible_lines < line_count) {
-        needed = visible_lines;
-    } else {
-        needed = line_count - first_line;
-        if (needed < 1) {
-            needed = 1;
+            BeginPaint(hwnd, &ps);
+            GetClientRect(hwnd, &rect);
+            hdc = ps.hdc;
+            background_brush = CreateSolidBrush(RGB(248, 248, 248));
+            FillRect(hdc, &rect, background_brush);
+            DeleteObject(background_brush);
+            if (app == NULL || app->debug.assembler_source == NULL) {
+                EndPaint(hwnd, &ps);
+                return 0;
+            }
+
+            old_font = SelectObject(hdc, app->debug.assembler_font != NULL ? app->debug.assembler_font : GetStockObject(ANSI_FIXED_FONT));
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, RGB(96, 96, 96));
+            GetTextMetricsA(hdc, &metrics);
+            char_height = metrics.tmHeight + metrics.tmExternalLeading;
+            if (char_height <= 0) {
+                char_height = 16;
+            }
+
+            first_line = (int)SendMessageA(app->debug.assembler_source, EM_GETFIRSTVISIBLELINE, 0, 0);
+            line_count = (int)SendMessageA(app->debug.assembler_source, EM_GETLINECOUNT, 0, 0);
+            if (line_count < 1) {
+                line_count = 1;
+            }
+            GetClientRect(app->debug.assembler_source, &source_rect);
+            visible_lines = (source_rect.bottom - source_rect.top) / char_height + 2;
+            if (visible_lines < 1) {
+                visible_lines = 1;
+            }
+
+            error_brush = CreateSolidBrush(RGB(220, 40, 40));
+            error_pen = CreatePen(PS_SOLID, 1, RGB(220, 40, 40));
+            old_brush = SelectObject(hdc, error_brush);
+            old_pen = SelectObject(hdc, error_pen);
+
+            for (int i = 0; i < visible_lines; ++i) {
+                char number_buffer[16];
+                RECT line_rect = {18, i * char_height, rect.right - 6, (i + 1) * char_height};
+                int line_number = first_line + i + 1;
+
+                if (line_number > line_count) {
+                    break;
+                }
+                snprintf(number_buffer, sizeof(number_buffer), "%d", line_number);
+                DrawTextA(hdc, number_buffer, -1, &line_rect, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+                if (app->debug.assembler_error_line == (size_t)line_number) {
+                    int dot_center_y = i * char_height + char_height / 2;
+                    Ellipse(hdc, 5, dot_center_y - 4, 13, dot_center_y + 4);
+                }
+            }
+
+            SelectObject(hdc, old_pen);
+            SelectObject(hdc, old_brush);
+            DeleteObject(error_pen);
+            DeleteObject(error_brush);
+            SelectObject(hdc, old_font);
+            EndPaint(hwnd, &ps);
+            return 0;
         }
-    }
-
-    buffer = (char *)malloc((size_t)needed * 16);
-    if (buffer == NULL) {
-        return;
-    }
-    buffer[0] = '\0';
-    for (int i = 0; i < needed; ++i) {
-        used += (size_t)snprintf(buffer + used, (size_t)needed * 16 - used, "%4d\r\n", first_line + i + 1);
-        if (used >= (size_t)needed * 16) {
+        case WM_LBUTTONDOWN:
+            if (app != NULL && app->debug.assembler_source != NULL) {
+                SetFocus(app->debug.assembler_source);
+            }
+            return 0;
+        default:
             break;
-        }
     }
-    SetWindowTextA(app->debug.assembler_line_numbers, buffer);
-    free(buffer);
+    return DefWindowProcA(hwnd, msg, wparam, lparam);
 }
 
 /* Sizes the debugger controls to the current client area of the tool window. */
@@ -2764,6 +2930,11 @@ static LRESULT CALLBACK app_assembler_source_wndproc(HWND hwnd, UINT msg, WPARAM
         const bool ctrl_down = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         const bool shift_down = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
 
+        if ((UINT)wparam == VK_F1) {
+            SendMessageA(parent, WM_COMMAND, APP_MENU_ASM_HELP_SHOW, 0);
+            return 0;
+        }
+
         if (ctrl_down && !shift_down) {
             switch ((UINT)wparam) {
                 case 'A':
@@ -2786,11 +2957,29 @@ static LRESULT CALLBACK app_assembler_source_wndproc(HWND hwnd, UINT msg, WPARAM
                     app_assembler_handle_edit_command(app, APP_MENU_ASM_EDIT_PASTE);
                     app_assembler_update_line_numbers(app);
                     return 0;
+                case 'N':
+                    SendMessageA(parent, WM_COMMAND, APP_MENU_ASM_FILE_NEW, 0);
+                    return 0;
+                case 'O':
+                    SendMessageA(parent, WM_COMMAND, APP_MENU_ASM_FILE_LOAD, 0);
+                    return 0;
+                case 'S':
+                    SendMessageA(parent, WM_COMMAND, APP_MENU_ASM_FILE_SAVE, 0);
+                    return 0;
                 case 'B':
                     SendMessageA(parent, WM_COMMAND, APP_MENU_ASM_BUILD_ASSEMBLE, 0);
                     return 0;
                 case VK_INSERT:
                     app_assembler_handle_edit_command(app, APP_MENU_ASM_EDIT_COPY);
+                    return 0;
+                default:
+                    break;
+            }
+        }
+        if (ctrl_down && shift_down) {
+            switch ((UINT)wparam) {
+                case 'S':
+                    SendMessageA(parent, WM_COMMAND, APP_MENU_ASM_FILE_SAVE_AS, 0);
                     return 0;
                 default:
                     break;
@@ -2922,6 +3111,18 @@ static LRESULT CALLBACK app_debugger_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
                 app_debugger_layout_controls(app, hwnd);
             }
             return 0;
+        case WM_ENTERSIZEMOVE:
+            app_set_modal_loop_timer(app, hwnd, true);
+            return 0;
+        case WM_EXITSIZEMOVE:
+            app_set_modal_loop_timer(app, hwnd, false);
+            return 0;
+        case WM_TIMER:
+            if (app != NULL && wparam == APP_TIMER_MODAL_LOOP) {
+                app_tick_emulator(app);
+                return 0;
+            }
+            break;
         case WM_COMMAND:
             if (app == NULL) {
                 break;
@@ -2996,6 +3197,7 @@ static LRESULT CALLBACK app_debugger_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
             return 0;
         case WM_DESTROY:
             if (app != NULL) {
+                app_set_modal_loop_timer(app, hwnd, false);
                 app->debug.paused = false;
                 app->debug.stepping = false;
                 app->debug.stop_requested = false;
@@ -3056,9 +3258,9 @@ static LRESULT CALLBACK app_assembler_wndproc(HWND hwnd, UINT msg, WPARAM wparam
             );
             app->debug.assembler_line_numbers = CreateWindowExA(
                 0,
-                "EDIT",
+                "ZXSpecAssemblerGutter",
                 "",
-                WS_CHILD | WS_VISIBLE | WS_BORDER | ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
+                WS_CHILD | WS_VISIBLE | WS_BORDER,
                 0,
                 0,
                 0,
@@ -3102,6 +3304,18 @@ static LRESULT CALLBACK app_assembler_wndproc(HWND hwnd, UINT msg, WPARAM wparam
                 app_assembler_layout_controls(app, hwnd);
             }
             return 0;
+        case WM_ENTERSIZEMOVE:
+            app_set_modal_loop_timer(app, hwnd, true);
+            return 0;
+        case WM_EXITSIZEMOVE:
+            app_set_modal_loop_timer(app, hwnd, false);
+            return 0;
+        case WM_TIMER:
+            if (app != NULL && wparam == APP_TIMER_MODAL_LOOP) {
+                app_tick_emulator(app);
+                return 0;
+            }
+            break;
         case WM_COMMAND:
             if (app == NULL) {
                 break;
@@ -3109,6 +3323,8 @@ static LRESULT CALLBACK app_assembler_wndproc(HWND hwnd, UINT msg, WPARAM wparam
             if (LOWORD(wparam) == APP_CTRL_ASM_SOURCE && HIWORD(wparam) == EN_CHANGE) {
                 if (!app->debug.assembler_ignore_change) {
                     app->debug.assembler_dirty = true;
+                    app_assembler_clear_error_marker(app);
+                    app_assembler_set_status(app, "");
                 }
                 app_assembler_update_line_numbers(app);
                 return 0;
@@ -3135,6 +3351,12 @@ static LRESULT CALLBACK app_assembler_wndproc(HWND hwnd, UINT msg, WPARAM wparam
                 app_assembler_set_status(app, status);
                 return 0;
             }
+            if (LOWORD(wparam) == APP_MENU_ASM_FILE_SAVE_AS) {
+                char status[512];
+                app_assembler_save_source_as(hwnd, app, status, sizeof(status));
+                app_assembler_set_status(app, status);
+                return 0;
+            }
             if (LOWORD(wparam) == APP_CTRL_ASM_APPLY || LOWORD(wparam) == APP_MENU_ASM_BUILD_ASSEMBLE) {
                 app_assembler_apply_source(hwnd, app);
                 return 0;
@@ -3151,6 +3373,7 @@ static LRESULT CALLBACK app_assembler_wndproc(HWND hwnd, UINT msg, WPARAM wparam
             return 0;
         case WM_DESTROY:
             if (app != NULL) {
+                app_set_modal_loop_timer(app, hwnd, false);
                 if (app->debug.assembler_font != NULL) {
                     DeleteObject(app->debug.assembler_font);
                     app->debug.assembler_font = NULL;
@@ -3166,6 +3389,7 @@ static LRESULT CALLBACK app_assembler_wndproc(HWND hwnd, UINT msg, WPARAM wparam
                 app->debug.assembler_source_wndproc = NULL;
                 app->debug.assembler_dirty = false;
                 app->debug.assembler_ignore_change = false;
+                app->debug.assembler_error_line = 0;
             }
             return 0;
         default:
@@ -3193,6 +3417,16 @@ static bool app_register_tool_window_classes(HINSTANCE instance) {
     wc.lpfnWndProc = app_assembler_wndproc;
     wc.hInstance = instance;
     wc.lpszClassName = "ZXSpecAssemblerWindow";
+    wc.hCursor = LoadCursorA(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    if (RegisterClassA(&wc) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        return false;
+    }
+
+    ZeroMemory(&wc, sizeof(wc));
+    wc.lpfnWndProc = app_assembler_gutter_wndproc;
+    wc.hInstance = instance;
+    wc.lpszClassName = "ZXSpecAssemblerGutter";
     wc.hCursor = LoadCursorA(NULL, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     if (RegisterClassA(&wc) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
@@ -3278,6 +3512,22 @@ static void app_show_assembler_help(HWND hwnd) {
         "  ORG address\r\n"
         "  DB value[, value...]\r\n"
         "  DW value[, value...]\r\n"
+        "  INCLUDE \"file.asm\"\r\n"
+        "\r\n"
+        "Editor:\r\n"
+        "  Ctrl+N New\r\n"
+        "  Ctrl+O Load\r\n"
+        "  Ctrl+S Save\r\n"
+        "  Ctrl+Shift+S Save As\r\n"
+        "  Ctrl+A Select All\r\n"
+        "  Ctrl+B Assemble\r\n"
+        "  F1 Assembler Help\r\n"
+        "  Ctrl+Z/X/C/V standard edit shortcuts\r\n"
+        "\r\n"
+        "Compile errors:\r\n"
+        "  - The caret jumps to the failing line.\r\n"
+        "  - A red dot marks the failing line in the gutter.\r\n"
+        "  - Error markers clear on edit, load, and compile.\r\n"
         "\r\n"
         "Address selection:\r\n"
         "  - If the source contains ORG, that address is used.\r\n"
@@ -3291,7 +3541,10 @@ static void app_show_assembler_help(HWND hwnd) {
         "Notes:\r\n"
         "  - Numbers may be decimal, $hex, 0xhex, hex with H suffix, or %binary.\r\n"
         "  - Quoted text works in DB, for example DB \"HELLO\",13.\r\n"
-        "  - Labels and macros are not supported.\r\n"
+        "  - INCLUDE expands in place, so it can appear mid-file.\r\n"
+        "  - INCLUDE paths are resolved relative to the current source file.\r\n"
+        "  - Labels are supported.\r\n"
+        "  - Macros are not supported.\r\n"
         "  - Writes are limited to RAM at 4000h-FFFFh.\r\n",
         "Assembler Help",
         MB_OK | MB_ICONINFORMATION
@@ -3409,6 +3662,7 @@ static bool app_assembler_load_source_path(
     SetWindowTextA(app->debug.assembler_source, normalized);
     app->debug.assembler_ignore_change = false;
     app->debug.assembler_dirty = false;
+    app_assembler_clear_error_marker(app);
     app_assembler_set_current_path(app, path);
     snprintf(status_buffer, status_buffer_size, "Loaded assembler source from %s", path);
     free(normalized);
@@ -3444,36 +3698,17 @@ static bool app_assembler_load_source(HWND hwnd, AppState *app, char *status_buf
     return app_assembler_load_source_path(path, app, status_buffer, status_buffer_size);
 }
 
-/* Saves the current assembler source edit contents to a text file chosen by
-   the user through the standard Windows save dialog. */
-static bool app_assembler_save_source(HWND hwnd, AppState *app, char *status_buffer, size_t status_buffer_size) {
-    OPENFILENAMEA ofn;
-    char path[MAX_PATH];
+/* Writes the current assembler source to one concrete path and updates the
+   active document identity after the write succeeds. */
+static bool app_assembler_write_source_to_path(
+    AppState *app,
+    const char *path,
+    char *status_buffer,
+    size_t status_buffer_size
+) {
     int source_length = GetWindowTextLengthA(app->debug.assembler_source);
     char *source;
     FILE *file;
-
-    ZeroMemory(&ofn, sizeof(ofn));
-    ZeroMemory(path, sizeof(path));
-    if (app->debug.assembler_current_path[0] != '\0') {
-        snprintf(path, sizeof(path), "%s", app->debug.assembler_current_path);
-    } else {
-        snprintf(path, sizeof(path), "source.asm");
-    }
-    ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner = hwnd;
-    ofn.lpstrFilter =
-        "Assembler Source (*.asm;*.txt)\0*.asm;*.txt\0"
-        "All Files (*.*)\0*.*\0";
-    ofn.lpstrFile = path;
-    ofn.nMaxFile = MAX_PATH;
-    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
-    ofn.lpstrDefExt = "asm";
-
-    if (!GetSaveFileNameA(&ofn)) {
-        snprintf(status_buffer, status_buffer_size, "Save cancelled.");
-        return false;
-    }
 
     source = (char *)malloc((size_t)source_length + 1);
     if (source == NULL) {
@@ -3502,6 +3737,52 @@ static bool app_assembler_save_source(HWND hwnd, AppState *app, char *status_buf
     return true;
 }
 
+/* Saves to the current path when one exists, otherwise it falls back to the
+   Save As flow so unnamed documents still prompt for a filename. */
+static bool app_assembler_save_source(HWND hwnd, AppState *app, char *status_buffer, size_t status_buffer_size) {
+    (void)hwnd;
+
+    if (app->debug.assembler_current_path[0] != '\0') {
+        return app_assembler_write_source_to_path(
+            app,
+            app->debug.assembler_current_path,
+            status_buffer,
+            status_buffer_size
+        );
+    }
+    return app_assembler_save_source_as(hwnd, app, status_buffer, status_buffer_size);
+}
+
+/* Prompts for a filename and then writes the current assembler source to the
+   chosen path, even if the document already has a current filename. */
+static bool app_assembler_save_source_as(HWND hwnd, AppState *app, char *status_buffer, size_t status_buffer_size) {
+    OPENFILENAMEA ofn;
+    char path[MAX_PATH];
+
+    ZeroMemory(&ofn, sizeof(ofn));
+    ZeroMemory(path, sizeof(path));
+    if (app->debug.assembler_current_path[0] != '\0') {
+        snprintf(path, sizeof(path), "%s", app->debug.assembler_current_path);
+    } else {
+        snprintf(path, sizeof(path), "source.asm");
+    }
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = hwnd;
+    ofn.lpstrFilter =
+        "Assembler Source (*.asm;*.txt)\0*.asm;*.txt\0"
+        "All Files (*.*)\0*.*\0";
+    ofn.lpstrFile = path;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+    ofn.lpstrDefExt = "asm";
+
+    if (!GetSaveFileNameA(&ofn)) {
+        snprintf(status_buffer, status_buffer_size, "Save As cancelled.");
+        return false;
+    }
+    return app_assembler_write_source_to_path(app, path, status_buffer, status_buffer_size);
+}
+
 /* Clears the current assembler document after offering to save unsaved edits. */
 static bool app_assembler_new_source(HWND hwnd, AppState *app, char *status_buffer, size_t status_buffer_size) {
     if (!app_assembler_confirm_close(hwnd, app)) {
@@ -3513,6 +3794,7 @@ static bool app_assembler_new_source(HWND hwnd, AppState *app, char *status_buff
     SetWindowTextA(app->debug.assembler_source, "");
     app->debug.assembler_ignore_change = false;
     app->debug.assembler_dirty = false;
+    app_assembler_clear_error_marker(app);
     app_assembler_set_current_path(app, NULL);
     app_assembler_update_line_numbers(app);
     snprintf(status_buffer, status_buffer_size, "Started a new assembler source.");
@@ -3526,9 +3808,11 @@ static void app_assembler_apply_source(HWND hwnd, AppState *app) {
     uint16_t effective_address;
     uint16_t org_address;
     int source_length = GetWindowTextLengthA(app->debug.assembler_source);
+    AssemblerPreparedSource prepared_source;
     char *source;
     (void)hwnd;
 
+    app_assembler_clear_error_marker(app);
     if (source_length <= 0) {
         app_assembler_set_status(app, "Enter one or more assembler lines first.");
         return;
@@ -3540,15 +3824,24 @@ static void app_assembler_apply_source(HWND hwnd, AppState *app) {
         return;
     }
     GetWindowTextA(app->debug.assembler_source, source, source_length + 1);
-    if (app_assembler_find_source_org(source, &org_address)) {
+    if (!app_assembler_prepare_source(app, source, &prepared_source, status, sizeof(status))) {
+        app_assembler_sync_error_from_status(app, status);
+        app_assembler_set_status(app, status);
+        free(source);
+        return;
+    }
+    if (app_assembler_find_source_org(prepared_source.text, &org_address)) {
         effective_address = org_address;
     } else {
         effective_address = app->spec.machine.cpu.pc;
     }
-    if (app_assemble_source(app, effective_address, source, status, sizeof(status))) {
+    if (app_assemble_source(app, effective_address, &prepared_source, status, sizeof(status))) {
         InvalidateRect(app->main_hwnd, NULL, FALSE);
         app_debug_refresh_window(app);
+    } else {
+        app_assembler_sync_error_from_status(app, status);
     }
+    app_assembler_free_prepared_source(&prepared_source);
     app_assembler_set_status(app, status);
     free(source);
 }
@@ -3961,6 +4254,75 @@ static void app_handle_key_up(AppState *app, WPARAM wparam) {
     app->active_key_codes[vk] = 0;
 }
 
+/* Returns the real PAL frame duration for the selected Spectrum model so the
+   frontend can step 48K and 128K machines at their native rates. */
+static double app_model_frame_duration_ms(SpectrumModel model) {
+    if (model == SPECTRUM_MODEL_128K) {
+        return (311.0 * 228.0 * 1000.0) / 3546894.0;
+    }
+    return (312.0 * 224.0 * 1000.0) / 3500000.0;
+}
+
+/* Runs one timing slice of the emulator and audio service. This is shared by
+   the normal idle loop and the timer path used during modal move/size loops. */
+static void app_tick_emulator(AppState *app) {
+    LARGE_INTEGER now;
+    double elapsed_ms;
+    double frame_ms;
+    bool rendered = false;
+    int frames_run = 0;
+
+    if (app == NULL || !app->running) {
+        return;
+    }
+
+    QueryPerformanceCounter(&now);
+    elapsed_ms = (double)(now.QuadPart - app->last_tick.QuadPart) * 1000.0 / (double)app->perf_freq.QuadPart;
+    app->last_tick = now;
+    frame_ms = app_model_frame_duration_ms(app->spec.model);
+    app->emulation_accumulator_ms += elapsed_ms;
+    if (app->emulation_accumulator_ms > frame_ms * 8.0) {
+        app->emulation_accumulator_ms = frame_ms * 8.0;
+    }
+
+    if (!app->debug.paused) {
+        while (app->emulation_accumulator_ms >= frame_ms && frames_run < 8) {
+            app_run_autotype(app);
+            app_debug_run_frame(app);
+            app->emulation_accumulator_ms -= frame_ms;
+            rendered = true;
+            frames_run++;
+            if (app->debug.paused) {
+                app->emulation_accumulator_ms = 0.0;
+                break;
+            }
+        }
+        if (rendered) {
+            InvalidateRect(app->main_hwnd, NULL, FALSE);
+        }
+    } else {
+        app->emulation_accumulator_ms = 0.0;
+    }
+    app_audio_service(app);
+}
+
+/* Keeps the emulator ticking while Windows is inside a modal move/size loop
+   for any of the app's top-level windows. */
+static void app_set_modal_loop_timer(AppState *app, HWND hwnd, bool enabled) {
+    if (app == NULL) {
+        return;
+    }
+    if (enabled) {
+        if (!app->modal_loop_timer_active) {
+            SetTimer(hwnd, APP_TIMER_MODAL_LOOP, 20, NULL);
+            app->modal_loop_timer_active = true;
+        }
+    } else if (app->modal_loop_timer_active) {
+        KillTimer(hwnd, APP_TIMER_MODAL_LOOP);
+        app->modal_loop_timer_active = false;
+    }
+}
+
 /* Acts as the Win32 window procedure, routing keyboard input, paint events,
    and shutdown messages between the OS and the emulator application state. */
 static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
@@ -3975,8 +4337,47 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         case WM_KEYDOWN:
         case WM_SYSKEYDOWN:
             if (app != NULL) {
-                if ((GetKeyState(VK_CONTROL) & 0x8000) != 0 && (UINT)wparam == 'V') {
-                    app_paste_text(hwnd, app);
+                const bool ctrl_down = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+                const bool shift_down = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+                const bool alt_down = (GetKeyState(VK_MENU) & 0x8000) != 0;
+
+                if (ctrl_down && shift_down) {
+                    switch ((UINT)wparam) {
+                        case 'A':
+                            app_open_assembler_window(app);
+                            return 0;
+                        case 'D':
+                            app_open_debugger_window(app);
+                            return 0;
+                        default:
+                            break;
+                    }
+                }
+                if (ctrl_down && !shift_down && !alt_down) {
+                    switch ((UINT)wparam) {
+                        case 'O':
+                            SendMessageA(hwnd, WM_COMMAND, APP_MENU_FILE_OPEN_SNAPSHOT, 0);
+                            return 0;
+                        case 'R':
+                            SendMessageA(hwnd, WM_COMMAND, APP_MENU_FILE_RESET, 0);
+                            return 0;
+                        case 'V':
+                            app_paste_text(hwnd, app);
+                            return 0;
+                        case '1':
+                        case VK_NUMPAD1:
+                            SendMessageA(hwnd, WM_COMMAND, APP_MENU_MACHINE_48K, 0);
+                            return 0;
+                        case '2':
+                        case VK_NUMPAD2:
+                            SendMessageA(hwnd, WM_COMMAND, APP_MENU_MACHINE_128K, 0);
+                            return 0;
+                        default:
+                            break;
+                    }
+                }
+                if (alt_down && (UINT)wparam == VK_F4) {
+                    SendMessageA(hwnd, WM_CLOSE, 0, 0);
                     return 0;
                 }
                 app_handle_key_down(app, wparam, lparam);
@@ -3993,6 +4394,18 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                 app_release_all_keys(app);
             }
             return 0;
+        case WM_ENTERSIZEMOVE:
+            app_set_modal_loop_timer(app, hwnd, true);
+            return 0;
+        case WM_EXITSIZEMOVE:
+            app_set_modal_loop_timer(app, hwnd, false);
+            return 0;
+        case WM_TIMER:
+            if (app != NULL && wparam == APP_TIMER_MODAL_LOOP) {
+                app_tick_emulator(app);
+                return 0;
+            }
+            break;
         case WM_COMMAND:
             if (app != NULL) {
                 switch (LOWORD(wparam)) {
@@ -4093,6 +4506,7 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
             return 0;
         case WM_DESTROY:
             if (app != NULL) {
+                app_set_modal_loop_timer(app, hwnd, false);
                 if (app->debug.debugger_hwnd != NULL) {
                     DestroyWindow(app->debug.debugger_hwnd);
                 }
@@ -4268,6 +4682,511 @@ static bool app_parent_dir(char *path) {
         return false;
     }
     *slash = '\0';
+    return true;
+}
+
+/* Releases any heap storage attached to a prepared assembler source bundle. */
+static void app_assembler_free_prepared_source(AssemblerPreparedSource *prepared) {
+    if (prepared == NULL) {
+        return;
+    }
+    free(prepared->text);
+    free(prepared->locations);
+    memset(prepared, 0, sizeof(*prepared));
+}
+
+/* Returns true when the supplied path is already absolute on Windows. */
+static bool app_path_is_absolute(const char *path) {
+    if (path == NULL || path[0] == '\0') {
+        return false;
+    }
+    if (path[0] == '\\' || path[0] == '/') {
+        return true;
+    }
+    return isalpha((unsigned char)path[0]) && path[1] == ':';
+}
+
+/* Converts a raw include operand into a plain path, accepting either quoted or
+   unquoted forms so `INCLUDE file.asm` and `INCLUDE "file.asm"` both work. */
+static bool app_assembler_extract_include_path(
+    const char *operand,
+    char *out_path,
+    size_t out_size,
+    char *error_buffer,
+    size_t error_buffer_size
+) {
+    char token[512];
+    char *trimmed;
+    size_t length;
+
+    snprintf(token, sizeof(token), "%s", operand);
+    trimmed = app_trim_inplace(token);
+    if (trimmed != token) {
+        memmove(token, trimmed, strlen(trimmed) + 1);
+    }
+    length = strlen(token);
+    if (length == 0) {
+        snprintf(error_buffer, error_buffer_size, "INCLUDE expects a file path.");
+        return false;
+    }
+    if ((token[0] == '"' || token[0] == '\'') && length >= 2 && token[length - 1] == token[0]) {
+        token[length - 1] = '\0';
+        memmove(token, token + 1, strlen(token));
+    }
+    if (token[0] == '\0') {
+        snprintf(error_buffer, error_buffer_size, "INCLUDE expects a file path.");
+        return false;
+    }
+    snprintf(out_path, out_size, "%s", token);
+    return true;
+}
+
+/* Resolves an include path relative to the file that referenced it when one is
+   available, otherwise against the current process working directory. */
+static bool app_assembler_resolve_include_path(
+    const char *including_path,
+    const char *operand,
+    char *out_path,
+    size_t out_size,
+    char *error_buffer,
+    size_t error_buffer_size
+) {
+    char relative_path[MAX_PATH];
+    char candidate[MAX_PATH];
+    DWORD resolved_length;
+
+    if (!app_assembler_extract_include_path(operand, relative_path, sizeof(relative_path), error_buffer, error_buffer_size)) {
+        return false;
+    }
+
+    if (app_path_is_absolute(relative_path)) {
+        snprintf(candidate, sizeof(candidate), "%s", relative_path);
+    } else if (including_path != NULL && including_path[0] != '\0') {
+        char parent[MAX_PATH];
+        snprintf(parent, sizeof(parent), "%s", including_path);
+        if (!app_parent_dir(parent) || !app_join_path(candidate, sizeof(candidate), parent, relative_path)) {
+            snprintf(error_buffer, error_buffer_size, "INCLUDE path is too long: %s", relative_path);
+            return false;
+        }
+    } else {
+        snprintf(candidate, sizeof(candidate), "%s", relative_path);
+    }
+
+    resolved_length = GetFullPathNameA(candidate, (DWORD)out_size, out_path, NULL);
+    if (resolved_length == 0 || resolved_length >= out_size) {
+        snprintf(error_buffer, error_buffer_size, "Could not resolve include path: %s", relative_path);
+        return false;
+    }
+    if (!app_file_exists(out_path)) {
+        snprintf(error_buffer, error_buffer_size, "Included file not found: %s", out_path);
+        return false;
+    }
+    return true;
+}
+
+/* Reads a text file and normalizes all line endings to bare LF characters so
+   assembler line handling works consistently across source files. */
+static bool app_read_text_file_normalized(
+    const char *path,
+    char **out_text,
+    char *error_buffer,
+    size_t error_buffer_size
+) {
+    FILE *file;
+    long file_size;
+    char *raw_data;
+    char *normalized;
+    size_t normalized_length = 0;
+
+    *out_text = NULL;
+    file = fopen(path, "rb");
+    if (file == NULL) {
+        snprintf(error_buffer, error_buffer_size, "Could not open include file: %s", path);
+        return false;
+    }
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        snprintf(error_buffer, error_buffer_size, "Could not read include file: %s", path);
+        return false;
+    }
+    file_size = ftell(file);
+    if (file_size < 0) {
+        fclose(file);
+        snprintf(error_buffer, error_buffer_size, "Could not read include file: %s", path);
+        return false;
+    }
+    rewind(file);
+
+    raw_data = (char *)malloc((size_t)file_size + 1);
+    if (raw_data == NULL) {
+        fclose(file);
+        snprintf(error_buffer, error_buffer_size, "Out of memory.");
+        return false;
+    }
+    if (file_size > 0 && fread(raw_data, 1, (size_t)file_size, file) != (size_t)file_size) {
+        fclose(file);
+        free(raw_data);
+        snprintf(error_buffer, error_buffer_size, "Could not read include file: %s", path);
+        return false;
+    }
+    fclose(file);
+    raw_data[file_size] = '\0';
+
+    normalized = (char *)malloc((size_t)file_size + 1);
+    if (normalized == NULL) {
+        free(raw_data);
+        snprintf(error_buffer, error_buffer_size, "Out of memory.");
+        return false;
+    }
+
+    for (long i = 0; i < file_size; ++i) {
+        unsigned char ch = (unsigned char)raw_data[i];
+        if (ch == '\r') {
+            if (i + 1 < file_size && raw_data[i + 1] == '\n') {
+                i++;
+            }
+            normalized[normalized_length++] = '\n';
+        } else {
+            normalized[normalized_length++] = (char)ch;
+        }
+    }
+    normalized[normalized_length] = '\0';
+
+    if (normalized_length >= 3 &&
+        (unsigned char)normalized[0] == 0xEF &&
+        (unsigned char)normalized[1] == 0xBB &&
+        (unsigned char)normalized[2] == 0xBF) {
+        memmove(normalized, normalized + 3, normalized_length - 2);
+    }
+
+    free(raw_data);
+    *out_text = normalized;
+    return true;
+}
+
+/* Extends the prepared-source buffers and records one logical source line plus
+   its originating file and line number. */
+static bool app_assembler_append_prepared_line(
+    AssemblerPreparedSource *prepared,
+    const char *line,
+    const char *source_path,
+    size_t source_line,
+    char *error_buffer,
+    size_t error_buffer_size
+) {
+    size_t line_length = strlen(line);
+
+    if (prepared->text_length + line_length + 2 > prepared->text_capacity) {
+        size_t new_capacity = prepared->text_capacity == 0 ? 1024 : prepared->text_capacity * 2;
+        while (new_capacity < prepared->text_length + line_length + 2) {
+            new_capacity *= 2;
+        }
+        char *new_text = (char *)realloc(prepared->text, new_capacity);
+        if (new_text == NULL) {
+            snprintf(error_buffer, error_buffer_size, "Out of memory.");
+            return false;
+        }
+        prepared->text = new_text;
+        prepared->text_capacity = new_capacity;
+    }
+    if (prepared->line_count + 1 > prepared->line_capacity) {
+        size_t new_capacity = prepared->line_capacity == 0 ? 64 : prepared->line_capacity * 2;
+        AssemblerSourceLocation *new_locations =
+            (AssemblerSourceLocation *)realloc(prepared->locations, new_capacity * sizeof(AssemblerSourceLocation));
+        if (new_locations == NULL) {
+            snprintf(error_buffer, error_buffer_size, "Out of memory.");
+            return false;
+        }
+        prepared->locations = new_locations;
+        prepared->line_capacity = new_capacity;
+    }
+
+    memcpy(prepared->text + prepared->text_length, line, line_length);
+    prepared->text_length += line_length;
+    prepared->text[prepared->text_length++] = '\n';
+    prepared->text[prepared->text_length] = '\0';
+
+    prepared->locations[prepared->line_count].path[0] = '\0';
+    if (source_path != NULL) {
+        snprintf(prepared->locations[prepared->line_count].path, MAX_PATH, "%s", source_path);
+    }
+    prepared->locations[prepared->line_count].line_number = source_line;
+    prepared->line_count++;
+    return true;
+}
+
+/* Formats assembler diagnostics with file-and-line context when expanded
+   source originated from one or more INCLUDEd files. */
+static void app_assembler_format_location_error(
+    const AssemblerSourceLocation *location,
+    size_t fallback_line,
+    const char *message,
+    char *out_error,
+    size_t out_error_size
+) {
+    size_t line_number = fallback_line;
+
+    if (location != NULL && location->line_number != 0) {
+        line_number = location->line_number;
+    }
+    if (location != NULL && location->path[0] != '\0') {
+        snprintf(out_error, out_error_size, "%s line %zu: %s", location->path, line_number, message);
+    } else {
+        snprintf(out_error, out_error_size, "Line %zu: %s", line_number, message);
+    }
+}
+
+/* Recursively expands INCLUDE directives into a flat source buffer while
+   preserving source locations for later error reporting. */
+static bool app_assembler_expand_source(
+    const char *source,
+    const char *source_path,
+    AssemblerPreparedSource *prepared,
+    char include_stack[][MAX_PATH],
+    size_t include_depth,
+    char *error_buffer,
+    size_t error_buffer_size
+) {
+    char *mutable_source;
+    char *cursor;
+    size_t line_number = 0;
+
+    if (include_depth >= 32) {
+        snprintf(error_buffer, error_buffer_size, "INCLUDE nesting is too deep.");
+        return false;
+    }
+
+    mutable_source = _strdup(source);
+    if (mutable_source == NULL) {
+        snprintf(error_buffer, error_buffer_size, "Out of memory.");
+        return false;
+    }
+
+    cursor = mutable_source;
+    while (cursor != NULL && *cursor != '\0') {
+        char *line_end = strchr(cursor, '\n');
+        char *line = cursor;
+        char *analysis_line;
+
+        if (line_end != NULL) {
+            *line_end = '\0';
+            cursor = line_end + 1;
+        } else {
+            cursor = NULL;
+        }
+
+        {
+            size_t line_length = strlen(line);
+            if (line_length > 0 && line[line_length - 1] == '\r') {
+                line[line_length - 1] = '\0';
+            }
+        }
+        line_number++;
+
+        analysis_line = _strdup(line);
+        if (analysis_line == NULL) {
+            free(mutable_source);
+            snprintf(error_buffer, error_buffer_size, "Out of memory.");
+            return false;
+        }
+
+        app_strip_comment(analysis_line);
+        {
+            char mnemonic[32];
+            char lhs[256];
+            char rhs[256];
+            char label[64];
+            char *text = app_trim_inplace(analysis_line);
+            size_t mnemonic_chars;
+            int operand_result;
+            int operand_count = 0;
+
+            while (app_parse_leading_label(&text, label, sizeof(label))) {
+                text = app_trim_inplace(text);
+                if (*text == '\0') {
+                    break;
+                }
+            }
+
+            if (*text != '\0') {
+                mnemonic_chars = app_read_upper_token(text, mnemonic, sizeof(mnemonic));
+                text += mnemonic_chars;
+                text = app_trim_inplace(text);
+                lhs[0] = '\0';
+                rhs[0] = '\0';
+
+                if (*text != '\0') {
+                    char *operand_cursor = text;
+                    operand_result = app_read_operand_strict(&operand_cursor, lhs, sizeof(lhs), error_buffer, error_buffer_size);
+                    if (operand_result < 0) {
+                        AssemblerSourceLocation location = {{0}, line_number};
+                        char final_error[512];
+                        if (source_path != NULL) {
+                            snprintf(location.path, sizeof(location.path), "%s", source_path);
+                        }
+                        app_assembler_format_location_error(&location, line_number, error_buffer, final_error, sizeof(final_error));
+                        snprintf(error_buffer, error_buffer_size, "%s", final_error);
+                        free(analysis_line);
+                        free(mutable_source);
+                        return false;
+                    }
+                    if (operand_result > 0) {
+                        operand_count = 1;
+                        operand_result = app_read_operand_strict(&operand_cursor, rhs, sizeof(rhs), error_buffer, error_buffer_size);
+                        if (operand_result < 0) {
+                            AssemblerSourceLocation location = {{0}, line_number};
+                            char final_error[512];
+                            if (source_path != NULL) {
+                                snprintf(location.path, sizeof(location.path), "%s", source_path);
+                            }
+                            app_assembler_format_location_error(&location, line_number, error_buffer, final_error, sizeof(final_error));
+                            snprintf(error_buffer, error_buffer_size, "%s", final_error);
+                            free(analysis_line);
+                            free(mutable_source);
+                            return false;
+                        }
+                        if (operand_result > 0) {
+                            operand_count = 2;
+                        }
+                    }
+                }
+
+                if (app_equals_ignore_case(mnemonic, "INCLUDE")) {
+                    char include_path[MAX_PATH];
+                    char *include_source;
+                    AssemblerSourceLocation location = {{0}, line_number};
+
+                    if (source_path != NULL) {
+                        snprintf(location.path, sizeof(location.path), "%s", source_path);
+                    }
+                    if (operand_count != 1) {
+                        char final_error[512];
+                        app_assembler_format_location_error(
+                            &location,
+                            line_number,
+                            "INCLUDE expects 1 operand.",
+                            final_error,
+                            sizeof(final_error)
+                        );
+                        snprintf(error_buffer, error_buffer_size, "%s", final_error);
+                        free(analysis_line);
+                        free(mutable_source);
+                        return false;
+                    }
+                    if (!app_assembler_resolve_include_path(
+                            source_path,
+                            lhs,
+                            include_path,
+                            sizeof(include_path),
+                            error_buffer,
+                            error_buffer_size)) {
+                        char final_error[512];
+                        app_assembler_format_location_error(&location, line_number, error_buffer, final_error, sizeof(final_error));
+                        snprintf(error_buffer, error_buffer_size, "%s", final_error);
+                        free(analysis_line);
+                        free(mutable_source);
+                        return false;
+                    }
+                    for (size_t i = 0; i < include_depth; ++i) {
+                        if (_stricmp(include_stack[i], include_path) == 0) {
+                            char circular_error[512];
+                            snprintf(circular_error, sizeof(circular_error), "Circular INCLUDE detected: %s", include_path);
+                            app_assembler_format_location_error(
+                                &location,
+                                line_number,
+                                circular_error,
+                                error_buffer,
+                                error_buffer_size
+                            );
+                            free(analysis_line);
+                            free(mutable_source);
+                            return false;
+                        }
+                    }
+                    snprintf(include_stack[include_depth], MAX_PATH, "%s", include_path);
+                    if (!app_read_text_file_normalized(include_path, &include_source, error_buffer, error_buffer_size)) {
+                        char final_error[512];
+                        app_assembler_format_location_error(&location, line_number, error_buffer, final_error, sizeof(final_error));
+                        snprintf(error_buffer, error_buffer_size, "%s", final_error);
+                        free(analysis_line);
+                        free(mutable_source);
+                        return false;
+                    }
+                    if (!app_assembler_expand_source(
+                            include_source,
+                            include_path,
+                            prepared,
+                            include_stack,
+                            include_depth + 1,
+                            error_buffer,
+                            error_buffer_size)) {
+                        free(include_source);
+                        free(analysis_line);
+                        free(mutable_source);
+                        return false;
+                    }
+                    free(include_source);
+                    free(analysis_line);
+                    continue;
+                }
+            }
+        }
+
+        free(analysis_line);
+        if (!app_assembler_append_prepared_line(
+                prepared,
+                line,
+                source_path,
+                line_number,
+                error_buffer,
+                error_buffer_size)) {
+            free(mutable_source);
+            return false;
+        }
+    }
+
+    free(mutable_source);
+    return true;
+}
+
+/* Builds the final source buffer used by ORG scanning and the two assembly
+   passes, expanding any nested INCLUDE directives first. */
+static bool app_assembler_prepare_source(
+    AppState *app,
+    const char *source,
+    AssemblerPreparedSource *prepared,
+    char *status_buffer,
+    size_t status_buffer_size
+) {
+    char include_stack[32][MAX_PATH];
+    const char *root_path = NULL;
+    size_t include_depth = 0;
+
+    memset(prepared, 0, sizeof(*prepared));
+    if (app != NULL && app->debug.assembler_current_path[0] != '\0') {
+        root_path = app->debug.assembler_current_path;
+        snprintf(include_stack[0], MAX_PATH, "%s", root_path);
+        include_depth = 1;
+    }
+    if (!app_assembler_expand_source(
+            source,
+            root_path,
+            prepared,
+            include_stack,
+            include_depth,
+            status_buffer,
+            status_buffer_size)) {
+        app_assembler_free_prepared_source(prepared);
+        return false;
+    }
+    if (prepared->text == NULL) {
+        prepared->text = _strdup("");
+        if (prepared->text == NULL) {
+            snprintf(status_buffer, status_buffer_size, "Out of memory.");
+            return false;
+        }
+        prepared->text_capacity = 1;
+    }
     return true;
 }
 
@@ -4536,22 +5455,13 @@ int main(int argc, char **argv) {
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }
-
-        LARGE_INTEGER now;
-        QueryPerformanceCounter(&now);
-        double elapsed_ms =
-            (double)(now.QuadPart - app.last_tick.QuadPart) * 1000.0 / (double)app.perf_freq.QuadPart;
-        if (elapsed_ms >= 20.0) {
-            if (!app.debug.paused) {
-                app_run_autotype(&app);
-                app_debug_run_frame(&app);
-                InvalidateRect(hwnd, NULL, FALSE);
+        app_tick_emulator(&app);
+        {
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            if (((double)(now.QuadPart - app.last_tick.QuadPart) * 1000.0 / (double)app.perf_freq.QuadPart) < 20.0) {
+                Sleep(1);
             }
-            app_audio_service(&app);
-            app.last_tick = now;
-        } else {
-            app_audio_service(&app);
-            Sleep(1);
         }
     }
 

@@ -16,7 +16,9 @@
 
 enum {
     ZX_HOST_KEY_CAPS_SHIFT = 1,
-    ZX_HOST_KEY_SYMBOL_SHIFT = 2
+    ZX_HOST_KEY_SYMBOL_SHIFT = 2,
+    ZX_48K_FRAME_US = 19968,
+    ZX_128K_FRAME_US = 19992
 };
 
 /* Reads a ROM file into the provided buffer, rejects files larger than the
@@ -331,10 +333,13 @@ void spectrum_render_frame(Spectrum *spec) {
 /* Advances the machine by about one 50 Hz frame and then refreshes the cached
    frontend framebuffer from the emulator's current display buffer. */
 void spectrum_run_frame(Spectrum *spec) {
+    uint32_t frame_us;
+
     if (!spec->machine_ready) {
         return;
     }
-    zx_exec(&spec->machine, 20000);
+    frame_us = spec->model == SPECTRUM_MODEL_128K ? ZX_128K_FRAME_US : ZX_48K_FRAME_US;
+    zx_exec(&spec->machine, frame_us);
     spectrum_render_frame(spec);
 }
 

@@ -1,6 +1,6 @@
 # ZX Spectrum Emulator
 
-Small ZX Spectrum emulator in C for Windows. It builds with GCC via CMake and uses only the Win32 API for display and input.
+Small ZX Spectrum emulator in C for Windows. It uses the Win32 API for display and input and currently builds through `build.bat` with `zig rc` and `zig cc`.
 
 ## Current scope
 
@@ -15,13 +15,12 @@ Small ZX Spectrum emulator in C for Windows. It builds with GCC via CMake and us
 
 - Tape loading
 - Accurate ULA contention timing
-- Snapshot formats (`.z80`, `.sna`)
+- `.sna` snapshot loading
 
 ## Build
 
 ```powershell
-cmake -S . -B build
-cmake --build build
+.\build.bat
 ```
 
 ## Run
@@ -65,14 +64,18 @@ With no arguments, the emulator looks for `128.rom` in the working folder first 
 - `File -> Exit` closes the emulator
 - `Machine -> 48K` / `Machine -> 128K` rebuilds the emulator for that model and remembers the choice between runs
 - `Input -> Paste Text` types clipboard text through the Spectrum keyboard matrix
-- `Tools -> Assembler...` opens a small RAM patching assembler with support for common Z80 instructions plus `ORG`, `DB`, and `DW`
+- `Tools -> Assembler...` opens a small RAM patching assembler with support for common Z80 instructions plus `ORG`, `DB`, `DW`, and `INCLUDE`
 - `Tools -> Debugger...` opens a separate debugger window with pause, run, single-step, register state, and memory/disassembly views
 
 ## Assembler Notes
 
 - The built-in assembler is intentionally small: it supports labels and a practical subset of Z80 mnemonics, not a full macro assembler
+- `File -> New` clears the current source after prompting to save when needed
+- `INCLUDE "file.asm"` expands another source file in place during assembly, so it can appear in the middle of a source file; relative paths are resolved from the current source file
+- `Ctrl+B` assembles the current source
+- `Ctrl+A`, `Ctrl+Z`, `Ctrl+X`, `Ctrl+C`, and `Ctrl+V` work like a normal text editor inside the assembler source box
 - Assembler writes are limited to RAM at `0x4000`-`0xFFFF`; ROM addresses are read-only in the running machine
-- A working sample is included at [examples/hello.asm](</C:/Users/Les Farrell/OneDrive/Desktop/emu/examples/hello.asm>)
+- Working samples are included at [hello.asm](/C:/Users/Les%20Farrell/OneDrive/Desktop/emu/src/examples/hello.asm) and [include-main.asm](/C:/Users/Les%20Farrell/OneDrive/Desktop/emu/src/examples/include-main.asm)
 
 ## Text Entry Notes
 
