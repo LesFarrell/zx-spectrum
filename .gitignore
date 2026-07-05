@@ -1,2 +1,9 @@
 build/
 build-cmake/
+src/*.tzx
+src/*.z80
+src/*.tap
+src/*.o
+src/*.pdb
+src/*.exe
+src/plus3.rom
