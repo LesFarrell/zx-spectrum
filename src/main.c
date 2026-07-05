@@ -75,7 +75,9 @@ enum {
     APP_MENU_ASM_EDIT_SELECT_ALL = 2215,
     APP_MENU_ASM_BUILD_ASSEMBLE = 2221,
     APP_MENU_ASM_HELP_SHOW = 2231,
-    APP_TIMER_MODAL_LOOP = 3001
+    APP_TIMER_MODAL_LOOP = 3001,
+    APP_MSG_TAPE_LOAD_COMPLETE = WM_APP + 1,
+    APP_MSG_SNAPSHOT_LOAD_COMPLETE = WM_APP + 2
 };
 
 typedef struct AudioBuffer {
@@ -103,6 +105,26 @@ typedef struct AutoTypeState {
     int hold_frames;
     int active_key_code;
 } AutoTypeState;
+
+typedef struct AppTapeLoadJob {
+    HWND hwnd;
+    char path[MAX_PATH];
+    uint32_t tick_hz;
+    bool stop_in_48k_mode;
+    TapePlayer tape;
+    char error[256];
+    bool ok;
+} AppTapeLoadJob;
+
+typedef struct AppSnapshotLoadJob {
+    HWND hwnd;
+    char path[MAX_PATH];
+    uint8_t *data;
+    size_t size;
+    SpectrumModel model;
+    char error[256];
+    bool ok;
+} AppSnapshotLoadJob;
 
 struct RomSet {
     char rom_a[MAX_PATH];
@@ -205,6 +227,8 @@ struct AppState {
     int active_key_codes[256];
     bool tape_autoload_enabled;
     bool tape_autoplay_pending;
+    bool tape_load_in_progress;
+    bool snapshot_load_in_progress;
     bool running;
     bool modal_loop_timer_active;
 };
@@ -238,9 +262,19 @@ static void app_show_error(const char *message);
 static bool app_start_autotype(AppState *app, const WCHAR *text);
 static bool app_tape_input_callback(void *user_data, uint64_t tick_count);
 static bool app_tape_fast_load_trap(void *user_data, void *machine);
+static DWORD WINAPI app_tape_load_worker(void *param);
+static DWORD WINAPI app_snapshot_load_worker(void *param);
 static bool app_parent_dir(char *path);
 static bool app_file_exists(const char *path);
 static bool app_join_path(char *out, size_t out_size, const char *left, const char *right);
+static bool app_read_file_all(
+    const char *path,
+    uint8_t **buffer,
+    size_t *size,
+    char *error_buffer,
+    size_t error_buffer_size,
+    const char *kind
+);
 static RomSet *app_rom_set_for_model(RomSelection *selection, SpectrumModel model);
 static const RomSet *app_rom_set_for_model_const(const RomSelection *selection, SpectrumModel model);
 static bool app_rom_set_is_available(const RomSet *set);
@@ -252,16 +286,13 @@ static bool app_load_model_roms(
     char *error_buffer,
     size_t error_buffer_size
 );
-static bool app_detect_snapshot_model(
-    const char *path,
-    SpectrumModel *model,
-    char *error_buffer,
-    size_t error_buffer_size
-);
 static bool app_parse_number(const char *text, int *value);
 static double app_model_frame_duration_ms(SpectrumModel model);
 static void app_tick_emulator(AppState *app);
 static bool app_load_tape_file(HWND hwnd, AppState *app, const char *path, char *error_buffer, size_t error_buffer_size);
+static bool app_apply_loaded_tape(HWND hwnd, AppState *app, TapePlayer *loaded_tape, char *error_buffer, size_t error_buffer_size);
+static bool app_load_snapshot_file(HWND hwnd, AppState *app, const char *path, char *error_buffer, size_t error_buffer_size);
+static bool app_apply_loaded_snapshot(HWND hwnd, AppState *app, AppSnapshotLoadJob *job, char *error_buffer, size_t error_buffer_size);
 static void app_play_tape(AppState *app);
 static void app_stop_tape(AppState *app);
 static void app_set_modal_loop_timer(AppState *app, HWND hwnd, bool enabled);
@@ -4257,8 +4288,57 @@ static bool app_start_autotype(AppState *app, const WCHAR *text) {
     return queued;
 }
 
-/* Inserts a TAP or TZX image, then either auto-starts a standard ROM load or
-   leaves the tape inserted for manual control depending on user preference. */
+/* Runs tape file I/O and decode work away from the window thread so opening
+   larger TAP/TZX files does not stall input or trigger the busy cursor. */
+static DWORD WINAPI app_tape_load_worker(void *param) {
+    AppTapeLoadJob *job = (AppTapeLoadJob *)param;
+
+    tape_init(&job->tape);
+    job->ok = tape_load_file(
+        &job->tape,
+        job->path,
+        job->tick_hz,
+        job->stop_in_48k_mode,
+        job->error,
+        sizeof(job->error)
+    );
+    if (!PostMessageA(job->hwnd, APP_MSG_TAPE_LOAD_COMPLETE, 0, (LPARAM)job)) {
+        if (job->ok) {
+            tape_discard(&job->tape);
+        }
+        free(job);
+    }
+    return 0;
+}
+
+/* Runs snapshot file I/O and model detection away from the window thread so
+   loading larger `.z80` files does not stall painting or input processing. */
+static DWORD WINAPI app_snapshot_load_worker(void *param) {
+    AppSnapshotLoadJob *job = (AppSnapshotLoadJob *)param;
+
+    job->ok = app_read_file_all(
+        job->path,
+        &job->data,
+        &job->size,
+        job->error,
+        sizeof(job->error),
+        "snapshot"
+    );
+    if (job->ok) {
+        if (!spectrum_detect_snapshot_model_data(job->data, job->size, &job->model)) {
+            snprintf(job->error, sizeof(job->error), "Unsupported or corrupt .z80 snapshot: %s", job->path);
+            job->ok = false;
+        }
+    }
+    if (!PostMessageA(job->hwnd, APP_MSG_SNAPSHOT_LOAD_COMPLETE, 0, (LPARAM)job)) {
+        free(job->data);
+        free(job);
+    }
+    return 0;
+}
+
+/* Starts an asynchronous tape decode job and returns immediately so the UI
+   thread can keep pumping messages while file loading happens in the background. */
 static bool app_load_tape_file(
     HWND hwnd,
     AppState *app,
@@ -4266,25 +4346,93 @@ static bool app_load_tape_file(
     char *error_buffer,
     size_t error_buffer_size
 ) {
-    const bool should_stop_in_48k = app->spec.model == SPECTRUM_MODEL_48K;
-    SpectrumModel autoload_model = app->spec.model;
+    AppTapeLoadJob *job;
+    HANDLE thread_handle;
 
-    if (!tape_load_file(
-            &app->tape,
-            path,
-            (uint32_t)app->spec.machine.freq_hz,
-            should_stop_in_48k,
-            error_buffer,
-            error_buffer_size)) {
+    if (app->tape_load_in_progress) {
+        snprintf(error_buffer, error_buffer_size, "A tape is already loading.");
         return false;
     }
 
+    job = (AppTapeLoadJob *)calloc(1, sizeof(*job));
+    if (job == NULL) {
+        snprintf(error_buffer, error_buffer_size, "Out of memory while starting tape load.");
+        return false;
+    }
+
+    job->hwnd = hwnd;
+    job->tick_hz = (uint32_t)app->spec.machine.freq_hz;
+    job->stop_in_48k_mode = app->spec.model == SPECTRUM_MODEL_48K;
+    snprintf(job->path, sizeof(job->path), "%s", path);
+
+    thread_handle = CreateThread(NULL, 0, app_tape_load_worker, job, 0, NULL);
+    if (thread_handle == NULL) {
+        free(job);
+        snprintf(error_buffer, error_buffer_size, "Could not create tape loading thread.");
+        return false;
+    }
+
+    CloseHandle(thread_handle);
+    app->tape_load_in_progress = true;
+    return true;
+}
+
+/* Starts an asynchronous snapshot file read/validation job and returns
+   immediately so the UI thread stays responsive while disk work completes. */
+static bool app_load_snapshot_file(
+    HWND hwnd,
+    AppState *app,
+    const char *path,
+    char *error_buffer,
+    size_t error_buffer_size
+) {
+    AppSnapshotLoadJob *job;
+    HANDLE thread_handle;
+
+    if (app->snapshot_load_in_progress) {
+        snprintf(error_buffer, error_buffer_size, "A snapshot is already loading.");
+        return false;
+    }
+
+    job = (AppSnapshotLoadJob *)calloc(1, sizeof(*job));
+    if (job == NULL) {
+        snprintf(error_buffer, error_buffer_size, "Out of memory while starting snapshot load.");
+        return false;
+    }
+    job->hwnd = hwnd;
+    snprintf(job->path, sizeof(job->path), "%s", path);
+
+    thread_handle = CreateThread(NULL, 0, app_snapshot_load_worker, job, 0, NULL);
+    if (thread_handle == NULL) {
+        free(job);
+        snprintf(error_buffer, error_buffer_size, "Could not create snapshot loading thread.");
+        return false;
+    }
+
+    CloseHandle(thread_handle);
+    app->snapshot_load_in_progress = true;
+    return true;
+}
+
+/* Inserts an already decoded TAP/TZX image, then either auto-starts a standard
+   ROM load or leaves the tape inserted for manual control depending on user
+   preference. This runs on the main thread after background file decode ends. */
+static bool app_apply_loaded_tape(
+    HWND hwnd,
+    AppState *app,
+    TapePlayer *loaded_tape,
+    char *error_buffer,
+    size_t error_buffer_size
+) {
+    const TapeAutoloadTarget autoload_target = tape_autoload_target(loaded_tape);
+    SpectrumModel autoload_model = app->spec.model;
+
+    tape_discard(&app->tape);
+    app->tape = *loaded_tape;
     tape_stop(&app->tape);
     tape_rewind(&app->tape, (uint32_t)app->spec.machine.freq_hz);
 
     if (app->tape_autoload_enabled) {
-        const TapeAutoloadTarget autoload_target = tape_autoload_target(&app->tape);
-
         if (autoload_target == TAPE_AUTOLOAD_TARGET_128_MENU) {
             autoload_model = SPECTRUM_MODEL_128K;
         } else if (autoload_target == TAPE_AUTOLOAD_TARGET_48_BASIC) {
@@ -4317,6 +4465,39 @@ static bool app_load_tape_file(
         }
     }
 
+    app_debug_machine_changed(app);
+    InvalidateRect(hwnd, NULL, FALSE);
+    return true;
+}
+
+/* Applies a background-loaded snapshot on the main thread, rebuilding the
+   machine only if the decoded `.z80` payload targets a different model. */
+static bool app_apply_loaded_snapshot(
+    HWND hwnd,
+    AppState *app,
+    AppSnapshotLoadJob *job,
+    char *error_buffer,
+    size_t error_buffer_size
+) {
+    app_autotype_clear(app);
+    app_release_all_keys(app);
+    app_audio_flush(app);
+    tape_stop(&app->tape);
+
+    if (job->model != app->spec.model) {
+        const RomSet *set = app_rom_set_for_model_const(&app->roms, job->model);
+        if (!app_load_model_roms(app, job->model, set, error_buffer, error_buffer_size)) {
+            return false;
+        }
+        tape_rewind(&app->tape, (uint32_t)app->spec.machine.freq_hz);
+    }
+    if (!spectrum_load_snapshot_z80_data(&app->spec, job->data, job->size, error_buffer, error_buffer_size)) {
+        return false;
+    }
+
+    app_audio_flush(app);
+    app_update_title(hwnd, &app->spec);
+    app_update_model_menu(hwnd, app->spec.model);
     app_debug_machine_changed(app);
     InvalidateRect(hwnd, NULL, FALSE);
     return true;
@@ -4608,6 +4789,40 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                 return 0;
             }
             break;
+        case APP_MSG_TAPE_LOAD_COMPLETE:
+            if (app != NULL) {
+                AppTapeLoadJob *job = (AppTapeLoadJob *)lparam;
+                app->tape_load_in_progress = false;
+                if (job != NULL) {
+                    if (!job->ok) {
+                        app_show_error(job->error);
+                    } else if (!app_apply_loaded_tape(hwnd, app, &job->tape, job->error, sizeof(job->error))) {
+                        app_show_error(job->error);
+                    } else {
+                        tape_init(&job->tape);
+                    }
+                    tape_discard(&job->tape);
+                    free(job);
+                }
+                return 0;
+            }
+            break;
+        case APP_MSG_SNAPSHOT_LOAD_COMPLETE:
+            if (app != NULL) {
+                AppSnapshotLoadJob *job = (AppSnapshotLoadJob *)lparam;
+                app->snapshot_load_in_progress = false;
+                if (job != NULL) {
+                    if (!job->ok) {
+                        app_show_error(job->error);
+                    } else if (!app_apply_loaded_snapshot(hwnd, app, job, job->error, sizeof(job->error))) {
+                        app_show_error(job->error);
+                    }
+                    free(job->data);
+                    free(job);
+                }
+                return 0;
+            }
+            break;
         case WM_COMMAND:
             if (app != NULL) {
                 switch (LOWORD(wparam)) {
@@ -4642,32 +4857,8 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                             }
 
                             if (extension != NULL && _stricmp(extension, ".z80") == 0) {
-                                SpectrumModel snapshot_model;
-
-                                app_autotype_clear(app);
-                                app_release_all_keys(app);
-                                app_audio_flush(app);
-                                tape_stop(&app->tape);
-                                if (!app_detect_snapshot_model(path, &snapshot_model, error_buffer, sizeof(error_buffer))) {
+                                if (!app_load_snapshot_file(hwnd, app, path, error_buffer, sizeof(error_buffer))) {
                                     app_show_error(error_buffer);
-                                    return 0;
-                                }
-                                if (snapshot_model != app->spec.model) {
-                                    const RomSet *set = app_rom_set_for_model_const(&app->roms, snapshot_model);
-                                    if (!app_load_model_roms(app, snapshot_model, set, error_buffer, sizeof(error_buffer))) {
-                                        app_show_error(error_buffer);
-                                        return 0;
-                                    }
-                                    tape_rewind(&app->tape, (uint32_t)app->spec.machine.freq_hz);
-                                }
-                                if (!spectrum_load_snapshot_z80(&app->spec, path, error_buffer, sizeof(error_buffer))) {
-                                    app_show_error(error_buffer);
-                                } else {
-                                    app_audio_flush(app);
-                                    app_update_title(hwnd, &app->spec);
-                                    app_update_model_menu(hwnd, app->spec.model);
-                                    app_debug_machine_changed(app);
-                                    InvalidateRect(hwnd, NULL, FALSE);
                                 }
                                 return 0;
                             }
@@ -5729,50 +5920,53 @@ static void app_controller_poll(AppState *app) {
     }
 }
 
-/* Reads enough of a `.z80` snapshot header to decide which machine ROM set
-   must be loaded before the chips quickloader restores machine state. */
-static bool app_detect_snapshot_model(
+/* Reads an entire file into a heap buffer so background loader workers can
+   validate and apply media without blocking the window thread on file I/O. */
+static bool app_read_file_all(
     const char *path,
-    SpectrumModel *model,
+    uint8_t **buffer,
+    size_t *size,
     char *error_buffer,
-    size_t error_buffer_size
+    size_t error_buffer_size,
+    const char *kind
 ) {
     FILE *file = fopen(path, "rb");
-    uint8_t header[35];
-    size_t bytes_read;
-    uint16_t pc;
+    uint8_t *data = NULL;
+    long file_size;
 
     if (file == NULL) {
-        snprintf(error_buffer, error_buffer_size, "Could not read snapshot file: %s", path);
+        snprintf(error_buffer, error_buffer_size, "Could not read %s file: %s", kind, path);
         return false;
     }
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        snprintf(error_buffer, error_buffer_size, "Could not size %s file: %s", kind, path);
+        return false;
+    }
+    file_size = ftell(file);
+    if (file_size <= 0) {
+        fclose(file);
+        snprintf(error_buffer, error_buffer_size, "%s file is empty: %s", kind, path);
+        return false;
+    }
+    rewind(file);
 
-    bytes_read = fread(header, 1, sizeof(header), file);
+    data = (uint8_t *)malloc((size_t)file_size);
+    if (data == NULL) {
+        fclose(file);
+        snprintf(error_buffer, error_buffer_size, "Out of memory while reading %s file: %s", kind, path);
+        return false;
+    }
+    if (fread(data, 1, (size_t)file_size, file) != (size_t)file_size) {
+        free(data);
+        fclose(file);
+        snprintf(error_buffer, error_buffer_size, "Could not read %s file: %s", kind, path);
+        return false;
+    }
     fclose(file);
-    if (bytes_read < 30) {
-        snprintf(error_buffer, error_buffer_size, "Unsupported or corrupt .z80 snapshot: %s", path);
-        return false;
-    }
 
-    pc = (uint16_t)(header[6] | (header[7] << 8));
-    if (pc != 0) {
-        *model = SPECTRUM_MODEL_48K;
-        return true;
-    }
-    if (bytes_read < 35) {
-        snprintf(error_buffer, error_buffer_size, "Unsupported or corrupt .z80 snapshot: %s", path);
-        return false;
-    }
-
-    if (header[34] < 3) {
-        *model = SPECTRUM_MODEL_48K;
-    } else {
-        if (header[34] == 7 || header[34] == 8 || header[34] == 13) {
-            snprintf(error_buffer, error_buffer_size, "This snapshot targets an unsupported Spectrum model.");
-            return false;
-        }
-        *model = SPECTRUM_MODEL_128K;
-    }
+    *buffer = data;
+    *size = (size_t)file_size;
     return true;
 }
 

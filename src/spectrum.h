@@ -109,6 +109,24 @@ void spectrum_key_up(Spectrum *spec, int key_code);
 /* Updates the emulated joystick state mask presented on the Kempston port. */
 void spectrum_set_joystick_mask(Spectrum *spec, uint8_t mask);
 
+/* Detects the target machine model encoded by a `.z80` snapshot payload that
+   has already been read into memory. */
+bool spectrum_detect_snapshot_model_data(
+    const uint8_t *data,
+    size_t size,
+    SpectrumModel *model
+);
+
+/* Loads a `.z80` snapshot payload that is already resident in memory into the
+   wrapped machine, rebuilding to the encoded model when necessary. */
+bool spectrum_load_snapshot_z80_data(
+    Spectrum *spec,
+    const uint8_t *data,
+    size_t data_size,
+    char *error_buffer,
+    size_t error_buffer_size
+);
+
 /* Loads a `.z80` snapshot file into the currently wrapped machine, rebuilding
    the 48K or 128K backend first when the snapshot format requires a different
    model than the one that is currently active. */

@@ -99,7 +99,7 @@ static bool spectrum_load_file_all(const char *path, uint8_t **buffer, size_t *s
 
 /* Extracts the target machine model from a `.z80` snapshot header so the
    wrapper can rebuild the emulator as 48K or 128K before loading the state. */
-static bool spectrum_detect_snapshot_model(
+bool spectrum_detect_snapshot_model_data(
     const uint8_t *data,
     size_t size,
     SpectrumModel *model
@@ -395,6 +395,39 @@ void spectrum_set_joystick_mask(Spectrum *spec, uint8_t mask) {
 
 /* Loads a `.z80` snapshot file, switches the backend model when necessary,
    then asks the chips ZX implementation to restore the machine state. */
+bool spectrum_load_snapshot_z80_data(
+    Spectrum *spec,
+    const uint8_t *data,
+    size_t data_size,
+    char *error_buffer,
+    size_t error_buffer_size
+) {
+    SpectrumModel snapshot_model;
+
+    if (!spectrum_detect_snapshot_model_data(data, data_size, &snapshot_model)) {
+        snprintf(error_buffer, error_buffer_size, "Unsupported or corrupt .z80 snapshot.");
+        return false;
+    }
+
+    if (snapshot_model != spec->model) {
+        if (!spectrum_rebuild_for_model(spec, snapshot_model, error_buffer, error_buffer_size)) {
+            return false;
+        }
+    }
+
+    if (!zx_quickload(&spec->machine, (chips_range_t){ .ptr = (void *)data, .size = data_size })) {
+        snprintf(
+            error_buffer,
+            error_buffer_size,
+            "Could not load .z80 snapshot into the current machine."
+        );
+        return false;
+    }
+
+    spectrum_render_frame(spec);
+    return true;
+}
+
 bool spectrum_load_snapshot_z80(
     Spectrum *spec,
     const char *snapshot_path,
@@ -403,7 +436,6 @@ bool spectrum_load_snapshot_z80(
 ) {
     uint8_t *data = NULL;
     size_t data_size = 0;
-    SpectrumModel snapshot_model;
     bool ok = false;
 
     if (!spectrum_load_file_all(snapshot_path, &data, &data_size)) {
@@ -411,31 +443,12 @@ bool spectrum_load_snapshot_z80(
         return false;
     }
 
-    if (!spectrum_detect_snapshot_model(data, data_size, &snapshot_model)) {
-        snprintf(error_buffer, error_buffer_size, "Unsupported or corrupt .z80 snapshot: %s", snapshot_path);
-        goto cleanup;
+    ok = spectrum_load_snapshot_z80_data(spec, data, data_size, error_buffer, error_buffer_size);
+    if (!ok && error_buffer[0] != '\0') {
+        char message[256];
+        snprintf(message, sizeof(message), "%s: %s", error_buffer, snapshot_path);
+        snprintf(error_buffer, error_buffer_size, "%s", message);
     }
-
-    if (snapshot_model != spec->model) {
-        if (!spectrum_rebuild_for_model(spec, snapshot_model, error_buffer, error_buffer_size)) {
-            goto cleanup;
-        }
-    }
-
-    if (!zx_quickload(&spec->machine, (chips_range_t){ .ptr = data, .size = data_size })) {
-        snprintf(
-            error_buffer,
-            error_buffer_size,
-            "Could not load .z80 snapshot into the current machine: %s",
-            snapshot_path
-        );
-        goto cleanup;
-    }
-
-    spectrum_render_frame(spec);
-    ok = true;
-
-cleanup:
     free(data);
     return ok;
 }
