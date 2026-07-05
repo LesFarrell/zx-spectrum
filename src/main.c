@@ -4174,8 +4174,8 @@ static int app_resolve_key_down(WPARAM wparam, LPARAM lparam) {
     return app_lookup_fallback_key(vk);
 }
 
-/* Converts queued Unicode text into the limited ASCII subset currently
-   supported by the emulator's Spectrum keyboard mapping. */
+/* Converts internal auto-type text into the limited ASCII subset needed by
+   the tape autoload command queue. */
 static int app_autotype_translate_char(WCHAR ch) {
     if (ch == L'\r' || ch == L'\n') {
         return 0x0D;
@@ -4189,7 +4189,8 @@ static int app_autotype_translate_char(WCHAR ch) {
     return 0;
 }
 
-/* Clears any queued translated text so a new paste starts from a known state. */
+/* Clears any pending auto-type command and releases any injected key that is
+   still being held across frames. */
 static void app_autotype_clear(AppState *app) {
     if (app->auto_type.active_key_code != 0) {
         spectrum_key_up(&app->spec, app->auto_type.active_key_code);
@@ -4227,8 +4228,8 @@ static bool app_tape_fast_load_trap(void *user_data, void *machine) {
     return tape_try_fast_load(&app->tape, (zx_t *)machine);
 }
 
-/* Starts a queued text-entry sequence that feeds printable characters into the
-   Spectrum one key tap at a time on later emulator frames. */
+/* Queues a short ROM-facing command sequence, such as the tape autoload
+   keystrokes, for paced injection over later emulator frames. */
 static bool app_start_autotype(AppState *app, const WCHAR *text) {
     bool queued = false;
 
@@ -4267,7 +4268,6 @@ static bool app_load_tape_file(
 ) {
     const bool should_stop_in_48k = app->spec.model == SPECTRUM_MODEL_48K;
     SpectrumModel autoload_model = app->spec.model;
-    (void)hwnd;
 
     if (!tape_load_file(
             &app->tape,

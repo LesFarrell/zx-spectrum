@@ -59,6 +59,9 @@ static bool tape_program_uses_128_basic_tokens(const TapeBlock *block) {
     return false;
 }
 
+/* Classifies the likely ROM-side autoload path from the first indexed blocks.
+   Ambiguous tapes fall back to 48 BASIC because most TAP/TZX program images
+   use a standard 48K loader even when opened from a 128K-capable frontend. */
 static TapeAutoloadTarget tape_detect_autoload_target(const TapePlayer *player) {
     uint8_t first_type;
 

@@ -93,12 +93,6 @@ With no arguments, the emulator looks for `128.rom` in `.\src` first and starts 
 - Assembler writes are limited to RAM at `0x4000`-`0xFFFF`; ROM addresses are read-only in the running machine
 - Working samples are included at [hello.asm](/C:/Users/Les%20Farrell/OneDrive/Desktop/emu/src/examples/hello.asm) and [include-main.asm](/C:/Users/Les%20Farrell/OneDrive/Desktop/emu/src/examples/include-main.asm)
 
-## Text Entry Notes
-
-- The Spectrum ROM still decides whether a key press means a BASIC keyword, a letter, or a symbol
-- Queued text is most useful for symbols and line fragments once the ROM editor is already in the mode you expect
-- BASIC keywords still follow normal Spectrum editing rules, so the first token on a line is not treated like a modern text field
-
 ## Notes
 
 This is a deliberately simple emulator shell built around the vendored `chips` ZX Spectrum core under the zlib/libpng license. The license text is in [third_party/chips/LICENSE.txt](</C:/Users/Les Farrell/OneDrive/Desktop/emu/third_party/chips/LICENSE.txt>).
