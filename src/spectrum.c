@@ -146,6 +146,8 @@ static void spectrum_init_machine(Spectrum *spec) {
     desc.audio.sample_rate = spec->audio_sample_rate;
     desc.audio.beeper_volume = spec->beeper_volume;
     desc.audio.ay_volume = spec->ay_volume;
+    desc.tape.callback = spec->tape_callback;
+    desc.tape.user_data = spec->tape_user_data;
     if (spec->model == SPECTRUM_MODEL_128K) {
         desc.roms.zx128_0.ptr = spec->rom[0];
         desc.roms.zx128_0.size = sizeof(spec->rom[0]);
@@ -220,6 +222,19 @@ void spectrum_configure_audio(
     spec->audio_num_samples = num_samples;
     spec->beeper_volume = beeper_volume;
     spec->ay_volume = ay_volume;
+}
+
+/* Records the tape input source so machine rebuilds preserve the callback. */
+void spectrum_configure_tape_input(
+    Spectrum *spec,
+    zx_tape_input_callback_t callback,
+    void *user_data
+) {
+    spec->tape_callback = callback;
+    spec->tape_user_data = user_data;
+    if (spec->machine_ready) {
+        zx_set_tape_input(&spec->machine, callback, user_data);
+    }
 }
 
 /* Loads ROM data from disk, validates whether it matches the requested 48K

@@ -14,6 +14,7 @@
 #include <string.h>
 
 #include "spectrum.h"
+#include "tape.h"
 
 typedef struct KeyMap {
     UINT vk;
@@ -36,6 +37,8 @@ enum {
     APP_MENU_FILE_OPEN_SNAPSHOT = 1001,
     APP_MENU_FILE_RESET = 1002,
     APP_MENU_FILE_EXIT = 1003,
+    APP_MENU_FILE_PLAY_TAPE = 1004,
+    APP_MENU_FILE_STOP_TAPE = 1005,
     APP_MENU_TOOLS_ASSEMBLER = 1301,
     APP_MENU_TOOLS_DEBUGGER = 1302,
     APP_MENU_MACHINE_48K = 1201,
@@ -93,6 +96,8 @@ typedef struct AutoTypeState {
     size_t length;
     size_t position;
     int cooldown_frames;
+    int hold_frames;
+    int active_key_code;
 } AutoTypeState;
 
 struct RomSet {
@@ -191,6 +196,7 @@ struct AppState {
     AudioState audio;
     ControllerState controller;
     AutoTypeState auto_type;
+    TapePlayer tape;
     DebugState debug;
     int active_key_codes[256];
     bool running;
@@ -224,6 +230,7 @@ static const KeyMap SPECIAL_KEY_MAP[] = {
 
 static void app_show_error(const char *message);
 static bool app_start_autotype(AppState *app, const WCHAR *text);
+static bool app_tape_input_callback(void *user_data, uint64_t tick_count);
 static bool app_parent_dir(char *path);
 static bool app_file_exists(const char *path);
 static bool app_join_path(char *out, size_t out_size, const char *left, const char *right);
@@ -247,6 +254,9 @@ static bool app_detect_snapshot_model(
 static bool app_parse_number(const char *text, int *value);
 static double app_model_frame_duration_ms(SpectrumModel model);
 static void app_tick_emulator(AppState *app);
+static bool app_load_tape_file(HWND hwnd, AppState *app, const char *path, char *error_buffer, size_t error_buffer_size);
+static void app_play_tape(AppState *app);
+static void app_stop_tape(AppState *app);
 static void app_set_modal_loop_timer(AppState *app, HWND hwnd, bool enabled);
 static void app_controller_init(AppState *app);
 static void app_controller_shutdown(AppState *app);
@@ -328,7 +338,10 @@ static HMENU app_create_menu(void) {
         return NULL;
     }
 
-    AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_OPEN_SNAPSHOT, "&Open .z80 Snapshot...\tCtrl+O");
+    AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_OPEN_SNAPSHOT, "&Open Tape/Snapshot...\tCtrl+O");
+    AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_PLAY_TAPE, "&Play Tape\tF3");
+    AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_STOP_TAPE, "S&top Tape\tF4");
+    AppendMenuA(file_menu, MF_SEPARATOR, 0, NULL);
     AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_RESET, "&Reset\tCtrl+R");
     AppendMenuA(file_menu, MF_SEPARATOR, 0, NULL);
     AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_EXIT, "E&xit\tAlt+F4");
@@ -4152,9 +4165,14 @@ static int app_autotype_translate_char(WCHAR ch) {
 
 /* Clears any queued translated text so a new paste starts from a known state. */
 static void app_autotype_clear(AppState *app) {
+    if (app->auto_type.active_key_code != 0) {
+        spectrum_key_up(&app->spec, app->auto_type.active_key_code);
+    }
     app->auto_type.length = 0;
     app->auto_type.position = 0;
     app->auto_type.cooldown_frames = 0;
+    app->auto_type.hold_frames = 0;
+    app->auto_type.active_key_code = 0;
 }
 
 /* Releases every currently held Spectrum key, for example after the emulator
@@ -4166,6 +4184,13 @@ static void app_release_all_keys(AppState *app) {
             app->active_key_codes[i] = 0;
         }
     }
+}
+
+/* Samples the inserted tape image at the current emulated t-state so ULA
+   reads can see the waveform on EAR bit 6. */
+static bool app_tape_input_callback(void *user_data, uint64_t tick_count) {
+    AppState *app = (AppState *)user_data;
+    return tape_input_level(&app->tape, tick_count);
 }
 
 /* Starts a queued text-entry sequence that feeds printable characters into the
@@ -4221,28 +4246,82 @@ static bool app_paste_text(HWND hwnd, AppState *app) {
     return queued;
 }
 
+/* Inserts a TAP or TZX image into the virtual tape deck without resetting
+   the machine or typing commands on the user's behalf. */
+static bool app_load_tape_file(
+    HWND hwnd,
+    AppState *app,
+    const char *path,
+    char *error_buffer,
+    size_t error_buffer_size
+) {
+    const bool should_stop_in_48k = app->spec.model == SPECTRUM_MODEL_48K;
+
+    if (!tape_load_file(
+            &app->tape,
+            path,
+            (uint32_t)app->spec.machine.freq_hz,
+            should_stop_in_48k,
+            error_buffer,
+            error_buffer_size)) {
+        return false;
+    }
+
+    tape_stop(&app->tape);
+    tape_rewind(&app->tape, (uint32_t)app->spec.machine.freq_hz);
+    app_debug_machine_changed(app);
+    InvalidateRect(hwnd, NULL, FALSE);
+    MessageBoxA(
+        hwnd,
+        "Tape inserted.\nType LOAD \"\" at the BASIC prompt, then press F3 to play.\nPress F4 to stop.",
+        "ZX Spectrum Emulator",
+        MB_OK | MB_ICONINFORMATION
+    );
+    return true;
+}
+
 /* Advances the queued text-entry path once per frame, tapping a single
    Spectrum key with a short gap between characters for ROM scanning safety. */
 static void app_run_autotype(AppState *app) {
-    int key_code;
-
-    if (app->auto_type.position >= app->auto_type.length) {
+    if (app->auto_type.active_key_code != 0) {
+        if (app->auto_type.hold_frames > 0) {
+            app->auto_type.hold_frames--;
+            return;
+        }
+        spectrum_key_up(&app->spec, app->auto_type.active_key_code);
+        app->auto_type.active_key_code = 0;
+        app->auto_type.cooldown_frames = 2;
+        if (app->auto_type.position >= app->auto_type.length) {
+            app->auto_type.length = 0;
+            app->auto_type.position = 0;
+        }
         return;
     }
     if (app->auto_type.cooldown_frames > 0) {
         app->auto_type.cooldown_frames--;
         return;
     }
-
-    key_code = (unsigned char)app->auto_type.buffer[app->auto_type.position++];
-    spectrum_key_down(&app->spec, key_code);
-    spectrum_key_up(&app->spec, key_code);
-    app->auto_type.cooldown_frames = 1;
-
     if (app->auto_type.position >= app->auto_type.length) {
-        app->auto_type.length = 0;
-        app->auto_type.position = 0;
+        return;
     }
+
+    app->auto_type.active_key_code = (unsigned char)app->auto_type.buffer[app->auto_type.position++];
+    spectrum_key_down(&app->spec, app->auto_type.active_key_code);
+    app->auto_type.hold_frames = 2;
+}
+
+/* Restarts the inserted tape from the beginning and begins playback. */
+static void app_play_tape(AppState *app) {
+    if (!tape_has_tape(&app->tape)) {
+        return;
+    }
+    tape_rewind(&app->tape, (uint32_t)app->spec.machine.freq_hz);
+    tape_start(&app->tape, app->spec.machine.tick_count);
+}
+
+/* Stops the current tape playback position without ejecting the inserted tape. */
+static void app_stop_tape(AppState *app) {
+    tape_stop(&app->tape);
 }
 
 /* Switches the running machine between 48K and 128K by reloading the ROM
@@ -4261,11 +4340,13 @@ static void app_switch_model(HWND hwnd, AppState *app, SpectrumModel model) {
     app_autotype_clear(app);
     app_release_all_keys(app);
     app_audio_flush(app);
+    tape_stop(&app->tape);
     if (!app_load_model_roms(app, model, set, error_buffer, sizeof(error_buffer))) {
         app_show_error(error_buffer);
         app_update_model_menu(hwnd, app->spec.model);
         return;
     }
+    tape_rewind(&app->tape, (uint32_t)app->spec.machine.freq_hz);
 
     app_save_model(model);
     app_update_title(hwnd, &app->spec);
@@ -4444,6 +4525,18 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                     SendMessageA(hwnd, WM_CLOSE, 0, 0);
                     return 0;
                 }
+                if (!ctrl_down && !shift_down && !alt_down) {
+                    switch ((UINT)wparam) {
+                        case VK_F3:
+                            SendMessageA(hwnd, WM_COMMAND, APP_MENU_FILE_PLAY_TAPE, 0);
+                            return 0;
+                        case VK_F4:
+                            SendMessageA(hwnd, WM_COMMAND, APP_MENU_FILE_STOP_TAPE, 0);
+                            return 0;
+                        default:
+                            break;
+                    }
+                }
                 app_handle_key_down(app, wparam, lparam);
             }
             return 0;
@@ -4477,53 +4570,80 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                         OPENFILENAMEA ofn;
                         char path[MAX_PATH];
                         char error_buffer[256];
+                        const char *extension;
 
                         ZeroMemory(&ofn, sizeof(ofn));
                         ZeroMemory(path, sizeof(path));
                         ofn.lStructSize = sizeof(ofn);
                         ofn.hwndOwner = hwnd;
                         ofn.lpstrFilter =
+                            "ZX Spectrum Files (*.tap;*.tzx;*.z80)\0*.tap;*.tzx;*.z80\0"
+                            "Tape Images (*.tap;*.tzx)\0*.tap;*.tzx\0"
                             "ZX Spectrum Snapshots (*.z80)\0*.z80\0"
                             "All Files (*.*)\0*.*\0";
                         ofn.lpstrFile = path;
                         ofn.nMaxFile = MAX_PATH;
                         ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
-                        ofn.lpstrDefExt = "z80";
+                        ofn.lpstrDefExt = "tap";
 
                         if (GetOpenFileNameA(&ofn)) {
-                            SpectrumModel snapshot_model;
-
-                            if (!app_detect_snapshot_model(path, &snapshot_model, error_buffer, sizeof(error_buffer))) {
-                                app_show_error(error_buffer);
+                            extension = strrchr(path, '.');
+                            if (extension != NULL &&
+                                (_stricmp(extension, ".tap") == 0 || _stricmp(extension, ".tzx") == 0)) {
+                                if (!app_load_tape_file(hwnd, app, path, error_buffer, sizeof(error_buffer))) {
+                                    app_show_error(error_buffer);
+                                }
                                 return 0;
                             }
-                            if (snapshot_model != app->spec.model) {
-                                const RomSet *set = app_rom_set_for_model_const(&app->roms, snapshot_model);
+
+                            if (extension != NULL && _stricmp(extension, ".z80") == 0) {
+                                SpectrumModel snapshot_model;
+
                                 app_autotype_clear(app);
                                 app_release_all_keys(app);
                                 app_audio_flush(app);
-                                if (!app_load_model_roms(app, snapshot_model, set, error_buffer, sizeof(error_buffer))) {
+                                tape_stop(&app->tape);
+                                if (!app_detect_snapshot_model(path, &snapshot_model, error_buffer, sizeof(error_buffer))) {
                                     app_show_error(error_buffer);
                                     return 0;
                                 }
+                                if (snapshot_model != app->spec.model) {
+                                    const RomSet *set = app_rom_set_for_model_const(&app->roms, snapshot_model);
+                                    if (!app_load_model_roms(app, snapshot_model, set, error_buffer, sizeof(error_buffer))) {
+                                        app_show_error(error_buffer);
+                                        return 0;
+                                    }
+                                    tape_rewind(&app->tape, (uint32_t)app->spec.machine.freq_hz);
+                                }
+                                if (!spectrum_load_snapshot_z80(&app->spec, path, error_buffer, sizeof(error_buffer))) {
+                                    app_show_error(error_buffer);
+                                } else {
+                                    app_audio_flush(app);
+                                    app_update_title(hwnd, &app->spec);
+                                    app_update_model_menu(hwnd, app->spec.model);
+                                    app_debug_machine_changed(app);
+                                    InvalidateRect(hwnd, NULL, FALSE);
+                                }
+                                return 0;
                             }
-                            if (!spectrum_load_snapshot_z80(&app->spec, path, error_buffer, sizeof(error_buffer))) {
-                                app_show_error(error_buffer);
-                            } else {
-                                app_audio_flush(app);
-                                app_update_title(hwnd, &app->spec);
-                                app_update_model_menu(hwnd, app->spec.model);
-                                app_debug_machine_changed(app);
-                                InvalidateRect(hwnd, NULL, FALSE);
-                            }
+
+                            app_show_error("Unsupported file type. Open a .tap, .tzx, or .z80 file.");
                         }
                         return 0;
                     }
+                    case APP_MENU_FILE_PLAY_TAPE:
+                        app_play_tape(app);
+                        return 0;
+                    case APP_MENU_FILE_STOP_TAPE:
+                        app_stop_tape(app);
+                        return 0;
                     case APP_MENU_FILE_RESET:
                         app_autotype_clear(app);
                         app_release_all_keys(app);
                         app_audio_flush(app);
+                        tape_stop(&app->tape);
                         spectrum_reset(&app->spec);
+                        tape_rewind(&app->tape, (uint32_t)app->spec.machine.freq_hz);
                         app_debug_machine_changed(app);
                         InvalidateRect(hwnd, NULL, FALSE);
                         return 0;
@@ -5378,6 +5498,7 @@ static bool app_load_model_roms(
         beeper_volume,
         ay_volume
     );
+    spectrum_configure_tape_input(&app->spec, app_tape_input_callback, app);
     if (!spectrum_load_roms(
             &app->spec,
             set->rom_a,
@@ -5652,6 +5773,7 @@ int main(int argc, char **argv) {
     AppState app;
     ZeroMemory(&app, sizeof(app));
     app.roms = selection;
+    tape_init(&app.tape);
     app_audio_init(&app);
     app_controller_init(&app);
 
@@ -5666,6 +5788,7 @@ int main(int argc, char **argv) {
         app_show_error(error_buffer);
         app_controller_shutdown(&app);
         app_audio_shutdown(&app);
+        tape_discard(&app.tape);
         return 1;
     }
 
@@ -5697,6 +5820,7 @@ int main(int argc, char **argv) {
         app_show_error("RegisterClass failed.");
         app_controller_shutdown(&app);
         app_audio_shutdown(&app);
+        tape_discard(&app.tape);
         return 1;
     }
     if (!app_register_tool_window_classes(instance)) {
@@ -5704,6 +5828,7 @@ int main(int argc, char **argv) {
         app_show_error("Tool window registration failed.");
         app_controller_shutdown(&app);
         app_audio_shutdown(&app);
+        tape_discard(&app.tape);
         return 1;
     }
 
@@ -5713,6 +5838,7 @@ int main(int argc, char **argv) {
         app_show_error("CreateMenu failed.");
         app_controller_shutdown(&app);
         app_audio_shutdown(&app);
+        tape_discard(&app.tape);
         return 1;
     }
 
@@ -5737,6 +5863,7 @@ int main(int argc, char **argv) {
         app_show_error("CreateWindowEx failed.");
         app_controller_shutdown(&app);
         app_audio_shutdown(&app);
+        tape_discard(&app.tape);
         return 1;
     }
 
@@ -5764,5 +5891,6 @@ int main(int argc, char **argv) {
 
     app_controller_shutdown(&app);
     app_audio_shutdown(&app);
+    tape_discard(&app.tape);
     return 0;
 }

@@ -12,11 +12,13 @@ Small ZX Spectrum emulator in C for Windows. It uses the Win32 API for display, 
 - Kempston joystick input from an XInput-compatible controller
 - 48K beeper sound through the Windows audio device
 - 128K AY sound through the Windows audio device
+- `.tap` tape loading
+- `.tzx` tape loading for standard-speed and common pulse/data blocks
 - `.z80` snapshot loading for 48K and 128K snapshots
 
 ## Not implemented
 
-- Tape loading
+- Advanced `.tzx` block types such as direct recording, generalized data, and call/jump control flow
 - Full ULA I/O contention timing
 - `.sna` snapshot loading
 - Non-48K/128K `.z80` snapshot models
@@ -69,7 +71,10 @@ With no arguments, the emulator looks for `128.rom` in `.\src` first and starts 
 
 ## Menu
 
-- `File -> Open .z80 Snapshot...` loads a ZX Spectrum `.z80` snapshot into the current emulator session
+- `File -> Open Tape/Snapshot...` opens `.tap`, `.tzx`, or `.z80` files
+- Tape files are inserted without resetting the machine
+- Type `LOAD ""` at the BASIC prompt, then press `F3` or use `File -> Play Tape`
+- Press `F4` or use `File -> Stop Tape` to stop playback
 - `File -> Reset` resets the active machine
 - `File -> Exit` closes the emulator
 - `Machine -> 48K` / `Machine -> 128K` rebuilds the emulator for that model and remembers the choice between runs

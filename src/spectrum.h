@@ -36,6 +36,8 @@ typedef struct Spectrum {
     int audio_sample_rate;
     float beeper_volume;
     float ay_volume;
+    zx_tape_input_callback_t tape_callback;
+    void *tape_user_data;
     int rom48_index;
 
     uint8_t rom[2][0x4000];
@@ -67,6 +69,13 @@ void spectrum_configure_audio(
     int num_samples,
     float beeper_volume,
     float ay_volume
+);
+
+/* Wires an application-owned EAR/tape input source into ULA port reads. */
+void spectrum_configure_tape_input(
+    Spectrum *spec,
+    zx_tape_input_callback_t callback,
+    void *user_data
 );
 
 /* Resets the embedded machine back to power-on state and refreshes the cached

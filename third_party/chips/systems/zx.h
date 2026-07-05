@@ -100,6 +100,8 @@ typedef enum {
 #define ZX_JOYSTICK_UP      (1<<3)
 #define ZX_JOYSTICK_BTN     (1<<4)
 
+typedef bool (*zx_tape_input_callback_t)(void *user_data, uint64_t tick_count);
+
 // config parameters for zx_init()
 typedef struct {
     zx_type_t type;                     // default is ZX_TYPE_48K
@@ -112,6 +114,10 @@ typedef struct {
         float beeper_volume;
         float ay_volume;
     } audio;
+    struct {
+        zx_tape_input_callback_t callback;
+        void *user_data;
+    } tape;
     // ROM images
     struct {
         // ZX Spectrum 48K
@@ -151,6 +157,8 @@ typedef struct {
     uint64_t freq_hz;
     bool valid;
     chips_debug_t debug;
+    zx_tape_input_callback_t tape_callback;
+    void *tape_user_data;
     struct {
         chips_audio_callback_t callback;
         int num_samples;
@@ -183,6 +191,8 @@ void zx_set_joystick_type(zx_t* sys, zx_joystick_type_t type);
 zx_joystick_type_t zx_joystick_type(zx_t* sys);
 // set joystick mask (combination of ZX_JOYSTICK_*)
 void zx_joystick(zx_t* sys, uint8_t mask);
+// set a callback used for EAR/tape input sampling during ULA reads
+void zx_set_tape_input(zx_t* sys, zx_tape_input_callback_t callback, void *user_data);
 // load a ZX Z80 file into the emulator
 bool zx_quickload(zx_t* sys, chips_range_t data);
 // save a snapshot, patches any pointers to zero, returns a snapshot version
@@ -226,6 +236,8 @@ void zx_init(zx_t* sys, const zx_desc_t* desc) {
     sys->audio.num_samples = _ZX_DEFAULT(desc->audio.num_samples, ZX_DEFAULT_AUDIO_SAMPLES);
     CHIPS_ASSERT(sys->audio.num_samples <= ZX_MAX_AUDIO_SAMPLES);
     sys->debug = desc->debug;
+    sys->tape_callback = desc->tape.callback;
+    sys->tape_user_data = desc->tape.user_data;
 
     // initalize the hardware
     sys->border_color = 0;
@@ -533,8 +545,14 @@ static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
             if (pins & Z80_RD) {
                 // read from ULA
                 uint8_t data = (1<<7)|(1<<5);
-                // MIC/EAR flags -> bit 6
-                if (sys->last_fe_out & (1<<3|1<<4)) {
+                bool ear_high = false;
+                if (sys->tape_callback != NULL) {
+                    ear_high = sys->tape_callback(sys->tape_user_data, sys->tick_count);
+                }
+                else if (sys->last_fe_out & (1<<3|1<<4)) {
+                    ear_high = true;
+                }
+                if (ear_high) {
                     data |= (1<<6);
                 }
                 // keyboard matrix bits are encoded in the upper 8 bit of the port address
@@ -742,6 +760,12 @@ void zx_joystick(zx_t* sys, uint8_t mask) {
     else {
         sys->joy_joymask = mask;
     }
+}
+
+void zx_set_tape_input(zx_t* sys, zx_tape_input_callback_t callback, void *user_data) {
+    CHIPS_ASSERT(sys && sys->valid);
+    sys->tape_callback = callback;
+    sys->tape_user_data = user_data;
 }
 
 static void _zx_init_memory_map(zx_t* sys) {
@@ -1083,6 +1107,8 @@ chips_display_info_t zx_display_info(zx_t* sys) {
 uint32_t zx_save_snapshot(zx_t* sys, zx_t* dst) {
     CHIPS_ASSERT(sys && dst);
     *dst = *sys;
+    dst->tape_callback = 0;
+    dst->tape_user_data = 0;
     chips_debug_snapshot_onsave(&dst->debug);
     chips_audio_callback_snapshot_onsave(&dst->audio.callback);
     ay38910_snapshot_onsave(&dst->ay);
@@ -1097,6 +1123,8 @@ bool zx_load_snapshot(zx_t* sys, uint32_t version, zx_t* src) {
     }
     static zx_t im;
     im = *src;
+    im.tape_callback = sys->tape_callback;
+    im.tape_user_data = sys->tape_user_data;
     chips_debug_snapshot_onload(&im.debug, &sys->debug);
     chips_audio_callback_snapshot_onload(&im.audio.callback, &sys->audio.callback);
     ay38910_snapshot_onload(&im.ay, &sys->ay);
