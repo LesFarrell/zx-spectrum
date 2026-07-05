@@ -29,6 +29,9 @@ enum {
     ZX_KEY_CAPS_SHIFT = 1,
     ZX_KEY_SYMBOL_SHIFT = 2,
     APP_AUTOTYPE_CAPACITY = 4096,
+    APP_AUTOTYPE_HOLD_FRAMES = 10,
+    APP_AUTOTYPE_COOLDOWN_FRAMES = 6,
+    APP_AUTOTYPE_BOOT_DELAY_FRAMES = 150,
     APP_AUDIO_SAMPLE_RATE = 44100,
     APP_AUDIO_CALLBACK_SAMPLES = 128,
     APP_AUDIO_BUFFER_SAMPLES = 1024,
@@ -39,6 +42,7 @@ enum {
     APP_MENU_FILE_EXIT = 1003,
     APP_MENU_FILE_PLAY_TAPE = 1004,
     APP_MENU_FILE_STOP_TAPE = 1005,
+    APP_MENU_FILE_AUTOLOAD_TAPES = 1006,
     APP_MENU_TOOLS_ASSEMBLER = 1301,
     APP_MENU_TOOLS_DEBUGGER = 1302,
     APP_MENU_MACHINE_48K = 1201,
@@ -199,6 +203,8 @@ struct AppState {
     TapePlayer tape;
     DebugState debug;
     int active_key_codes[256];
+    bool tape_autoload_enabled;
+    bool tape_autoplay_pending;
     bool running;
     bool modal_loop_timer_active;
 };
@@ -268,6 +274,7 @@ static void app_debug_run_frame(AppState *app);
 static void app_debug_run_from_address(AppState *app, uint16_t address);
 static HMENU app_create_assembler_menu(void);
 static void app_save_model(SpectrumModel model);
+static void app_save_tape_autoload(bool enabled);
 static void app_update_model_menu(HWND hwnd, SpectrumModel model);
 static void app_audio_callback(const float *samples, int num_samples, void *user_data);
 static void app_debug_refresh_window(AppState *app);
@@ -342,6 +349,7 @@ static HMENU app_create_menu(void) {
     AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_OPEN_SNAPSHOT, "&Open Tape/Snapshot...\tCtrl+O");
     AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_PLAY_TAPE, "&Play Tape\tF3");
     AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_STOP_TAPE, "S&top Tape\tF4");
+    AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_AUTOLOAD_TAPES, "&Auto-load Tapes On Open");
     AppendMenuA(file_menu, MF_SEPARATOR, 0, NULL);
     AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_RESET, "&Reset\tCtrl+R");
     AppendMenuA(file_menu, MF_SEPARATOR, 0, NULL);
@@ -381,6 +389,10 @@ static const char *app_model_settings_value(SpectrumModel model) {
         default:
             return "48";
     }
+}
+
+static const char *app_tape_autoload_settings_value(bool enabled) {
+    return enabled ? "1" : "0";
 }
 
 /* Creates a simple document-style menu for the assembler window with file,
@@ -458,6 +470,19 @@ static void app_update_model_menu(HWND hwnd, SpectrumModel model) {
         APP_MENU_MACHINE_128K,
         app_model_menu_id(model),
         MF_BYCOMMAND
+    );
+}
+
+/* Reflects the current tape auto-load setting in the File menu. */
+static void app_update_tape_menu(HWND hwnd, bool enabled) {
+    HMENU menu = GetMenu(hwnd);
+    if (menu == NULL) {
+        return;
+    }
+    CheckMenuItem(
+        menu,
+        APP_MENU_FILE_AUTOLOAD_TAPES,
+        MF_BYCOMMAND | (enabled ? MF_CHECKED : MF_UNCHECKED)
     );
 }
 
@@ -4149,7 +4174,7 @@ static int app_resolve_key_down(WPARAM wparam, LPARAM lparam) {
     return app_lookup_fallback_key(vk);
 }
 
-/* Converts pasted Unicode text into the limited ASCII subset currently
+/* Converts queued Unicode text into the limited ASCII subset currently
    supported by the emulator's Spectrum keyboard mapping. */
 static int app_autotype_translate_char(WCHAR ch) {
     if (ch == L'\r' || ch == L'\n') {
@@ -4174,6 +4199,7 @@ static void app_autotype_clear(AppState *app) {
     app->auto_type.cooldown_frames = 0;
     app->auto_type.hold_frames = 0;
     app->auto_type.active_key_code = 0;
+    app->tape_autoplay_pending = false;
 }
 
 /* Releases every currently held Spectrum key, for example after the emulator
@@ -4230,32 +4256,8 @@ static bool app_start_autotype(AppState *app, const WCHAR *text) {
     return queued;
 }
 
-/* Pulls Unicode text from the clipboard and hands it to the queued translated
-   text path so BASIC commands can be entered without physical key combos. */
-static bool app_paste_text(HWND hwnd, AppState *app) {
-    HANDLE clipboard_data;
-    const WCHAR *text;
-    bool queued = false;
-
-    if (!OpenClipboard(hwnd)) {
-        return false;
-    }
-
-    clipboard_data = GetClipboardData(CF_UNICODETEXT);
-    if (clipboard_data != NULL) {
-        text = (const WCHAR *)GlobalLock(clipboard_data);
-        if (text != NULL) {
-            queued = app_start_autotype(app, text);
-            GlobalUnlock(clipboard_data);
-        }
-    }
-
-    CloseClipboard();
-    return queued;
-}
-
-/* Inserts a TAP or TZX image into the virtual tape deck without resetting
-   the machine or typing commands on the user's behalf. */
+/* Inserts a TAP or TZX image, then either auto-starts a standard ROM load or
+   leaves the tape inserted for manual control depending on user preference. */
 static bool app_load_tape_file(
     HWND hwnd,
     AppState *app,
@@ -4264,6 +4266,8 @@ static bool app_load_tape_file(
     size_t error_buffer_size
 ) {
     const bool should_stop_in_48k = app->spec.model == SPECTRUM_MODEL_48K;
+    SpectrumModel autoload_model = app->spec.model;
+    (void)hwnd;
 
     if (!tape_load_file(
             &app->tape,
@@ -4277,14 +4281,44 @@ static bool app_load_tape_file(
 
     tape_stop(&app->tape);
     tape_rewind(&app->tape, (uint32_t)app->spec.machine.freq_hz);
+
+    if (app->tape_autoload_enabled) {
+        const TapeAutoloadTarget autoload_target = tape_autoload_target(&app->tape);
+
+        if (autoload_target == TAPE_AUTOLOAD_TARGET_128_MENU) {
+            autoload_model = SPECTRUM_MODEL_128K;
+        } else if (autoload_target == TAPE_AUTOLOAD_TARGET_48_BASIC) {
+            autoload_model = SPECTRUM_MODEL_48K;
+        }
+
+        app_autotype_clear(app);
+        app_release_all_keys(app);
+        app_audio_flush(app);
+        if (autoload_model != app->spec.model) {
+            const RomSet *set = app_rom_set_for_model_const(&app->roms, autoload_model);
+            if (!app_load_model_roms(app, autoload_model, set, error_buffer, error_buffer_size)) {
+                return false;
+            }
+            app_update_title(hwnd, &app->spec);
+            app_update_model_menu(hwnd, app->spec.model);
+        }
+        spectrum_reset(&app->spec);
+        tape_rewind(&app->tape, (uint32_t)app->spec.machine.freq_hz);
+        if (autoload_model == SPECTRUM_MODEL_128K) {
+            app->tape_autoplay_pending = app_start_autotype(app, L"\r");
+        } else {
+            app->tape_autoplay_pending = app_start_autotype(app, L"j\"\"\r");
+        }
+        if (app->tape_autoplay_pending) {
+            app->auto_type.cooldown_frames = APP_AUTOTYPE_BOOT_DELAY_FRAMES;
+        }
+        if (!app->tape_autoplay_pending) {
+            tape_start(&app->tape, app->spec.machine.tick_count);
+        }
+    }
+
     app_debug_machine_changed(app);
     InvalidateRect(hwnd, NULL, FALSE);
-    MessageBoxA(
-        hwnd,
-        "Tape inserted.\nStandard ROM loads now fast-load automatically when you type LOAD \"\".\nUse F3/F4 only for custom loaders or real-time tape playback.",
-        "ZX Spectrum Emulator",
-        MB_OK | MB_ICONINFORMATION
-    );
     return true;
 }
 
@@ -4298,10 +4332,14 @@ static void app_run_autotype(AppState *app) {
         }
         spectrum_key_up(&app->spec, app->auto_type.active_key_code);
         app->auto_type.active_key_code = 0;
-        app->auto_type.cooldown_frames = 2;
+        app->auto_type.cooldown_frames = APP_AUTOTYPE_COOLDOWN_FRAMES;
         if (app->auto_type.position >= app->auto_type.length) {
             app->auto_type.length = 0;
             app->auto_type.position = 0;
+            if (app->tape_autoplay_pending) {
+                app->tape_autoplay_pending = false;
+                tape_start(&app->tape, app->spec.machine.tick_count);
+            }
         }
         return;
     }
@@ -4315,7 +4353,7 @@ static void app_run_autotype(AppState *app) {
 
     app->auto_type.active_key_code = (unsigned char)app->auto_type.buffer[app->auto_type.position++];
     spectrum_key_down(&app->spec, app->auto_type.active_key_code);
-    app->auto_type.hold_frames = 2;
+    app->auto_type.hold_frames = APP_AUTOTYPE_HOLD_FRAMES;
 }
 
 /* Restarts the inserted tape from the beginning and begins playback. */
@@ -4323,12 +4361,14 @@ static void app_play_tape(AppState *app) {
     if (!tape_has_tape(&app->tape)) {
         return;
     }
+    app->tape_autoplay_pending = false;
     tape_rewind(&app->tape, (uint32_t)app->spec.machine.freq_hz);
     tape_start(&app->tape, app->spec.machine.tick_count);
 }
 
 /* Stops the current tape playback position without ejecting the inserted tape. */
 static void app_stop_tape(AppState *app) {
+    app->tape_autoplay_pending = false;
     tape_stop(&app->tape);
 }
 
@@ -4514,9 +4554,6 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                         case 'R':
                             SendMessageA(hwnd, WM_COMMAND, APP_MENU_FILE_RESET, 0);
                             return 0;
-                        case 'V':
-                            app_paste_text(hwnd, app);
-                            return 0;
                         case '1':
                         case VK_NUMPAD1:
                             SendMessageA(hwnd, WM_COMMAND, APP_MENU_MACHINE_48K, 0);
@@ -4644,6 +4681,11 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                         return 0;
                     case APP_MENU_FILE_STOP_TAPE:
                         app_stop_tape(app);
+                        return 0;
+                    case APP_MENU_FILE_AUTOLOAD_TAPES:
+                        app->tape_autoload_enabled = !app->tape_autoload_enabled;
+                        app_save_tape_autoload(app->tape_autoload_enabled);
+                        app_update_tape_menu(hwnd, app->tape_autoload_enabled);
                         return 0;
                     case APP_MENU_FILE_RESET:
                         app_autotype_clear(app);
@@ -4823,6 +4865,28 @@ static bool app_load_saved_model(SpectrumModel *model) {
     return false;
 }
 
+/* Reads the persisted tape auto-load setting, defaulting to enabled when
+   the user has not explicitly chosen otherwise yet. */
+static bool app_load_saved_tape_autoload(bool *enabled) {
+    char path[MAX_PATH];
+    char value[16];
+
+    if (!app_settings_path(path, sizeof(path))) {
+        return false;
+    }
+
+    GetPrivateProfileStringA("emulator", "tape_autoload", "", value, sizeof(value), path);
+    if (strcmp(value, "1") == 0) {
+        *enabled = true;
+        return true;
+    }
+    if (strcmp(value, "0") == 0) {
+        *enabled = false;
+        return true;
+    }
+    return false;
+}
+
 /* Persists the user's menu-selected machine preference so future launches
    start in the same 48K or 128K mode when possible. */
 static void app_save_model(SpectrumModel model) {
@@ -4834,6 +4898,21 @@ static void app_save_model(SpectrumModel model) {
         "emulator",
         "model",
         app_model_settings_value(model),
+        path
+    );
+}
+
+/* Persists whether opening a tape should immediately begin the standard ROM
+   loading flow or simply insert the image for manual control. */
+static void app_save_tape_autoload(bool enabled) {
+    char path[MAX_PATH];
+    if (!app_settings_path(path, sizeof(path))) {
+        return;
+    }
+    WritePrivateProfileStringA(
+        "emulator",
+        "tape_autoload",
+        app_tape_autoload_settings_value(enabled),
         path
     );
 }
@@ -5769,10 +5848,13 @@ static void app_show_error(const char *message) {
 int main(int argc, char **argv) {
     RomSelection selection;
     SpectrumModel saved_model = SPECTRUM_MODEL_48K;
+    bool saved_tape_autoload = true;
     bool has_saved_model;
+    bool has_saved_tape_autoload;
     INITCOMMONCONTROLSEX common_controls;
     ZeroMemory(&selection, sizeof(selection));
     has_saved_model = app_load_saved_model(&saved_model);
+    has_saved_tape_autoload = app_load_saved_tape_autoload(&saved_tape_autoload);
     if (!app_resolve_roms(argc, argv, has_saved_model, saved_model, &selection)) {
         app_print_usage();
         app_show_error("No compatible ROM found. Place 48.rom and/or 128.rom next to the EXE or in the repo.");
@@ -5782,6 +5864,7 @@ int main(int argc, char **argv) {
     AppState app;
     ZeroMemory(&app, sizeof(app));
     app.roms = selection;
+    app.tape_autoload_enabled = has_saved_tape_autoload ? saved_tape_autoload : true;
     tape_init(&app.tape);
     app_audio_init(&app);
     app_controller_init(&app);
@@ -5879,6 +5962,7 @@ int main(int argc, char **argv) {
     app.main_hwnd = hwnd;
     app_update_title(hwnd, &app.spec);
     app_update_model_menu(hwnd, app.spec.model);
+    app_update_tape_menu(hwnd, app.tape_autoload_enabled);
     app.running = true;
     app_debug_machine_changed(&app);
 

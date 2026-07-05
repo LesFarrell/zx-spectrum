@@ -61,7 +61,6 @@ With no arguments, the emulator looks for `128.rom` in `.\src` first and starts 
 - `Ctrl` maps to `SYMBOL SHIFT`
 - Raw key presses still drive the Spectrum matrix for held keys and games
 - Printable keys use the active Windows keyboard layout, so symbols such as `"` follow the host layout
-- `Ctrl+V` queues clipboard text into the emulator one Spectrum key tap at a time
 
 ## Controller
 
@@ -72,7 +71,9 @@ With no arguments, the emulator looks for `128.rom` in `.\src` first and starts 
 ## Menu
 
 - `File -> Open Tape/Snapshot...` opens `.tap`, `.tzx`, or `.z80` files
-- Tape files are inserted without resetting the machine
+- `File -> Auto-load Tapes On Open` toggles whether opening a tape starts loading automatically
+- With auto-load on, opening a tape inspects the tape and chooses `48 BASIC` or the `128K` tape loader automatically
+- With auto-load off, opening a tape just inserts and rewinds it for manual loading
 - Standard ROM `LOAD ""` operations fast-load automatically for `.tap` and standard-block `.tzx` files
 - Use `F3` or `File -> Play Tape` only for custom loaders or real-time tape playback
 - Press `F4` or use `File -> Stop Tape` to stop real-time playback

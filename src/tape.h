@@ -15,6 +15,12 @@ typedef struct TapeBlock {
     size_t length;
 } TapeBlock;
 
+typedef enum TapeAutoloadTarget {
+    TAPE_AUTOLOAD_TARGET_UNKNOWN = 0,
+    TAPE_AUTOLOAD_TARGET_48_BASIC,
+    TAPE_AUTOLOAD_TARGET_128_MENU
+} TapeAutoloadTarget;
+
 typedef struct TapePlayer {
     TapeSegment *segments;
     size_t segment_count;
@@ -26,6 +32,7 @@ typedef struct TapePlayer {
     size_t play_index;
     uint64_t segment_end_tick;
     uint32_t tick_hz;
+    TapeAutoloadTarget autoload_target;
     bool inserted;
     bool playing;
 } TapePlayer;
@@ -45,6 +52,7 @@ void tape_start(TapePlayer *player, uint64_t tick_count);
 void tape_stop(TapePlayer *player);
 bool tape_input_level(TapePlayer *player, uint64_t tick_count);
 bool tape_has_tape(const TapePlayer *player);
+TapeAutoloadTarget tape_autoload_target(const TapePlayer *player);
 bool tape_try_fast_load(TapePlayer *player, void *machine);
 
 #endif

@@ -36,6 +36,53 @@ typedef struct TapeTzxLoop {
     uint16_t remaining;
 } TapeTzxLoop;
 
+static bool tape_is_standard_header_block(const TapeBlock *block, uint8_t *type_out) {
+    if (block == NULL || block->length != 19 || block->bytes == NULL || block->bytes[0] != 0x00) {
+        return false;
+    }
+    if (type_out != NULL) {
+        *type_out = block->bytes[1];
+    }
+    return true;
+}
+
+static bool tape_program_uses_128_basic_tokens(const TapeBlock *block) {
+    if (block == NULL || block->length < 3 || block->bytes == NULL || block->bytes[0] != 0xFF) {
+        return false;
+    }
+
+    for (size_t i = 1; i + 1 < block->length; ++i) {
+        if (block->bytes[i] == 0xA3 || block->bytes[i] == 0xA4) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static TapeAutoloadTarget tape_detect_autoload_target(const TapePlayer *player) {
+    uint8_t first_type;
+
+    if (player == NULL) {
+        return TAPE_AUTOLOAD_TARGET_UNKNOWN;
+    }
+    if (player->autoload_target == TAPE_AUTOLOAD_TARGET_128_MENU) {
+        return TAPE_AUTOLOAD_TARGET_128_MENU;
+    }
+    if (player->block_count == 0) {
+        return TAPE_AUTOLOAD_TARGET_UNKNOWN;
+    }
+    if (!tape_is_standard_header_block(&player->blocks[0], &first_type)) {
+        return TAPE_AUTOLOAD_TARGET_48_BASIC;
+    }
+    if (first_type != 0x00) {
+        return TAPE_AUTOLOAD_TARGET_48_BASIC;
+    }
+    if (player->block_count > 1 && tape_program_uses_128_basic_tokens(&player->blocks[1])) {
+        return TAPE_AUTOLOAD_TARGET_128_MENU;
+    }
+    return TAPE_AUTOLOAD_TARGET_48_BASIC;
+}
+
 static bool tape_reserve_blocks(TapePlayer *player, size_t additional_count) {
     TapeBlock *blocks;
     size_t required;
@@ -585,6 +632,7 @@ static bool tape_parse_tzx(
                     return false;
                 }
                 offset += 4;
+                player->autoload_target = TAPE_AUTOLOAD_TARGET_128_MENU;
                 if (stop_in_48k_mode) {
                     return true;
                 }
@@ -796,6 +844,7 @@ bool tape_load_file(
         return false;
     }
 
+    player->autoload_target = tape_detect_autoload_target(player);
     player->inserted = player->segment_count > 0;
     player->playing = false;
     player->next_block_index = 0;
@@ -849,6 +898,13 @@ bool tape_input_level(TapePlayer *player, uint64_t tick_count) {
 
 bool tape_has_tape(const TapePlayer *player) {
     return player != NULL && player->inserted && player->segment_count > 0;
+}
+
+TapeAutoloadTarget tape_autoload_target(const TapePlayer *player) {
+    if (player == NULL) {
+        return TAPE_AUTOLOAD_TARGET_UNKNOWN;
+    }
+    return player->autoload_target;
 }
 
 bool tape_try_fast_load(TapePlayer *player, void *machine_ptr) {
