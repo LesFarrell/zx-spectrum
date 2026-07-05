@@ -1,5 +1,14 @@
 #include "tape.h"
 
+#include "chips/chips_common.h"
+#include "chips/z80.h"
+#include "chips/beeper.h"
+#include "chips/ay38910.h"
+#include "chips/mem.h"
+#include "chips/kbd.h"
+#include "chips/clk.h"
+#include "systems/zx.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,6 +36,54 @@ typedef struct TapeTzxLoop {
     uint16_t remaining;
 } TapeTzxLoop;
 
+static bool tape_reserve_blocks(TapePlayer *player, size_t additional_count) {
+    TapeBlock *blocks;
+    size_t required;
+    size_t new_capacity;
+
+    if (additional_count > SIZE_MAX - player->block_count) {
+        return false;
+    }
+    required = player->block_count + additional_count;
+    if (required <= player->block_capacity) {
+        return true;
+    }
+
+    new_capacity = (player->block_capacity > 0) ? player->block_capacity : 64;
+    while (new_capacity < required) {
+        if (new_capacity > (SIZE_MAX / 2)) {
+            new_capacity = required;
+            break;
+        }
+        new_capacity *= 2;
+    }
+
+    blocks = (TapeBlock *)realloc(player->blocks, new_capacity * sizeof(TapeBlock));
+    if (blocks == NULL) {
+        return false;
+    }
+    player->blocks = blocks;
+    player->block_capacity = new_capacity;
+    return true;
+}
+
+static bool tape_append_fast_block(TapePlayer *player, const uint8_t *data, size_t length) {
+    TapeBlock *block;
+
+    if (!tape_reserve_blocks(player, 1)) {
+        return false;
+    }
+    block = &player->blocks[player->block_count++];
+    block->bytes = (uint8_t *)malloc(length);
+    if (block->bytes == NULL) {
+        player->block_count--;
+        return false;
+    }
+    memcpy(block->bytes, data, length);
+    block->length = length;
+    return true;
+}
+
 static void tape_set_error(char *buffer, size_t buffer_size, const char *message, const char *path) {
     if (buffer == NULL || buffer_size == 0) {
         return;
@@ -48,6 +105,25 @@ static uint32_t tape_read_u24(const uint8_t *ptr) {
 
 static uint32_t tape_read_u32(const uint8_t *ptr) {
     return (uint32_t)(ptr[0] | (ptr[1] << 8) | (ptr[2] << 16) | (ptr[3] << 24));
+}
+
+static uint8_t tape_cp_flags(uint8_t left, uint8_t right) {
+    const uint8_t result = (uint8_t)(left - right);
+    uint8_t flags = Z80_NF | (result & (Z80_SF | Z80_YF | Z80_XF));
+
+    if (result == 0) {
+        flags |= Z80_ZF;
+    }
+    if (((left ^ right ^ result) & 0x10u) != 0) {
+        flags |= Z80_HF;
+    }
+    if (((left ^ right) & (left ^ result) & 0x80u) != 0) {
+        flags |= Z80_PF;
+    }
+    if (left < right) {
+        flags |= Z80_CF;
+    }
+    return flags;
 }
 
 static bool tape_has_bytes(size_t offset, size_t count, size_t total) {
@@ -243,6 +319,10 @@ static bool tape_parse_tap(
             tape_set_error(error_buffer, error_buffer_size, "Out of memory while decoding TAP file", path);
             return false;
         }
+        if (!tape_append_fast_block(player, &data[offset], block_length)) {
+            tape_set_error(error_buffer, error_buffer_size, "Out of memory while indexing TAP blocks", path);
+            return false;
+        }
         offset += block_length;
     }
     return true;
@@ -290,6 +370,10 @@ static bool tape_parse_tzx(
                 }
                 if (!tape_append_standard_block(&builder, &data[offset], block_length, pause_ms)) {
                     tape_set_error(error_buffer, error_buffer_size, "Out of memory while decoding TZX data", path);
+                    return false;
+                }
+                if (!tape_append_fast_block(player, &data[offset], block_length)) {
+                    tape_set_error(error_buffer, error_buffer_size, "Out of memory while indexing TZX blocks", path);
                     return false;
                 }
                 offset += block_length;
@@ -627,6 +711,10 @@ void tape_discard(TapePlayer *player) {
     if (player == NULL) {
         return;
     }
+    for (size_t i = 0; i < player->block_count; ++i) {
+        free(player->blocks[i].bytes);
+    }
+    free(player->blocks);
     free(player->segments);
     tape_init(player);
 }
@@ -710,6 +798,7 @@ bool tape_load_file(
 
     player->inserted = player->segment_count > 0;
     player->playing = false;
+    player->next_block_index = 0;
     player->play_index = 0;
     player->segment_end_tick = 0;
     return player->inserted;
@@ -720,6 +809,7 @@ void tape_rewind(TapePlayer *player, uint32_t tick_hz) {
         return;
     }
     player->tick_hz = tick_hz;
+    player->next_block_index = 0;
     player->play_index = 0;
     player->segment_end_tick = 0;
     player->playing = false;
@@ -759,4 +849,85 @@ bool tape_input_level(TapePlayer *player, uint64_t tick_count) {
 
 bool tape_has_tape(const TapePlayer *player) {
     return player != NULL && player->inserted && player->segment_count > 0;
+}
+
+bool tape_try_fast_load(TapePlayer *player, void *machine_ptr) {
+    TapeBlock *block;
+    uint8_t expected_flag;
+    bool is_load;
+    uint8_t parity;
+    uint16_t requested_length;
+    uint16_t start_addr;
+    uint16_t bytes_processed = 0;
+    zx_t *machine = (zx_t *)machine_ptr;
+
+    if (player == NULL || machine == NULL || player->next_block_index >= player->block_count) {
+        return false;
+    }
+
+    block = &player->blocks[player->next_block_index];
+    expected_flag = (uint8_t)(machine->cpu.af2 >> 8);
+    is_load = (machine->cpu.af2 & Z80_CF) != 0;
+    requested_length = machine->cpu.de;
+    start_addr = machine->cpu.ix;
+
+    if (block->length != ((size_t)requested_length + 2u) || block->length < 2) {
+        return false;
+    }
+
+    player->next_block_index++;
+    player->playing = false;
+
+    parity = block->bytes[0];
+    machine->cpu.a = 0;
+    machine->cpu.l = parity;
+
+    if (requested_length == 0) {
+        machine->cpu.af2 = 0x0001;
+        machine->cpu.b = 0xB0;
+        machine->cpu.f = tape_cp_flags(parity, 1);
+        goto finished;
+    }
+
+    machine->cpu.af2 = 0x0145;
+
+    if (parity != expected_flag) {
+        machine->cpu.f &= (uint8_t)~Z80_CF;
+        goto finished;
+    }
+
+    machine->cpu.l = block->bytes[block->length - 1];
+
+    if (is_load) {
+        for (uint16_t i = 0; i < requested_length; ++i) {
+            const uint8_t value = block->bytes[1u + i];
+            parity ^= value;
+            mem_wr(&machine->mem, (uint16_t)(start_addr + i), value);
+            bytes_processed++;
+        }
+    } else {
+        for (uint16_t i = 0; i < requested_length; ++i) {
+            const uint8_t value = block->bytes[1u + i];
+            parity ^= value;
+            bytes_processed++;
+            if (mem_rd(&machine->mem, (uint16_t)(start_addr + i)) != value) {
+                machine->cpu.l = value;
+                machine->cpu.f &= (uint8_t)~Z80_CF;
+                goto finished;
+            }
+        }
+    }
+
+    parity ^= block->bytes[1u + requested_length];
+    machine->cpu.a = parity;
+    machine->cpu.f = tape_cp_flags(parity, 1);
+    machine->cpu.b = 0xB0;
+
+finished:
+    machine->cpu.c = 1;
+    machine->cpu.h = parity;
+    machine->cpu.de = (uint16_t)(requested_length - bytes_processed);
+    machine->cpu.ix = (uint16_t)(start_addr + bytes_processed);
+    machine->cpu.pc = 0x05E2;
+    return true;
 }

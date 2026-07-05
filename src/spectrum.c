@@ -147,6 +147,7 @@ static void spectrum_init_machine(Spectrum *spec) {
     desc.audio.beeper_volume = spec->beeper_volume;
     desc.audio.ay_volume = spec->ay_volume;
     desc.tape.callback = spec->tape_callback;
+    desc.tape.load_trap = spec->tape_load_trap;
     desc.tape.user_data = spec->tape_user_data;
     if (spec->model == SPECTRUM_MODEL_128K) {
         desc.roms.zx128_0.ptr = spec->rom[0];
@@ -234,6 +235,19 @@ void spectrum_configure_tape_input(
     spec->tape_user_data = user_data;
     if (spec->machine_ready) {
         zx_set_tape_input(&spec->machine, callback, user_data);
+    }
+}
+
+/* Records the fast-load trap source so rebuilds preserve ROM loader traps. */
+void spectrum_configure_tape_load_trap(
+    Spectrum *spec,
+    zx_tape_load_trap_callback_t callback,
+    void *user_data
+) {
+    spec->tape_load_trap = callback;
+    spec->tape_user_data = user_data;
+    if (spec->machine_ready) {
+        zx_set_tape_load_trap(&spec->machine, callback, user_data);
     }
 }
 

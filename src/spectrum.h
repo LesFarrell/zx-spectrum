@@ -37,6 +37,7 @@ typedef struct Spectrum {
     float beeper_volume;
     float ay_volume;
     zx_tape_input_callback_t tape_callback;
+    zx_tape_load_trap_callback_t tape_load_trap;
     void *tape_user_data;
     int rom48_index;
 
@@ -75,6 +76,13 @@ void spectrum_configure_audio(
 void spectrum_configure_tape_input(
     Spectrum *spec,
     zx_tape_input_callback_t callback,
+    void *user_data
+);
+
+/* Wires an optional ROM tape-loader fast-trap callback into the machine. */
+void spectrum_configure_tape_load_trap(
+    Spectrum *spec,
+    zx_tape_load_trap_callback_t callback,
     void *user_data
 );
 

@@ -73,8 +73,9 @@ With no arguments, the emulator looks for `128.rom` in `.\src` first and starts 
 
 - `File -> Open Tape/Snapshot...` opens `.tap`, `.tzx`, or `.z80` files
 - Tape files are inserted without resetting the machine
-- Type `LOAD ""` at the BASIC prompt, then press `F3` or use `File -> Play Tape`
-- Press `F4` or use `File -> Stop Tape` to stop playback
+- Standard ROM `LOAD ""` operations fast-load automatically for `.tap` and standard-block `.tzx` files
+- Use `F3` or `File -> Play Tape` only for custom loaders or real-time tape playback
+- Press `F4` or use `File -> Stop Tape` to stop real-time playback
 - `File -> Reset` resets the active machine
 - `File -> Exit` closes the emulator
 - `Machine -> 48K` / `Machine -> 128K` rebuilds the emulator for that model and remembers the choice between runs

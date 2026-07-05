@@ -101,6 +101,7 @@ typedef enum {
 #define ZX_JOYSTICK_BTN     (1<<4)
 
 typedef bool (*zx_tape_input_callback_t)(void *user_data, uint64_t tick_count);
+typedef bool (*zx_tape_load_trap_callback_t)(void *user_data, void *machine);
 
 // config parameters for zx_init()
 typedef struct {
@@ -116,6 +117,7 @@ typedef struct {
     } audio;
     struct {
         zx_tape_input_callback_t callback;
+        zx_tape_load_trap_callback_t load_trap;
         void *user_data;
     } tape;
     // ROM images
@@ -158,6 +160,7 @@ typedef struct {
     bool valid;
     chips_debug_t debug;
     zx_tape_input_callback_t tape_callback;
+    zx_tape_load_trap_callback_t tape_load_trap;
     void *tape_user_data;
     struct {
         chips_audio_callback_t callback;
@@ -193,6 +196,8 @@ zx_joystick_type_t zx_joystick_type(zx_t* sys);
 void zx_joystick(zx_t* sys, uint8_t mask);
 // set a callback used for EAR/tape input sampling during ULA reads
 void zx_set_tape_input(zx_t* sys, zx_tape_input_callback_t callback, void *user_data);
+// set a callback used to fast-trap the ROM tape loader for standard blocks
+void zx_set_tape_load_trap(zx_t* sys, zx_tape_load_trap_callback_t callback, void *user_data);
 // load a ZX Z80 file into the emulator
 bool zx_quickload(zx_t* sys, chips_range_t data);
 // save a snapshot, patches any pointers to zero, returns a snapshot version
@@ -237,6 +242,7 @@ void zx_init(zx_t* sys, const zx_desc_t* desc) {
     CHIPS_ASSERT(sys->audio.num_samples <= ZX_MAX_AUDIO_SAMPLES);
     sys->debug = desc->debug;
     sys->tape_callback = desc->tape.callback;
+    sys->tape_load_trap = desc->tape.load_trap;
     sys->tape_user_data = desc->tape.user_data;
 
     // initalize the hardware
@@ -622,12 +628,26 @@ uint32_t zx_exec(zx_t* sys, uint32_t micro_seconds) {
     if (0 == sys->debug.callback.func) {
         // run without debug hook
         for (uint32_t tick = 0; tick < num_ticks; tick++) {
+            if ((sys->cpu.step == 192) &&
+                ((sys->cpu.pc == 0x056C) || (sys->cpu.pc == 0x0112)) &&
+                (sys->tape_load_trap != NULL)) {
+                if (sys->tape_load_trap(sys->tape_user_data, sys)) {
+                    pins = z80_prefetch(&sys->cpu, sys->cpu.pc);
+                }
+            }
             pins = _zx_tick(sys, pins);
         }
     }
     else {
         // run with debug hook
         for (uint32_t tick = 0; (tick < num_ticks) && !(*sys->debug.stopped); tick++) {
+            if ((sys->cpu.step == 192) &&
+                ((sys->cpu.pc == 0x056C) || (sys->cpu.pc == 0x0112)) &&
+                (sys->tape_load_trap != NULL)) {
+                if (sys->tape_load_trap(sys->tape_user_data, sys)) {
+                    pins = z80_prefetch(&sys->cpu, sys->cpu.pc);
+                }
+            }
             pins = _zx_tick(sys, pins);
             sys->debug.callback.func(sys->debug.callback.user_data, pins);
         }
@@ -765,6 +785,12 @@ void zx_joystick(zx_t* sys, uint8_t mask) {
 void zx_set_tape_input(zx_t* sys, zx_tape_input_callback_t callback, void *user_data) {
     CHIPS_ASSERT(sys && sys->valid);
     sys->tape_callback = callback;
+    sys->tape_user_data = user_data;
+}
+
+void zx_set_tape_load_trap(zx_t* sys, zx_tape_load_trap_callback_t callback, void *user_data) {
+    CHIPS_ASSERT(sys && sys->valid);
+    sys->tape_load_trap = callback;
     sys->tape_user_data = user_data;
 }
 
@@ -1108,6 +1134,7 @@ uint32_t zx_save_snapshot(zx_t* sys, zx_t* dst) {
     CHIPS_ASSERT(sys && dst);
     *dst = *sys;
     dst->tape_callback = 0;
+    dst->tape_load_trap = 0;
     dst->tape_user_data = 0;
     chips_debug_snapshot_onsave(&dst->debug);
     chips_audio_callback_snapshot_onsave(&dst->audio.callback);
@@ -1124,6 +1151,7 @@ bool zx_load_snapshot(zx_t* sys, uint32_t version, zx_t* src) {
     static zx_t im;
     im = *src;
     im.tape_callback = sys->tape_callback;
+    im.tape_load_trap = sys->tape_load_trap;
     im.tape_user_data = sys->tape_user_data;
     chips_debug_snapshot_onload(&im.debug, &sys->debug);
     chips_audio_callback_snapshot_onload(&im.audio.callback, &sys->audio.callback);

@@ -231,6 +231,7 @@ static const KeyMap SPECIAL_KEY_MAP[] = {
 static void app_show_error(const char *message);
 static bool app_start_autotype(AppState *app, const WCHAR *text);
 static bool app_tape_input_callback(void *user_data, uint64_t tick_count);
+static bool app_tape_fast_load_trap(void *user_data, void *machine);
 static bool app_parent_dir(char *path);
 static bool app_file_exists(const char *path);
 static bool app_join_path(char *out, size_t out_size, const char *left, const char *right);
@@ -4193,6 +4194,13 @@ static bool app_tape_input_callback(void *user_data, uint64_t tick_count) {
     return tape_input_level(&app->tape, tick_count);
 }
 
+/* Fast-traps the standard ROM tape loader when a TAP/TZX block can be
+   injected directly instead of being edge-timed through the EAR bit. */
+static bool app_tape_fast_load_trap(void *user_data, void *machine) {
+    AppState *app = (AppState *)user_data;
+    return tape_try_fast_load(&app->tape, (zx_t *)machine);
+}
+
 /* Starts a queued text-entry sequence that feeds printable characters into the
    Spectrum one key tap at a time on later emulator frames. */
 static bool app_start_autotype(AppState *app, const WCHAR *text) {
@@ -4273,7 +4281,7 @@ static bool app_load_tape_file(
     InvalidateRect(hwnd, NULL, FALSE);
     MessageBoxA(
         hwnd,
-        "Tape inserted.\nType LOAD \"\" at the BASIC prompt, then press F3 to play.\nPress F4 to stop.",
+        "Tape inserted.\nStandard ROM loads now fast-load automatically when you type LOAD \"\".\nUse F3/F4 only for custom loaders or real-time tape playback.",
         "ZX Spectrum Emulator",
         MB_OK | MB_ICONINFORMATION
     );
@@ -5499,6 +5507,7 @@ static bool app_load_model_roms(
         ay_volume
     );
     spectrum_configure_tape_input(&app->spec, app_tape_input_callback, app);
+    spectrum_configure_tape_load_trap(&app->spec, app_tape_fast_load_trap, app);
     if (!spectrum_load_roms(
             &app->spec,
             set->rom_a,
