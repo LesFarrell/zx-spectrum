@@ -48,8 +48,8 @@ typedef struct Spectrum {
    once ROM data has been provided. */
 void spectrum_init(Spectrum *spec, SpectrumModel model);
 
-/* Loads one or two ROM files into the local ROM buffers, validates the layout
-   for 48K or 128K mode, and initializes the embedded emulator instance. */
+/* Loads ROM data into the local ROM buffers, validates the layout for 48K
+   or 128K mode, and initializes the embedded emulator instance. */
 bool spectrum_load_roms(
     Spectrum *spec,
     const char *rom_path_a,
@@ -67,15 +67,6 @@ void spectrum_configure_audio(
     int num_samples,
     float beeper_volume,
     float ay_volume
-);
-
-/* Rebuilds the wrapped machine for the requested model using the ROM data that
-   has already been loaded, then resets into the new power-on state. */
-bool spectrum_set_model(
-    Spectrum *spec,
-    SpectrumModel model,
-    char *error_buffer,
-    size_t error_buffer_size
 );
 
 /* Resets the embedded machine back to power-on state and refreshes the cached
@@ -97,6 +88,9 @@ void spectrum_key_down(Spectrum *spec, int key_code);
 /* Sends a host key release into the embedded emulator using the chips keyboard
    mapping configured during machine initialization. */
 void spectrum_key_up(Spectrum *spec, int key_code);
+
+/* Updates the emulated joystick state mask presented on the Kempston port. */
+void spectrum_set_joystick_mask(Spectrum *spec, uint8_t mask);
 
 /* Loads a `.z80` snapshot file into the currently wrapped machine, rebuilding
    the 48K or 128K backend first when the snapshot format requires a different

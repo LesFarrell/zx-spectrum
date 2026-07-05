@@ -118,7 +118,14 @@ static bool spectrum_detect_snapshot_model(
         return false;
     }
 
-    *model = data[34] < 3 ? SPECTRUM_MODEL_48K : SPECTRUM_MODEL_128K;
+    if (data[34] < 3) {
+        *model = SPECTRUM_MODEL_48K;
+    } else {
+        if (data[34] == 7 || data[34] == 8 || data[34] == 13) {
+            return false;
+        }
+        *model = SPECTRUM_MODEL_128K;
+    }
     return true;
 }
 
@@ -128,7 +135,11 @@ static bool spectrum_detect_snapshot_model(
 static void spectrum_init_machine(Spectrum *spec) {
     zx_desc_t desc;
     memset(&desc, 0, sizeof(desc));
-    desc.type = spec->model == SPECTRUM_MODEL_128K ? ZX_TYPE_128 : ZX_TYPE_48K;
+    if (spec->model == SPECTRUM_MODEL_128K) {
+        desc.type = ZX_TYPE_128;
+    } else {
+        desc.type = ZX_TYPE_48K;
+    }
     desc.joystick_type = ZX_JOYSTICKTYPE_NONE;
     desc.audio.callback = spec->audio_callback;
     desc.audio.num_samples = spec->audio_num_samples;
@@ -139,7 +150,7 @@ static void spectrum_init_machine(Spectrum *spec) {
         desc.roms.zx128_0.ptr = spec->rom[0];
         desc.roms.zx128_0.size = sizeof(spec->rom[0]);
         desc.roms.zx128_1.ptr = spec->rom[1];
-        desc.roms.zx128_1.size = sizeof(spec->rom[1]);
+        desc.roms.zx128_1.size = sizeof(spec->rom[0]);
     } else {
         desc.roms.zx48k.ptr = spec->rom[spec->rom48_index];
         desc.roms.zx48k.size = sizeof(spec->rom[spec->rom48_index]);
@@ -172,7 +183,7 @@ static bool spectrum_rebuild_for_model(
         snprintf(
             error_buffer,
             error_buffer_size,
-            "This snapshot needs 128K ROMs, but only a 48K ROM is available."
+            "This machine needs 128K ROMs, but only a 48K ROM is available."
         );
         return false;
     }
@@ -211,8 +222,8 @@ void spectrum_configure_audio(
     spec->ay_volume = ay_volume;
 }
 
-/* Loads ROM data from disk, validates whether it matches the requested 48K or
-   128K layout, then creates and resets the embedded chips-based machine. */
+/* Loads ROM data from disk, validates whether it matches the requested 48K
+   or 128K layout, then creates and resets the embedded chips-based machine. */
 bool spectrum_load_roms(
     Spectrum *spec,
     const char *rom_path_a,
@@ -221,11 +232,11 @@ bool spectrum_load_roms(
     size_t error_buffer_size
 ) {
     size_t file_size = 0;
+    uint8_t combined[0x8000];
     memset(spec->rom_loaded, 0, sizeof(spec->rom_loaded));
     spec->rom48_index = 0;
 
     {
-        uint8_t combined[0x8000];
         if (!spectrum_load_file_exact(rom_path_a, combined, sizeof(combined), &file_size)) {
             snprintf(error_buffer, error_buffer_size, "Could not load ROM file: %s", rom_path_a);
             return false;
@@ -274,27 +285,6 @@ bool spectrum_load_roms(
     return true;
 }
 
-/* Switches between the 48K and 128K machines using whichever ROM images are
-   already loaded into the wrapper, then resets into the new model. */
-bool spectrum_set_model(
-    Spectrum *spec,
-    SpectrumModel model,
-    char *error_buffer,
-    size_t error_buffer_size
-) {
-    if (!spec->machine_ready) {
-        snprintf(error_buffer, error_buffer_size, "The Spectrum machine is not initialized.");
-        return false;
-    }
-    if (spec->model != model) {
-        if (!spectrum_rebuild_for_model(spec, model, error_buffer, error_buffer_size)) {
-            return false;
-        }
-    }
-    spectrum_reset(spec);
-    return true;
-}
-
 /* Resets the embedded emulator if it has already been created and synchronizes
    the wrapper framebuffer with the machine's freshly reset display state. */
 void spectrum_reset(Spectrum *spec) {
@@ -338,7 +328,11 @@ void spectrum_run_frame(Spectrum *spec) {
     if (!spec->machine_ready) {
         return;
     }
-    frame_us = spec->model == SPECTRUM_MODEL_128K ? ZX_128K_FRAME_US : ZX_48K_FRAME_US;
+    if (spec->model == SPECTRUM_MODEL_48K) {
+        frame_us = ZX_48K_FRAME_US;
+    } else {
+        frame_us = ZX_128K_FRAME_US;
+    }
     zx_exec(&spec->machine, frame_us);
     spectrum_render_frame(spec);
 }
@@ -359,6 +353,15 @@ void spectrum_key_up(Spectrum *spec, int key_code) {
         return;
     }
     zx_key_up(&spec->machine, key_code);
+}
+
+/* Updates the emulated joystick lines so frontend controller input can feed
+   the Kempston port without interfering with keyboard mappings. */
+void spectrum_set_joystick_mask(Spectrum *spec, uint8_t mask) {
+    if (!spec->machine_ready) {
+        return;
+    }
+    zx_joystick(&spec->machine, mask);
 }
 
 /* Loads a `.z80` snapshot file, switches the backend model when necessary,

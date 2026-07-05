@@ -3,6 +3,7 @@
 #include <commdlg.h>
 #include <commctrl.h>
 #include <mmsystem.h>
+#include <xinput.h>
 
 #include <stdbool.h>
 #include <ctype.h>
@@ -20,6 +21,8 @@ typedef struct KeyMap {
 } KeyMap;
 
 typedef struct AppState AppState;
+typedef struct RomSet RomSet;
+typedef struct RomSelection RomSelection;
 
 enum {
     ZX_KEY_CAPS_SHIFT = 1,
@@ -37,7 +40,6 @@ enum {
     APP_MENU_TOOLS_DEBUGGER = 1302,
     APP_MENU_MACHINE_48K = 1201,
     APP_MENU_MACHINE_128K = 1202,
-    APP_MENU_INPUT_PASTE_TEXT = 1101,
     APP_CTRL_DEBUG_TEXT = 2001,
     APP_CTRL_DEBUG_PAUSE = 2002,
     APP_CTRL_DEBUG_STEP = 2003,
@@ -84,12 +86,30 @@ typedef struct AudioState {
     bool enabled;
 } AudioState;
 
+typedef DWORD (WINAPI *AppXInputGetStateFn)(DWORD user_index, XINPUT_STATE *state);
+
 typedef struct AutoTypeState {
     char buffer[APP_AUTOTYPE_CAPACITY];
     size_t length;
     size_t position;
     int cooldown_frames;
 } AutoTypeState;
+
+struct RomSet {
+    char rom_a[MAX_PATH];
+    char rom_b[MAX_PATH];
+    bool has_rom_a;
+    bool has_rom_b;
+};
+
+typedef struct ControllerState {
+    HMODULE xinput_module;
+    AppXInputGetStateFn xinput_get_state;
+    DWORD active_user_index;
+    uint8_t joystick_mask;
+    bool available;
+    bool connected;
+} ControllerState;
 
 typedef struct DebugState {
     HWND debugger_hwnd;
@@ -152,30 +172,30 @@ typedef struct AssemblerContext {
     size_t label_count;
 } AssemblerContext;
 
+/* Stores the selected machine type and the resolved ROM paths after command
+   line parsing and fallback autodetection have been applied. */
+struct RomSelection {
+    SpectrumModel model;
+    RomSet rom_48k;
+    RomSet rom_128k;
+};
+
 struct AppState {
     Spectrum spec;
+    RomSelection roms;
     BITMAPINFO bitmap_info;
     HWND main_hwnd;
     LARGE_INTEGER perf_freq;
     LARGE_INTEGER last_tick;
     double emulation_accumulator_ms;
     AudioState audio;
+    ControllerState controller;
     AutoTypeState auto_type;
     DebugState debug;
     int active_key_codes[256];
     bool running;
     bool modal_loop_timer_active;
 };
-
-/* Stores the selected machine type and the resolved ROM paths after command
-   line parsing and fallback autodetection have been applied. */
-typedef struct RomSelection {
-    SpectrumModel model;
-    char rom_a[MAX_PATH];
-    char rom_b[MAX_PATH];
-    bool has_rom_a;
-    bool has_rom_b;
-} RomSelection;
 
 typedef struct AssemblerSourceLocation {
     char path[MAX_PATH];
@@ -207,10 +227,30 @@ static bool app_start_autotype(AppState *app, const WCHAR *text);
 static bool app_parent_dir(char *path);
 static bool app_file_exists(const char *path);
 static bool app_join_path(char *out, size_t out_size, const char *left, const char *right);
+static RomSet *app_rom_set_for_model(RomSelection *selection, SpectrumModel model);
+static const RomSet *app_rom_set_for_model_const(const RomSelection *selection, SpectrumModel model);
+static bool app_rom_set_is_available(const RomSet *set);
+static void app_rom_set_set_paths(RomSet *set, const char *rom_a, const char *rom_b);
+static bool app_load_model_roms(
+    AppState *app,
+    SpectrumModel model,
+    const RomSet *set,
+    char *error_buffer,
+    size_t error_buffer_size
+);
+static bool app_detect_snapshot_model(
+    const char *path,
+    SpectrumModel *model,
+    char *error_buffer,
+    size_t error_buffer_size
+);
 static bool app_parse_number(const char *text, int *value);
 static double app_model_frame_duration_ms(SpectrumModel model);
 static void app_tick_emulator(AppState *app);
 static void app_set_modal_loop_timer(AppState *app, HWND hwnd, bool enabled);
+static void app_controller_init(AppState *app);
+static void app_controller_shutdown(AppState *app);
+static void app_controller_poll(AppState *app);
 static bool app_debug_has_breakpoint(const AppState *app, uint16_t address);
 static bool app_debug_toggle_breakpoint(AppState *app, uint16_t address, bool *enabled);
 static void app_debug_run_frame(AppState *app);
@@ -270,13 +310,9 @@ static HMENU app_create_menu(void) {
     HMENU menu_bar = CreateMenu();
     HMENU file_menu = CreatePopupMenu();
     HMENU machine_menu = CreatePopupMenu();
-    HMENU input_menu = CreatePopupMenu();
     HMENU tools_menu = CreatePopupMenu();
 
-    if (menu_bar == NULL || file_menu == NULL || machine_menu == NULL || input_menu == NULL || tools_menu == NULL) {
-        if (input_menu != NULL) {
-            DestroyMenu(input_menu);
-        }
+    if (menu_bar == NULL || file_menu == NULL || machine_menu == NULL || tools_menu == NULL) {
         if (tools_menu != NULL) {
             DestroyMenu(tools_menu);
         }
@@ -298,14 +334,39 @@ static HMENU app_create_menu(void) {
     AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_EXIT, "E&xit\tAlt+F4");
     AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_48K, "&48K\tCtrl+1");
     AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_128K, "&128K\tCtrl+2");
-    AppendMenuA(input_menu, MF_STRING, APP_MENU_INPUT_PASTE_TEXT, "&Paste Text\tCtrl+V");
     AppendMenuA(tools_menu, MF_STRING, APP_MENU_TOOLS_ASSEMBLER, "&Assembler...\tCtrl+Shift+A");
     AppendMenuA(tools_menu, MF_STRING, APP_MENU_TOOLS_DEBUGGER, "&Debugger...\tCtrl+Shift+D");
     AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)file_menu, "&File");
     AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)machine_menu, "&Machine");
-    AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)input_menu, "&Input");
     AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)tools_menu, "&Tools");
     return menu_bar;
+}
+
+static const char *app_model_name(SpectrumModel model) {
+    switch (model) {
+        case SPECTRUM_MODEL_128K: return "128K";
+        case SPECTRUM_MODEL_48K:
+        default:
+            return "48K";
+    }
+}
+
+static UINT app_model_menu_id(SpectrumModel model) {
+    switch (model) {
+        case SPECTRUM_MODEL_128K: return APP_MENU_MACHINE_128K;
+        case SPECTRUM_MODEL_48K:
+        default:
+            return APP_MENU_MACHINE_48K;
+    }
+}
+
+static const char *app_model_settings_value(SpectrumModel model) {
+    switch (model) {
+        case SPECTRUM_MODEL_128K: return "128";
+        case SPECTRUM_MODEL_48K:
+        default:
+            return "48";
+    }
 }
 
 /* Creates a simple document-style menu for the assembler window with file,
@@ -365,7 +426,7 @@ static void app_update_title(HWND hwnd, const Spectrum *spec) {
         title,
         sizeof(title),
         "ZX Spectrum Emulator (%s)",
-        spec->model == SPECTRUM_MODEL_128K ? "128K" : "48K"
+        app_model_name(spec->model)
     );
     SetWindowTextA(hwnd, title);
 }
@@ -381,7 +442,7 @@ static void app_update_model_menu(HWND hwnd, SpectrumModel model) {
         menu,
         APP_MENU_MACHINE_48K,
         APP_MENU_MACHINE_128K,
-        model == SPECTRUM_MODEL_128K ? APP_MENU_MACHINE_128K : APP_MENU_MACHINE_48K,
+        app_model_menu_id(model),
         MF_BYCOMMAND
     );
 }
@@ -932,7 +993,7 @@ static void app_debug_refresh_window(AppState *app) {
         &used,
         "State: %s    Model: %s\r\n",
         app->debug.paused ? "Paused" : "Running",
-        app->spec.model == SPECTRUM_MODEL_128K ? "128K" : "48K"
+        app_model_name(app->spec.model)
     );
     if (app->debug.breakpoint_hit) {
         app_append_textf(
@@ -4184,10 +4245,11 @@ static void app_run_autotype(AppState *app) {
     }
 }
 
-/* Switches the running machine between 48K and 128K using the ROM data that
-   was loaded at startup, then persists the user's choice for future launches. */
+/* Switches the running machine between 48K and 128K by reloading the ROM
+   bundle assigned to that model, then persists the user's choice. */
 static void app_switch_model(HWND hwnd, AppState *app, SpectrumModel model) {
     char error_buffer[256];
+    const RomSet *set = app_rom_set_for_model_const(&app->roms, model);
 
     if (app->spec.model == model) {
         app_save_model(model);
@@ -4199,7 +4261,7 @@ static void app_switch_model(HWND hwnd, AppState *app, SpectrumModel model) {
     app_autotype_clear(app);
     app_release_all_keys(app);
     app_audio_flush(app);
-    if (!spectrum_set_model(&app->spec, model, error_buffer, sizeof(error_buffer))) {
+    if (!app_load_model_roms(app, model, set, error_buffer, sizeof(error_buffer))) {
         app_show_error(error_buffer);
         app_update_model_menu(hwnd, app->spec.model);
         return;
@@ -4284,6 +4346,8 @@ static void app_tick_emulator(AppState *app) {
     if (app->emulation_accumulator_ms > frame_ms * 8.0) {
         app->emulation_accumulator_ms = frame_ms * 8.0;
     }
+
+    app_controller_poll(app);
 
     if (!app->debug.paused) {
         while (app->emulation_accumulator_ms >= frame_ms && frames_run < 8) {
@@ -4427,6 +4491,22 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                         ofn.lpstrDefExt = "z80";
 
                         if (GetOpenFileNameA(&ofn)) {
+                            SpectrumModel snapshot_model;
+
+                            if (!app_detect_snapshot_model(path, &snapshot_model, error_buffer, sizeof(error_buffer))) {
+                                app_show_error(error_buffer);
+                                return 0;
+                            }
+                            if (snapshot_model != app->spec.model) {
+                                const RomSet *set = app_rom_set_for_model_const(&app->roms, snapshot_model);
+                                app_autotype_clear(app);
+                                app_release_all_keys(app);
+                                app_audio_flush(app);
+                                if (!app_load_model_roms(app, snapshot_model, set, error_buffer, sizeof(error_buffer))) {
+                                    app_show_error(error_buffer);
+                                    return 0;
+                                }
+                            }
                             if (!spectrum_load_snapshot_z80(&app->spec, path, error_buffer, sizeof(error_buffer))) {
                                 app_show_error(error_buffer);
                             } else {
@@ -4439,9 +4519,6 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                         }
                         return 0;
                     }
-                    case APP_MENU_INPUT_PASTE_TEXT:
-                        app_paste_text(hwnd, app);
-                        return 0;
                     case APP_MENU_FILE_RESET:
                         app_autotype_clear(app);
                         app_release_all_keys(app);
@@ -4550,7 +4627,6 @@ static bool app_parse_args(
             *model_explicit = true;
             continue;
         }
-
         if (*rom_a == NULL) {
             *rom_a = argv[i];
         } else if (*rom_b == NULL) {
@@ -4629,7 +4705,7 @@ static void app_save_model(SpectrumModel model) {
     WritePrivateProfileStringA(
         "emulator",
         "model",
-        model == SPECTRUM_MODEL_128K ? "128" : "48",
+        app_model_settings_value(model),
         path
     );
 }
@@ -5225,6 +5301,272 @@ static bool app_find_rom(char *out_path, size_t out_size, const char *filename) 
     return false;
 }
 
+/* Returns the ROM bundle tracked for one Spectrum model inside the startup
+   selection catalog and later machine-switch state. */
+static RomSet *app_rom_set_for_model(RomSelection *selection, SpectrumModel model) {
+    switch (model) {
+        case SPECTRUM_MODEL_128K:
+            return &selection->rom_128k;
+        case SPECTRUM_MODEL_48K:
+        default:
+            return &selection->rom_48k;
+    }
+}
+
+/* Const-qualified companion used by code paths that only need to inspect the
+   resolved ROM catalog without mutating it. */
+static const RomSet *app_rom_set_for_model_const(const RomSelection *selection, SpectrumModel model) {
+    switch (model) {
+        case SPECTRUM_MODEL_128K:
+            return &selection->rom_128k;
+        case SPECTRUM_MODEL_48K:
+        default:
+            return &selection->rom_48k;
+    }
+}
+
+/* Treats any ROM set with a primary image path as a loadable machine target. */
+static bool app_rom_set_is_available(const RomSet *set) {
+    return set != NULL && set->has_rom_a;
+}
+
+/* Stores one or two ROM paths into a model-specific bundle, clearing the
+   record first so stale secondary paths cannot leak between models. */
+static void app_rom_set_set_paths(RomSet *set, const char *rom_a, const char *rom_b) {
+    ZeroMemory(set, sizeof(*set));
+    if (rom_a != NULL && rom_a[0] != '\0') {
+        snprintf(set->rom_a, sizeof(set->rom_a), "%s", rom_a);
+        set->has_rom_a = true;
+    }
+    if (rom_b != NULL && rom_b[0] != '\0') {
+        snprintf(set->rom_b, sizeof(set->rom_b), "%s", rom_b);
+        set->has_rom_b = true;
+    }
+}
+
+/* Rebuilds the wrapped Spectrum from the ROM files assigned to the requested
+   model so each machine variant boots from its own supplied images. */
+static bool app_load_model_roms(
+    AppState *app,
+    SpectrumModel model,
+    const RomSet *set,
+    char *error_buffer,
+    size_t error_buffer_size
+) {
+    Spectrum previous_spec = app->spec;
+    chips_audio_callback_t audio_callback;
+    int sample_rate = app->spec.audio_sample_rate > 0 ? app->spec.audio_sample_rate : APP_AUDIO_SAMPLE_RATE;
+    int num_samples = app->spec.audio_num_samples > 0 ? app->spec.audio_num_samples : APP_AUDIO_CALLBACK_SAMPLES;
+    float beeper_volume = app->spec.beeper_volume > 0.0f ? app->spec.beeper_volume : 0.35f;
+    float ay_volume = app->spec.ay_volume > 0.0f ? app->spec.ay_volume : 0.20f;
+
+    if (!app_rom_set_is_available(set)) {
+        snprintf(error_buffer, error_buffer_size, "No ROM configured for %s mode.", app_model_name(model));
+        return false;
+    }
+
+    ZeroMemory(&audio_callback, sizeof(audio_callback));
+    audio_callback.func = app_audio_callback;
+    audio_callback.user_data = app;
+
+    spectrum_init(&app->spec, model);
+    spectrum_configure_audio(
+        &app->spec,
+        audio_callback,
+        sample_rate,
+        num_samples,
+        beeper_volume,
+        ay_volume
+    );
+    if (!spectrum_load_roms(
+            &app->spec,
+            set->rom_a,
+            set->has_rom_b ? set->rom_b : NULL,
+            error_buffer,
+            error_buffer_size)) {
+        app->spec = previous_spec;
+        return false;
+    }
+
+    spectrum_set_joystick_mask(&app->spec, app->controller.joystick_mask);
+    return true;
+}
+
+/* Loads any available XInput runtime lazily so Xbox-compatible controllers can
+   drive the Kempston port without adding a hard DLL dependency. */
+static void app_controller_init(AppState *app) {
+    static const char *const dll_names[] = {
+        "xinput1_4.dll",
+        "xinput9_1_0.dll",
+        "xinput1_3.dll"
+    };
+    ControllerState *controller = &app->controller;
+
+    for (size_t i = 0; i < sizeof(dll_names) / sizeof(dll_names[0]); ++i) {
+        FARPROC proc;
+
+        controller->xinput_module = LoadLibraryA(dll_names[i]);
+        if (controller->xinput_module != NULL) {
+            proc = GetProcAddress(controller->xinput_module, "XInputGetState");
+            controller->xinput_get_state = NULL;
+            if (proc != NULL) {
+                memcpy(&controller->xinput_get_state, &proc, sizeof(proc));
+            }
+            if (controller->xinput_get_state != NULL) {
+                controller->available = true;
+                controller->active_user_index = 0;
+                return;
+            }
+            FreeLibrary(controller->xinput_module);
+            controller->xinput_module = NULL;
+        }
+    }
+}
+
+/* Releases the optional controller runtime on shutdown and clears the cached
+   joystick state so later runs always start from a clean baseline. */
+static void app_controller_shutdown(AppState *app) {
+    ControllerState *controller = &app->controller;
+
+    controller->joystick_mask = 0;
+    controller->connected = false;
+    controller->available = false;
+    controller->xinput_get_state = NULL;
+    if (controller->xinput_module != NULL) {
+        FreeLibrary(controller->xinput_module);
+        controller->xinput_module = NULL;
+    }
+}
+
+/* Converts the current XInput state into a Kempston joystick bitmask and
+   pushes it into the emulated machine each frame. */
+static void app_controller_poll(AppState *app) {
+    ControllerState *controller = &app->controller;
+    XINPUT_STATE state;
+    DWORD result;
+    uint8_t mask = 0;
+    SHORT thumb_x;
+    SHORT thumb_y;
+
+    if (!controller->available || controller->xinput_get_state == NULL) {
+        return;
+    }
+
+    ZeroMemory(&state, sizeof(state));
+    result = controller->xinput_get_state(controller->active_user_index, &state);
+    if (result != ERROR_SUCCESS) {
+        controller->connected = false;
+        for (DWORD user_index = 0; user_index < XUSER_MAX_COUNT; ++user_index) {
+            ZeroMemory(&state, sizeof(state));
+            result = controller->xinput_get_state(user_index, &state);
+            if (result == ERROR_SUCCESS) {
+                controller->active_user_index = user_index;
+                controller->connected = true;
+                break;
+            }
+        }
+        if (!controller->connected) {
+            if (controller->joystick_mask != 0) {
+                controller->joystick_mask = 0;
+                spectrum_set_joystick_mask(&app->spec, 0);
+            }
+            return;
+        }
+    } else {
+        controller->connected = true;
+    }
+
+    if ((state.Gamepad.wButtons & XINPUT_GAMEPAD_DPAD_LEFT) != 0) {
+        mask |= ZX_JOYSTICK_LEFT;
+    }
+    if ((state.Gamepad.wButtons & XINPUT_GAMEPAD_DPAD_RIGHT) != 0) {
+        mask |= ZX_JOYSTICK_RIGHT;
+    }
+    if ((state.Gamepad.wButtons & XINPUT_GAMEPAD_DPAD_DOWN) != 0) {
+        mask |= ZX_JOYSTICK_DOWN;
+    }
+    if ((state.Gamepad.wButtons & XINPUT_GAMEPAD_DPAD_UP) != 0) {
+        mask |= ZX_JOYSTICK_UP;
+    }
+
+    thumb_x = state.Gamepad.sThumbLX;
+    thumb_y = state.Gamepad.sThumbLY;
+    if (thumb_x <= -XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) {
+        mask |= ZX_JOYSTICK_LEFT;
+    } else if (thumb_x >= XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) {
+        mask |= ZX_JOYSTICK_RIGHT;
+    }
+    if (thumb_y <= -XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) {
+        mask |= ZX_JOYSTICK_DOWN;
+    } else if (thumb_y >= XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) {
+        mask |= ZX_JOYSTICK_UP;
+    }
+
+    if ((state.Gamepad.wButtons & (
+            XINPUT_GAMEPAD_A |
+            XINPUT_GAMEPAD_B |
+            XINPUT_GAMEPAD_X |
+            XINPUT_GAMEPAD_Y |
+            XINPUT_GAMEPAD_LEFT_SHOULDER |
+            XINPUT_GAMEPAD_RIGHT_SHOULDER)) != 0 ||
+        state.Gamepad.bLeftTrigger >= XINPUT_GAMEPAD_TRIGGER_THRESHOLD ||
+        state.Gamepad.bRightTrigger >= XINPUT_GAMEPAD_TRIGGER_THRESHOLD) {
+        mask |= ZX_JOYSTICK_BTN;
+    }
+
+    if (mask != controller->joystick_mask) {
+        controller->joystick_mask = mask;
+        spectrum_set_joystick_mask(&app->spec, mask);
+    }
+}
+
+/* Reads enough of a `.z80` snapshot header to decide which machine ROM set
+   must be loaded before the chips quickloader restores machine state. */
+static bool app_detect_snapshot_model(
+    const char *path,
+    SpectrumModel *model,
+    char *error_buffer,
+    size_t error_buffer_size
+) {
+    FILE *file = fopen(path, "rb");
+    uint8_t header[35];
+    size_t bytes_read;
+    uint16_t pc;
+
+    if (file == NULL) {
+        snprintf(error_buffer, error_buffer_size, "Could not read snapshot file: %s", path);
+        return false;
+    }
+
+    bytes_read = fread(header, 1, sizeof(header), file);
+    fclose(file);
+    if (bytes_read < 30) {
+        snprintf(error_buffer, error_buffer_size, "Unsupported or corrupt .z80 snapshot: %s", path);
+        return false;
+    }
+
+    pc = (uint16_t)(header[6] | (header[7] << 8));
+    if (pc != 0) {
+        *model = SPECTRUM_MODEL_48K;
+        return true;
+    }
+    if (bytes_read < 35) {
+        snprintf(error_buffer, error_buffer_size, "Unsupported or corrupt .z80 snapshot: %s", path);
+        return false;
+    }
+
+    if (header[34] < 3) {
+        *model = SPECTRUM_MODEL_48K;
+    } else {
+        if (header[34] == 7 || header[34] == 8 || header[34] == 13) {
+            snprintf(error_buffer, error_buffer_size, "This snapshot targets an unsupported Spectrum model.");
+            return false;
+        }
+        *model = SPECTRUM_MODEL_128K;
+    }
+    return true;
+}
+
 /* Combines command line parsing with ROM autodetection so startup always ends
    with a complete machine selection and at least one resolved ROM path. */
 static bool app_resolve_roms(
@@ -5238,6 +5580,8 @@ static bool app_resolve_roms(
     bool model_explicit;
     const char *rom_a = NULL;
     const char *rom_b = NULL;
+    RomSet *target_set;
+    char rom_path[MAX_PATH];
 
     if (!app_parse_args(argc, argv, &model, &model_explicit, &rom_a, &rom_b)) {
         return false;
@@ -5246,79 +5590,39 @@ static bool app_resolve_roms(
         model = saved_model;
     }
 
+    ZeroMemory(selection, sizeof(*selection));
     selection->model = model;
-    selection->has_rom_a = false;
-    selection->has_rom_b = false;
-
     if (rom_a != NULL) {
-        snprintf(selection->rom_a, sizeof(selection->rom_a), "%s", rom_a);
-        selection->has_rom_a = true;
-    }
-    if (rom_b != NULL) {
-        snprintf(selection->rom_b, sizeof(selection->rom_b), "%s", rom_b);
-        selection->has_rom_b = true;
-    }
-
-    if (selection->has_rom_a) {
+        target_set = app_rom_set_for_model(selection, model);
+        app_rom_set_set_paths(target_set, rom_a, rom_b);
+        selection->model = model;
         return true;
     }
 
-    if (model_explicit && selection->model == SPECTRUM_MODEL_128K) {
-        if (app_find_rom(selection->rom_a, sizeof(selection->rom_a), "128.rom")) {
-            selection->has_rom_a = true;
-            return true;
-        }
-        return false;
+    if (app_find_rom(rom_path, sizeof(rom_path), "48.rom")) {
+        app_rom_set_set_paths(&selection->rom_48k, rom_path, NULL);
+    } else if (app_find_rom(rom_path, sizeof(rom_path), "128.rom")) {
+        app_rom_set_set_paths(&selection->rom_48k, rom_path, NULL);
+    }
+    if (app_find_rom(rom_path, sizeof(rom_path), "128.rom")) {
+        app_rom_set_set_paths(&selection->rom_128k, rom_path, NULL);
     }
 
-    if (model_explicit && selection->model == SPECTRUM_MODEL_48K) {
-        if (app_find_rom(selection->rom_a, sizeof(selection->rom_a), "128.rom")) {
-            selection->has_rom_a = true;
-            return true;
-        }
-        if (app_find_rom(selection->rom_a, sizeof(selection->rom_a), "48.rom")) {
-            selection->has_rom_a = true;
-            return true;
-        }
-        return false;
+    if (model_explicit) {
+        return app_rom_set_is_available(app_rom_set_for_model_const(selection, model));
     }
 
-    if (has_saved_model && saved_model == SPECTRUM_MODEL_128K) {
-        if (app_find_rom(selection->rom_a, sizeof(selection->rom_a), "128.rom")) {
-            selection->model = SPECTRUM_MODEL_128K;
-            selection->has_rom_a = true;
-            return true;
-        }
-        if (app_find_rom(selection->rom_a, sizeof(selection->rom_a), "48.rom")) {
-            selection->model = SPECTRUM_MODEL_48K;
-            selection->has_rom_a = true;
-            return true;
-        }
-        return false;
+    if (has_saved_model && app_rom_set_is_available(app_rom_set_for_model_const(selection, saved_model))) {
+        selection->model = saved_model;
+        return true;
     }
 
-    if (has_saved_model && saved_model == SPECTRUM_MODEL_48K) {
-        if (app_find_rom(selection->rom_a, sizeof(selection->rom_a), "128.rom")) {
-            selection->model = SPECTRUM_MODEL_48K;
-            selection->has_rom_a = true;
-            return true;
-        }
-        if (app_find_rom(selection->rom_a, sizeof(selection->rom_a), "48.rom")) {
-            selection->model = SPECTRUM_MODEL_48K;
-            selection->has_rom_a = true;
-            return true;
-        }
-        return false;
-    }
-
-    if (app_find_rom(selection->rom_a, sizeof(selection->rom_a), "128.rom")) {
+    if (app_rom_set_is_available(&selection->rom_128k)) {
         selection->model = SPECTRUM_MODEL_128K;
-        selection->has_rom_a = true;
         return true;
     }
-    if (app_find_rom(selection->rom_a, sizeof(selection->rom_a), "48.rom")) {
+    if (app_rom_set_is_available(&selection->rom_48k)) {
         selection->model = SPECTRUM_MODEL_48K;
-        selection->has_rom_a = true;
         return true;
     }
     return false;
@@ -5336,45 +5640,34 @@ int main(int argc, char **argv) {
     RomSelection selection;
     SpectrumModel saved_model = SPECTRUM_MODEL_48K;
     bool has_saved_model;
-    chips_audio_callback_t audio_callback;
     INITCOMMONCONTROLSEX common_controls;
     ZeroMemory(&selection, sizeof(selection));
     has_saved_model = app_load_saved_model(&saved_model);
     if (!app_resolve_roms(argc, argv, has_saved_model, saved_model, &selection)) {
         app_print_usage();
-        app_show_error("No ROM found. The emulator looks for 128.rom first, then 48.rom.");
+        app_show_error("No compatible ROM found. Place 48.rom and/or 128.rom next to the EXE or in the repo.");
         return 1;
     }
 
     AppState app;
     ZeroMemory(&app, sizeof(app));
+    app.roms = selection;
     app_audio_init(&app);
-    audio_callback.func = app_audio_callback;
-    audio_callback.user_data = &app;
-    spectrum_init(&app.spec, selection.model);
-    spectrum_configure_audio(
-        &app.spec,
-        audio_callback,
-        APP_AUDIO_SAMPLE_RATE,
-        APP_AUDIO_CALLBACK_SAMPLES,
-        0.35f,
-        0.20f
-    );
+    app_controller_init(&app);
 
     char error_buffer[256];
-    if (!spectrum_load_roms(
-        &app.spec,
-        selection.rom_a,
-        selection.has_rom_b ? selection.rom_b : NULL,
-        error_buffer,
-        sizeof(error_buffer)
-    )) {
+    if (!app_load_model_roms(
+            &app,
+            selection.model,
+            app_rom_set_for_model_const(&app.roms, selection.model),
+            error_buffer,
+            sizeof(error_buffer))) {
         fprintf(stderr, "%s\n", error_buffer);
         app_show_error(error_buffer);
+        app_controller_shutdown(&app);
         app_audio_shutdown(&app);
         return 1;
     }
-    spectrum_reset(&app.spec);
 
     app.bitmap_info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     app.bitmap_info.bmiHeader.biWidth = ZX_SCREEN_WIDTH;
@@ -5402,12 +5695,14 @@ int main(int argc, char **argv) {
     if (RegisterClassA(&wc) == 0) {
         fprintf(stderr, "RegisterClass failed.\n");
         app_show_error("RegisterClass failed.");
+        app_controller_shutdown(&app);
         app_audio_shutdown(&app);
         return 1;
     }
     if (!app_register_tool_window_classes(instance)) {
         fprintf(stderr, "Tool window registration failed.\n");
         app_show_error("Tool window registration failed.");
+        app_controller_shutdown(&app);
         app_audio_shutdown(&app);
         return 1;
     }
@@ -5416,6 +5711,7 @@ int main(int argc, char **argv) {
     if (menu == NULL) {
         fprintf(stderr, "CreateMenu failed.\n");
         app_show_error("CreateMenu failed.");
+        app_controller_shutdown(&app);
         app_audio_shutdown(&app);
         return 1;
     }
@@ -5439,6 +5735,7 @@ int main(int argc, char **argv) {
     if (hwnd == NULL) {
         fprintf(stderr, "CreateWindowEx failed.\n");
         app_show_error("CreateWindowEx failed.");
+        app_controller_shutdown(&app);
         app_audio_shutdown(&app);
         return 1;
     }
@@ -5465,6 +5762,7 @@ int main(int argc, char **argv) {
         }
     }
 
+    app_controller_shutdown(&app);
     app_audio_shutdown(&app);
     return 0;
 }

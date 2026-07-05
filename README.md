@@ -1,52 +1,56 @@
 # ZX Spectrum Emulator
 
-Small ZX Spectrum emulator in C for Windows. It uses the Win32 API for display and input and currently builds through `build.bat` with `zig rc` and `zig cc`.
+Small ZX Spectrum emulator in C for Windows. It uses the Win32 API for display, input, and audio, and currently builds with `zig rc` and `zig cc`.
 
 ## Current scope
 
 - 48K model
 - 128K model with ROM switching and RAM paging through port `0x7FFD`
 - ULA screen rendering with border and flash attributes
+- Memory-side ULA contention timing for 48K and 128K RAM accesses
 - Keyboard matrix input
+- Kempston joystick input from an XInput-compatible controller
 - 48K beeper sound through the Windows audio device
 - 128K AY sound through the Windows audio device
+- `.z80` snapshot loading for 48K and 128K snapshots
 
 ## Not implemented
 
 - Tape loading
-- Accurate ULA contention timing
+- Full ULA I/O contention timing
 - `.sna` snapshot loading
+- Non-48K/128K `.z80` snapshot models
 
 ## Build
 
 ```powershell
-.\build.bat
+.\src\build.bat
 ```
 
 ## Run
 
-With no arguments, the emulator looks for `128.rom` in the working folder first and starts in 128K mode. If that is not present, it falls back to `48.rom`.
+With no arguments, the emulator looks for `128.rom` in `.\src` first and starts in `128K` mode. If that is not present, it falls back to `48.rom`.
 
 ```powershell
-.\build\zxspecemu.exe
+.\src\zxspecemu.exe
 ```
 
 48K:
 
 ```powershell
-.\build\zxspecemu.exe --48 path\to\48k.rom
+.\src\zxspecemu.exe --48 path\to\48k.rom
 ```
 
 128K with two 16 KB ROMs:
 
 ```powershell
-.\build\zxspecemu.exe --128 path\to\128-0.rom path\to\128-1.rom
+.\src\zxspecemu.exe --128 path\to\128-0.rom path\to\128-1.rom
 ```
 
 128K with one combined 32 KB ROM:
 
 ```powershell
-.\build\zxspecemu.exe --128 path\to\128k-combined.rom
+.\src\zxspecemu.exe --128 path\to\128k-combined.rom
 ```
 
 ## Keyboard
@@ -55,7 +59,13 @@ With no arguments, the emulator looks for `128.rom` in the working folder first 
 - `Ctrl` maps to `SYMBOL SHIFT`
 - Raw key presses still drive the Spectrum matrix for held keys and games
 - Printable keys use the active Windows keyboard layout, so symbols such as `"` follow the host layout
-- `Input -> Paste Text` or `Ctrl+V` queues clipboard text into the emulator one Spectrum key tap at a time
+- `Ctrl+V` queues clipboard text into the emulator one Spectrum key tap at a time
+
+## Controller
+
+- An XInput-compatible pad is exposed as a Kempston joystick
+- D-pad or left stick maps to directions
+- `A`, `B`, `X`, `Y`, shoulders, or triggers map to fire
 
 ## Menu
 
@@ -63,7 +73,6 @@ With no arguments, the emulator looks for `128.rom` in the working folder first 
 - `File -> Reset` resets the active machine
 - `File -> Exit` closes the emulator
 - `Machine -> 48K` / `Machine -> 128K` rebuilds the emulator for that model and remembers the choice between runs
-- `Input -> Paste Text` types clipboard text through the Spectrum keyboard matrix
 - `Tools -> Assembler...` opens a small RAM patching assembler with support for common Z80 instructions plus `ORG`, `DB`, `DW`, and `INCLUDE`
 - `Tools -> Debugger...` opens a separate debugger window with pause, run, single-step, register state, and memory/disassembly views
 

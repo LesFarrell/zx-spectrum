@@ -69,7 +69,7 @@ extern "C" {
 #endif
 
 // bump this whenever the zx_t struct layout changes
-#define ZX_SNAPSHOT_VERSION (0x0001)
+#define ZX_SNAPSHOT_VERSION (0x0002)
 
 #define ZX_MAX_AUDIO_SAMPLES (1024)      // max number of audio samples in internal sample buffer
 #define ZX_DEFAULT_AUDIO_SAMPLES (128)   // default number of samples in internal sample buffer
@@ -133,6 +133,7 @@ typedef struct {
     uint8_t kbd_joymask;        // joystick mask from keyboard joystick emulation
     uint8_t joy_joymask;        // joystick mask from zx_joystick()
     uint32_t tick_count;
+    uint32_t frame_tstate;
     uint8_t last_mem_config;    // last out to 0x7FFD
     uint8_t last_fe_out;        // last out value to 0xFE port
     uint8_t blink_counter;      // incremented on each vblank
@@ -203,6 +204,9 @@ bool zx_load_snapshot(zx_t* sys, uint32_t version, zx_t* src);
 
 static void _zx_init_memory_map(zx_t* sys);
 static void _zx_init_keyboard_matrix(zx_t* sys);
+static uint8_t _zx_contention_delay(zx_t* sys);
+static bool _zx_is_contended_addr(zx_t* sys, uint16_t addr);
+static bool _zx_should_apply_memory_contention(zx_t* sys, uint64_t pins);
 
 #define _ZX_DEFAULT(val,def) (((val) != 0) ? (val) : (def))
 
@@ -253,7 +257,7 @@ void zx_init(zx_t* sys, const zx_desc_t* desc) {
         .sound_hz = audio_hz,
         .base_volume = _ZX_DEFAULT(desc->audio.beeper_volume, 0.25f),
     });
-    if (ZX_TYPE_128 == sys->type) {
+    if (ZX_TYPE_48K != sys->type) {
         ay38910_init(&sys->ay, &(ay38910_desc_t){
             .type = AY38910_TYPE_8912,
             .tick_hz = (int)sys->freq_hz / 2,
@@ -274,12 +278,14 @@ void zx_reset(zx_t* sys) {
     CHIPS_ASSERT(sys && sys->valid);
     sys->pins = z80_reset(&sys->cpu);
     beeper_reset(&sys->beeper);
-    if (sys->type == ZX_TYPE_128) {
+    if (sys->type != ZX_TYPE_48K) {
         ay38910_reset(&sys->ay);
     }
     sys->memory_paging_disabled = false;
     sys->kbd_joymask = 0;
     sys->joy_joymask = 0;
+    sys->frame_tstate = 0;
+    sys->last_mem_config = 0;
     sys->last_fe_out = 0;
     sys->scanline_counter = sys->scanline_period;
     sys->scanline_y = 0;
@@ -413,7 +419,79 @@ static void _zx_update_memory_map_zx128(zx_t* sys, uint8_t data) {
     }
 }
 
+/* Returns the current machine's active contention delay for the current
+   frame t-state, or zero when the ULA/gate array is not stealing the bus. */
+static uint8_t _zx_contention_delay(zx_t* sys) {
+    static const uint8_t ula_pattern[8] = { 6, 5, 4, 3, 2, 1, 0, 0 };
+    const uint32_t t = sys->frame_tstate;
+
+    if (sys->type == ZX_TYPE_48K) {
+        if (t >= 14335) {
+            const uint32_t rel = t - 14335;
+            if (rel < (192u * 224u)) {
+                const uint32_t line_pos = rel % 224u;
+                if (line_pos < 128u) {
+                    return ula_pattern[line_pos & 7u];
+                }
+            }
+        }
+        return 0;
+    }
+
+    if (sys->type == ZX_TYPE_128) {
+        if (t >= 14361) {
+            const uint32_t rel = t - 14361;
+            if (rel < (192u * 228u)) {
+                const uint32_t line_pos = rel % 228u;
+                if (line_pos < 128u) {
+                    return ula_pattern[line_pos & 7u];
+                }
+            }
+        }
+        return 0;
+    }
+
+    return 0;
+}
+
+/* Reports whether the supplied address currently maps to a RAM page that is
+   contended on the active machine model. */
+static bool _zx_is_contended_addr(zx_t* sys, uint16_t addr) {
+    if (sys->type == ZX_TYPE_48K) {
+        return addr >= 0x4000 && addr < 0x8000;
+    }
+
+    if (sys->type == ZX_TYPE_128) {
+        if (addr >= 0x4000 && addr < 0x8000) {
+            return true;
+        }
+        if (addr >= 0xC000) {
+            return 0 != ((sys->last_mem_config & 0x7) & 1);
+        }
+        return false;
+    }
+
+    return false;
+}
+
+/* Ferranti ULA machines can be stalled whenever a contended address is on the
+   bus. */
+static bool _zx_should_apply_memory_contention(zx_t* sys, uint64_t pins) {
+    if (!_zx_is_contended_addr(sys, Z80_GET_ADDR(pins))) {
+        return false;
+    }
+    return 0 == (pins & Z80_IORQ);
+}
+
 static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
+    bool new_frame = false;
+
+    if (_zx_contention_delay(sys) > 0 && _zx_should_apply_memory_contention(sys, pins)) {
+        pins |= Z80_WAIT;
+    }
+    else {
+        pins &= ~Z80_WAIT;
+    }
     pins = z80_tick(&sys->cpu, pins);
 
     // video decoding and vblank interrupt
@@ -425,6 +503,7 @@ static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
             pins |= Z80_INT;
             // hold the INT pin for 32 ticks
             sys->int_counter = 32;
+            new_frame = true;
         }
     }
 
@@ -508,6 +587,12 @@ static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
             }
             sys->audio.sample_pos = 0;
         }
+    }
+    if (new_frame) {
+        sys->frame_tstate = 0;
+    }
+    else {
+        sys->frame_tstate++;
     }
     return pins;
 }
@@ -933,7 +1018,7 @@ bool zx_quickload(zx_t* sys, chips_range_t data) {
     }
     if (ext_hdr) {
         sys->pins = z80_prefetch(&sys->cpu, (ext_hdr->PC_h<<8)|ext_hdr->PC_l);
-        if (sys->type == ZX_TYPE_128) {
+        if (sys->type != ZX_TYPE_48K) {
             ay38910_reset(&sys->ay);
             for (uint8_t i = 0; i < AY38910_NUM_REGISTERS; i++) {
                 ay38910_set_register(&sys->ay, i, ext_hdr->audio[i]);
