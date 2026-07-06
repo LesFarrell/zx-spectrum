@@ -50,12 +50,21 @@ enum {
     APP_CTRL_DEBUG_TEXT = 2001,
     APP_CTRL_DEBUG_PAUSE = 2002,
     APP_CTRL_DEBUG_STEP = 2003,
-    APP_CTRL_DEBUG_REFRESH = 2004,
-    APP_CTRL_DEBUG_ADDRESS = 2005,
-    APP_CTRL_DEBUG_GO = 2006,
-    APP_CTRL_DEBUG_SYNC = 2007,
-    APP_CTRL_DEBUG_BREAKPOINT_TOGGLE = 2008,
-    APP_CTRL_DEBUG_RUN_AT = 2009,
+    APP_CTRL_DEBUG_STEP_OVER = 2004,
+    APP_CTRL_DEBUG_REFRESH = 2005,
+    APP_CTRL_DEBUG_ADDRESS = 2006,
+    APP_CTRL_DEBUG_GO = 2007,
+    APP_CTRL_DEBUG_SYNC = 2008,
+    APP_CTRL_DEBUG_BREAKPOINT_TOGGLE = 2009,
+    APP_CTRL_DEBUG_RUN_AT = 2010,
+    APP_CTRL_DEBUG_RUN_TO = 2011,
+    APP_CTRL_DEBUG_WATCHPOINT_TOGGLE = 2012,
+    APP_CTRL_DEBUG_REMOVE_SELECTED = 2013,
+    APP_CTRL_DEBUG_POINTS_LIST = 2014,
+    APP_CTRL_DEBUG_VIEW_PC = 2015,
+    APP_CTRL_DEBUG_VIEW_SP = 2016,
+    APP_CTRL_DEBUG_PAGE_UP = 2017,
+    APP_CTRL_DEBUG_PAGE_DOWN = 2018,
     APP_CTRL_ASM_SOURCE = 2102,
     APP_CTRL_ASM_APPLY = 2103,
     APP_CTRL_ASM_STATUS = 2104,
@@ -146,12 +155,24 @@ typedef struct DebugState {
     HWND debugger_text;
     HWND debugger_pause_button;
     HWND debugger_step_button;
+    HWND debugger_step_over_button;
     HWND debugger_refresh_button;
     HWND debugger_address_edit;
     HWND debugger_go_button;
     HWND debugger_sync_checkbox;
     HWND debugger_breakpoint_toggle_button;
     HWND debugger_run_at_button;
+    HWND debugger_run_to_button;
+    HWND debugger_watchpoint_toggle_button;
+    HWND debugger_remove_selected_button;
+    HWND debugger_view_pc_button;
+    HWND debugger_view_sp_button;
+    HWND debugger_page_up_button;
+    HWND debugger_page_down_button;
+    HWND debugger_points_list;
+    HACCEL debugger_accel;
+    WNDPROC debugger_address_edit_wndproc;
+    WNDPROC debugger_points_list_wndproc;
     HWND assembler_hwnd;
     HWND assembler_line_numbers;
     HWND assembler_source;
@@ -170,14 +191,28 @@ typedef struct DebugState {
     bool stepping;
     bool stop_requested;
     bool breakpoint_hit;
+    bool watchpoint_hit;
     bool debugger_view_sync_pc;
     bool debugger_view_initialized;
+    bool debugger_run_to_active;
+    bool debugger_run_to_hit;
+    bool debugger_watchpoint_pending;
     bool debugger_skip_breakpoint_once;
     uint16_t debugger_view_address;
     uint16_t last_breakpoint_address;
+    uint16_t debugger_run_to_address;
+    uint16_t last_run_to_address;
     uint16_t debugger_skip_breakpoint_address;
-    uint16_t breakpoints[16];
+    uint16_t last_watchpoint_address;
+    uint16_t pending_watchpoint_address;
+    uint16_t *breakpoints;
     size_t breakpoint_count;
+    size_t breakpoint_capacity;
+    uint16_t *watchpoints;
+    size_t watchpoint_count;
+    size_t watchpoint_capacity;
+    uint8_t last_watchpoint_value;
+    uint8_t pending_watchpoint_value;
     uint64_t last_pins;
 } DebugState;
 
@@ -300,7 +335,22 @@ static void app_controller_init(AppState *app);
 static void app_controller_shutdown(AppState *app);
 static void app_controller_poll(AppState *app);
 static bool app_debug_has_breakpoint(const AppState *app, uint16_t address);
+static bool app_debug_reserve_breakpoints(AppState *app, size_t required_count);
+static bool app_debug_has_watchpoint(const AppState *app, uint16_t address);
+static bool app_debug_reserve_watchpoints(AppState *app, size_t required_count);
 static bool app_debug_toggle_breakpoint(AppState *app, uint16_t address, bool *enabled);
+static bool app_debug_toggle_watchpoint(AppState *app, uint16_t address, bool *enabled);
+static void app_debug_refresh_points_list(AppState *app);
+static bool app_debug_remove_selected_point(AppState *app);
+static void app_debug_free_storage(AppState *app);
+static void app_debug_append_point_summary(char *buffer, size_t buffer_size, size_t *used, const AppState *app);
+static bool app_debug_is_step_over_candidate(const Spectrum *spec, uint16_t address);
+static void app_debug_resume(AppState *app);
+static void app_debug_step_over_instruction(AppState *app);
+static void app_debug_navigate_view(AppState *app, int delta);
+static void app_debug_view_pc(AppState *app);
+static void app_debug_view_sp(AppState *app);
+static void app_debug_run_to_address(AppState *app, uint16_t address);
 static void app_debug_run_frame(AppState *app);
 static void app_debug_run_from_address(AppState *app, uint16_t address);
 static HMENU app_create_assembler_menu(void);
@@ -350,6 +400,8 @@ static void app_assembler_clear_error_marker(AppState *app);
 static void app_assembler_focus_line(AppState *app, size_t line_number);
 static void app_assembler_sync_error_from_status(AppState *app, const char *status_text);
 static void app_assembler_update_line_numbers(AppState *app);
+static LRESULT CALLBACK app_debugger_address_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
+static LRESULT CALLBACK app_debugger_points_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
 static LRESULT CALLBACK app_assembler_gutter_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
 static LRESULT CALLBACK app_assembler_source_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
 
@@ -358,15 +410,19 @@ static LRESULT CALLBACK app_assembler_source_wndproc(HWND hwnd, UINT msg, WPARAM
 static HMENU app_create_menu(void) {
     HMENU menu_bar = CreateMenu();
     HMENU file_menu = CreatePopupMenu();
+    HMENU tape_menu = CreatePopupMenu();
     HMENU machine_menu = CreatePopupMenu();
     HMENU tools_menu = CreatePopupMenu();
 
-    if (menu_bar == NULL || file_menu == NULL || machine_menu == NULL || tools_menu == NULL) {
+    if (menu_bar == NULL || file_menu == NULL || tape_menu == NULL || machine_menu == NULL || tools_menu == NULL) {
         if (tools_menu != NULL) {
             DestroyMenu(tools_menu);
         }
         if (machine_menu != NULL) {
             DestroyMenu(machine_menu);
+        }
+        if (tape_menu != NULL) {
+            DestroyMenu(tape_menu);
         }
         if (file_menu != NULL) {
             DestroyMenu(file_menu);
@@ -378,18 +434,18 @@ static HMENU app_create_menu(void) {
     }
 
     AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_OPEN_SNAPSHOT, "&Open Tape/Snapshot...\tCtrl+O");
-    AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_PLAY_TAPE, "&Play Tape\tF3");
-    AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_STOP_TAPE, "S&top Tape\tF4");
-    AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_AUTOLOAD_TAPES, "&Auto-load Tapes On Open");
-    AppendMenuA(file_menu, MF_SEPARATOR, 0, NULL);
     AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_RESET, "&Reset\tCtrl+R");
     AppendMenuA(file_menu, MF_SEPARATOR, 0, NULL);
     AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_EXIT, "E&xit\tAlt+F4");
+    AppendMenuA(tape_menu, MF_STRING, APP_MENU_FILE_PLAY_TAPE, "&Play Tape\tF3");
+    AppendMenuA(tape_menu, MF_STRING, APP_MENU_FILE_STOP_TAPE, "S&top Tape\tF4");
+    AppendMenuA(tape_menu, MF_STRING, APP_MENU_FILE_AUTOLOAD_TAPES, "&Auto-load Tapes On Open");
     AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_48K, "&48K\tCtrl+1");
     AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_128K, "&128K\tCtrl+2");
     AppendMenuA(tools_menu, MF_STRING, APP_MENU_TOOLS_ASSEMBLER, "&Assembler...\tCtrl+Shift+A");
     AppendMenuA(tools_menu, MF_STRING, APP_MENU_TOOLS_DEBUGGER, "&Debugger...\tCtrl+Shift+D");
     AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)file_menu, "&File");
+    AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)tape_menu, "&Tape");
     AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)machine_menu, "&Machine");
     AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)tools_menu, "&Tools");
     return menu_bar;
@@ -504,7 +560,7 @@ static void app_update_model_menu(HWND hwnd, SpectrumModel model) {
     );
 }
 
-/* Reflects the current tape auto-load setting in the File menu. */
+/* Reflects the current tape auto-load setting in the Tape menu. */
 static void app_update_tape_menu(HWND hwnd, bool enabled) {
     HMENU menu = GetMenu(hwnd);
     if (menu == NULL) {
@@ -665,6 +721,7 @@ static void app_debug_decode_instruction(
     size_t out_size,
     uint8_t *instruction_length
 ) {
+    char discard[64];
     static const char *reg8[] = {"B", "C", "D", "E", "H", "L", "(HL)", "A"};
     static const char *reg16[] = {"BC", "DE", "HL", "SP"};
     static const char *reg16_push[] = {"BC", "DE", "HL", "AF"};
@@ -681,6 +738,11 @@ static void app_debug_decode_instruction(
     const uint8_t z = op & 7;
     const uint8_t p = y >> 1;
     const uint8_t q = y & 1;
+
+    if (out == NULL || out_size == 0) {
+        out = discard;
+        out_size = sizeof(discard);
+    }
 
     *instruction_length = 1;
 
@@ -927,11 +989,55 @@ static void app_debug_decode_instruction(
 /* Refreshes the debugger button captions and enabled state so the current
    paused/running state remains visible from the tool window chrome. */
 static void app_debug_update_controls(AppState *app) {
+    bool has_selected_point = false;
+    const BOOL machine_ready = app->spec.machine_ready ? TRUE : FALSE;
+
     if (app->debug.debugger_hwnd == NULL) {
         return;
     }
+    if (app->debug.debugger_points_list != NULL) {
+        has_selected_point = SendMessageA(app->debug.debugger_points_list, LB_GETCURSEL, 0, 0) != LB_ERR;
+    }
     SetWindowTextA(app->debug.debugger_pause_button, app->debug.paused ? "Run" : "Pause");
-    EnableWindow(app->debug.debugger_step_button, app->debug.paused ? TRUE : FALSE);
+    EnableWindow(app->debug.debugger_pause_button, machine_ready);
+    EnableWindow(app->debug.debugger_step_button, (app->debug.paused && app->spec.machine_ready) ? TRUE : FALSE);
+    EnableWindow(app->debug.debugger_step_over_button, (app->debug.paused && app->spec.machine_ready) ? TRUE : FALSE);
+    if (app->debug.debugger_refresh_button != NULL) {
+        EnableWindow(app->debug.debugger_refresh_button, machine_ready);
+    }
+    if (app->debug.debugger_address_edit != NULL) {
+        EnableWindow(app->debug.debugger_address_edit, machine_ready);
+    }
+    if (app->debug.debugger_go_button != NULL) {
+        EnableWindow(app->debug.debugger_go_button, machine_ready);
+    }
+    if (app->debug.debugger_run_to_button != NULL) {
+        EnableWindow(app->debug.debugger_run_to_button, machine_ready);
+    }
+    if (app->debug.debugger_run_at_button != NULL) {
+        EnableWindow(app->debug.debugger_run_at_button, machine_ready);
+    }
+    if (app->debug.debugger_breakpoint_toggle_button != NULL) {
+        EnableWindow(app->debug.debugger_breakpoint_toggle_button, machine_ready);
+    }
+    if (app->debug.debugger_watchpoint_toggle_button != NULL) {
+        EnableWindow(app->debug.debugger_watchpoint_toggle_button, machine_ready);
+    }
+    if (app->debug.debugger_remove_selected_button != NULL) {
+        EnableWindow(app->debug.debugger_remove_selected_button, (has_selected_point && app->spec.machine_ready) ? TRUE : FALSE);
+    }
+    if (app->debug.debugger_view_pc_button != NULL) {
+        EnableWindow(app->debug.debugger_view_pc_button, machine_ready);
+    }
+    if (app->debug.debugger_view_sp_button != NULL) {
+        EnableWindow(app->debug.debugger_view_sp_button, machine_ready);
+    }
+    if (app->debug.debugger_page_up_button != NULL) {
+        EnableWindow(app->debug.debugger_page_up_button, machine_ready);
+    }
+    if (app->debug.debugger_page_down_button != NULL) {
+        EnableWindow(app->debug.debugger_page_down_button, machine_ready);
+    }
     if (app->debug.debugger_sync_checkbox != NULL) {
         SendMessageA(
             app->debug.debugger_sync_checkbox,
@@ -965,6 +1071,100 @@ static bool app_debug_has_breakpoint(const AppState *app, uint16_t address) {
     return false;
 }
 
+static bool app_debug_reserve_breakpoints(AppState *app, size_t required_count) {
+    uint16_t *new_breakpoints;
+    size_t new_capacity;
+
+    if (required_count <= app->debug.breakpoint_capacity) {
+        return true;
+    }
+
+    new_capacity = app->debug.breakpoint_capacity > 0 ? app->debug.breakpoint_capacity : 16;
+    while (new_capacity < required_count) {
+        if (new_capacity > (SIZE_MAX / 2)) {
+            new_capacity = required_count;
+            break;
+        }
+        new_capacity *= 2;
+    }
+
+    new_breakpoints = (uint16_t *)realloc(app->debug.breakpoints, new_capacity * sizeof(app->debug.breakpoints[0]));
+    if (new_breakpoints == NULL) {
+        return false;
+    }
+
+    app->debug.breakpoints = new_breakpoints;
+    app->debug.breakpoint_capacity = new_capacity;
+    return true;
+}
+
+static bool app_debug_has_watchpoint(const AppState *app, uint16_t address) {
+    for (size_t i = 0; i < app->debug.watchpoint_count; ++i) {
+        if (app->debug.watchpoints[i] == address) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool app_debug_reserve_watchpoints(AppState *app, size_t required_count) {
+    uint16_t *new_watchpoints;
+    size_t new_capacity;
+
+    if (required_count <= app->debug.watchpoint_capacity) {
+        return true;
+    }
+
+    new_capacity = app->debug.watchpoint_capacity > 0 ? app->debug.watchpoint_capacity : 16;
+    while (new_capacity < required_count) {
+        if (new_capacity > (SIZE_MAX / 2)) {
+            new_capacity = required_count;
+            break;
+        }
+        new_capacity *= 2;
+    }
+
+    new_watchpoints = (uint16_t *)realloc(app->debug.watchpoints, new_capacity * sizeof(app->debug.watchpoints[0]));
+    if (new_watchpoints == NULL) {
+        return false;
+    }
+
+    app->debug.watchpoints = new_watchpoints;
+    app->debug.watchpoint_capacity = new_capacity;
+    return true;
+}
+
+static DWORD_PTR app_debug_make_point_item_data(bool watchpoint, uint16_t address) {
+    return (DWORD_PTR)((watchpoint ? 0x10000u : 0u) | address);
+}
+
+static bool app_debug_get_selected_point(AppState *app, bool *watchpoint, uint16_t *address) {
+    int selection;
+    LRESULT item_data;
+
+    if (app == NULL || app->debug.debugger_points_list == NULL) {
+        return false;
+    }
+
+    selection = (int)SendMessageA(app->debug.debugger_points_list, LB_GETCURSEL, 0, 0);
+    if (selection == LB_ERR) {
+        return false;
+    }
+
+    item_data = SendMessageA(app->debug.debugger_points_list, LB_GETITEMDATA, (WPARAM)selection, 0);
+    if (item_data == LB_ERR) {
+        return false;
+    }
+
+    if (watchpoint != NULL) {
+        *watchpoint = (((DWORD_PTR)item_data >> 16) & 0x1u) != 0;
+    }
+    if (address != NULL) {
+        *address = (uint16_t)((DWORD_PTR)item_data & 0xFFFFu);
+    }
+    return true;
+}
+
 /* Adds or removes one debugger breakpoint at an absolute 16-bit address. */
 static bool app_debug_toggle_breakpoint(AppState *app, uint16_t address, bool *enabled) {
     for (size_t i = 0; i < app->debug.breakpoint_count; ++i) {
@@ -982,7 +1182,7 @@ static bool app_debug_toggle_breakpoint(AppState *app, uint16_t address, bool *e
         }
     }
 
-    if (app->debug.breakpoint_count >= sizeof(app->debug.breakpoints) / sizeof(app->debug.breakpoints[0])) {
+    if (!app_debug_reserve_breakpoints(app, app->debug.breakpoint_count + 1)) {
         return false;
     }
 
@@ -991,6 +1191,164 @@ static bool app_debug_toggle_breakpoint(AppState *app, uint16_t address, bool *e
         *enabled = true;
     }
     return true;
+}
+
+static bool app_debug_toggle_watchpoint(AppState *app, uint16_t address, bool *enabled) {
+    for (size_t i = 0; i < app->debug.watchpoint_count; ++i) {
+        if (app->debug.watchpoints[i] == address) {
+            memmove(
+                &app->debug.watchpoints[i],
+                &app->debug.watchpoints[i + 1],
+                (app->debug.watchpoint_count - i - 1) * sizeof(app->debug.watchpoints[0])
+            );
+            app->debug.watchpoint_count--;
+            if (enabled != NULL) {
+                *enabled = false;
+            }
+            return true;
+        }
+    }
+
+    if (!app_debug_reserve_watchpoints(app, app->debug.watchpoint_count + 1)) {
+        return false;
+    }
+
+    app->debug.watchpoints[app->debug.watchpoint_count++] = address;
+    if (enabled != NULL) {
+        *enabled = true;
+    }
+    return true;
+}
+
+static void app_debug_refresh_points_list(AppState *app) {
+    bool had_selection = false;
+    bool selected_watchpoint = false;
+    uint16_t selected_address = 0;
+    DWORD_PTR selected_data = 0;
+    int restore_index = LB_ERR;
+
+    if (app == NULL || app->debug.debugger_points_list == NULL) {
+        return;
+    }
+
+    had_selection = app_debug_get_selected_point(app, &selected_watchpoint, &selected_address);
+    if (had_selection) {
+        selected_data = app_debug_make_point_item_data(selected_watchpoint, selected_address);
+    }
+    SendMessageA(app->debug.debugger_points_list, LB_RESETCONTENT, 0, 0);
+
+    for (size_t i = 0; i < app->debug.breakpoint_count; ++i) {
+        char item[32];
+        snprintf(item, sizeof(item), "Exec  %04X", app->debug.breakpoints[i]);
+        const LRESULT index = SendMessageA(app->debug.debugger_points_list, LB_ADDSTRING, 0, (LPARAM)item);
+        if (index != LB_ERR && index != LB_ERRSPACE) {
+            SendMessageA(
+                app->debug.debugger_points_list,
+                LB_SETITEMDATA,
+                (WPARAM)index,
+                (LPARAM)app_debug_make_point_item_data(false, app->debug.breakpoints[i])
+            );
+            if (had_selection && selected_data == app_debug_make_point_item_data(false, app->debug.breakpoints[i])) {
+                restore_index = (int)index;
+            }
+        }
+    }
+    for (size_t i = 0; i < app->debug.watchpoint_count; ++i) {
+        char item[32];
+        snprintf(item, sizeof(item), "Write %04X", app->debug.watchpoints[i]);
+        const LRESULT index = SendMessageA(app->debug.debugger_points_list, LB_ADDSTRING, 0, (LPARAM)item);
+        if (index != LB_ERR && index != LB_ERRSPACE) {
+            SendMessageA(
+                app->debug.debugger_points_list,
+                LB_SETITEMDATA,
+                (WPARAM)index,
+                (LPARAM)app_debug_make_point_item_data(true, app->debug.watchpoints[i])
+            );
+            if (had_selection && selected_data == app_debug_make_point_item_data(true, app->debug.watchpoints[i])) {
+                restore_index = (int)index;
+            }
+        }
+    }
+
+    if (restore_index != LB_ERR) {
+        SendMessageA(app->debug.debugger_points_list, LB_SETCURSEL, (WPARAM)restore_index, 0);
+    } else if (had_selection) {
+        const size_t total_count = app->debug.breakpoint_count + app->debug.watchpoint_count;
+        if (total_count > 0) {
+            SendMessageA(app->debug.debugger_points_list, LB_SETCURSEL, (WPARAM)(total_count - 1), 0);
+        }
+    }
+}
+
+static bool app_debug_remove_selected_point(AppState *app) {
+    bool watchpoint = false;
+    uint16_t address = 0;
+
+    if (!app_debug_get_selected_point(app, &watchpoint, &address)) {
+        return false;
+    }
+
+    if (watchpoint) {
+        for (size_t i = 0; i < app->debug.watchpoint_count; ++i) {
+            if (app->debug.watchpoints[i] == address) {
+                memmove(
+                    &app->debug.watchpoints[i],
+                    &app->debug.watchpoints[i + 1],
+                    (app->debug.watchpoint_count - i - 1) * sizeof(app->debug.watchpoints[0])
+                );
+                app->debug.watchpoint_count--;
+                return true;
+            }
+        }
+    } else {
+        for (size_t i = 0; i < app->debug.breakpoint_count; ++i) {
+            if (app->debug.breakpoints[i] == address) {
+                memmove(
+                    &app->debug.breakpoints[i],
+                    &app->debug.breakpoints[i + 1],
+                    (app->debug.breakpoint_count - i - 1) * sizeof(app->debug.breakpoints[0])
+                );
+                app->debug.breakpoint_count--;
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+static void app_debug_free_storage(AppState *app) {
+    if (app == NULL) {
+        return;
+    }
+    free(app->debug.breakpoints);
+    app->debug.breakpoints = NULL;
+    app->debug.breakpoint_count = 0;
+    app->debug.breakpoint_capacity = 0;
+    free(app->debug.watchpoints);
+    app->debug.watchpoints = NULL;
+    app->debug.watchpoint_count = 0;
+    app->debug.watchpoint_capacity = 0;
+}
+
+static void app_debug_append_point_summary(char *buffer, size_t buffer_size, size_t *used, const AppState *app) {
+    app_append_textf(buffer, buffer_size, used, "Exec breakpoints:");
+    if (app->debug.breakpoint_count == 0) {
+        app_append_textf(buffer, buffer_size, used, " none");
+    } else {
+        for (size_t i = 0; i < app->debug.breakpoint_count; ++i) {
+            app_append_textf(buffer, buffer_size, used, " %04X", app->debug.breakpoints[i]);
+        }
+    }
+
+    app_append_textf(buffer, buffer_size, used, "\r\nWrite watchpoints:");
+    if (app->debug.watchpoint_count == 0) {
+        app_append_textf(buffer, buffer_size, used, " none");
+    } else {
+        for (size_t i = 0; i < app->debug.watchpoint_count; ++i) {
+            app_append_textf(buffer, buffer_size, used, " %04X", app->debug.watchpoints[i]);
+        }
+    }
 }
 
 /* Updates the debugger's disassembly and memory base address and reflects the
@@ -1034,17 +1392,68 @@ static bool app_debug_apply_address_input(AppState *app, char *error_buffer, siz
     return true;
 }
 
+static bool app_debug_is_step_over_candidate(const Spectrum *spec, uint16_t address) {
+    const uint8_t op = app_debug_mem_rd(spec, address);
+
+    switch (op) {
+        case 0xC4:
+        case 0xCC:
+        case 0xCD:
+        case 0xD4:
+        case 0xDC:
+        case 0xE4:
+        case 0xEC:
+        case 0xF4:
+        case 0xFC:
+            return true;
+        default:
+            return (op & 0xC7u) == 0xC7u;
+    }
+}
+
 /* Renders registers, flags, paging state, disassembly, and nearby memory into
    the debugger's read-only text view. */
 static void app_debug_refresh_window(AppState *app) {
-    char buffer[8192];
+    char stack_buffer[8192];
+    char *buffer = stack_buffer;
+    size_t buffer_size = sizeof(stack_buffer);
     char flags[16];
+    char ascii[17];
     size_t used = 0;
     uint16_t addr;
     z80_t *cpu;
+    const size_t total_points = app->debug.breakpoint_count + app->debug.watchpoint_count;
 
-    if (app->debug.debugger_text == NULL || !app->spec.machine_ready) {
+    if (total_points > 0 && total_points <= (SIZE_MAX - 12288u) / 24u) {
+        buffer_size = 12288u + (total_points * 24u);
+        buffer = (char *)malloc(buffer_size);
+        if (buffer == NULL) {
+            buffer = stack_buffer;
+            buffer_size = sizeof(stack_buffer);
+        }
+    }
+    buffer[0] = '\0';
+
+    if (app->debug.debugger_text == NULL) {
+        if (buffer != stack_buffer) {
+            free(buffer);
+        }
+        return;
+    }
+    if (!app->spec.machine_ready) {
+        app_append_textf(
+            buffer,
+            buffer_size,
+            &used,
+            "Machine not ready.\r\nDebugger actions are disabled until the machine is initialized.\r\n\r\n"
+        );
+        app_debug_append_point_summary(buffer, buffer_size, &used, app);
+        SetWindowTextA(app->debug.debugger_text, buffer);
+        app_debug_refresh_points_list(app);
         app_debug_update_controls(app);
+        if (buffer != stack_buffer) {
+            free(buffer);
+        }
         return;
     }
 
@@ -1059,24 +1468,52 @@ static void app_debug_refresh_window(AppState *app) {
 
     app_append_textf(
         buffer,
-        sizeof(buffer),
+        buffer_size,
         &used,
         "State: %s    Model: %s\r\n",
         app->debug.paused ? "Paused" : "Running",
         app_model_name(app->spec.model)
     );
+    if (app->debug.debugger_run_to_active) {
+        app_append_textf(
+            buffer,
+            buffer_size,
+            &used,
+            "Run-to target: %04X\r\n",
+            app->debug.debugger_run_to_address
+        );
+    }
     if (app->debug.breakpoint_hit) {
         app_append_textf(
             buffer,
-            sizeof(buffer),
+            buffer_size,
             &used,
             "Breakpoint hit at %04X\r\n",
             app->debug.last_breakpoint_address
         );
     }
+    if (app->debug.debugger_run_to_hit) {
+        app_append_textf(
+            buffer,
+            buffer_size,
+            &used,
+            "Run-to hit at %04X\r\n",
+            app->debug.last_run_to_address
+        );
+    }
+    if (app->debug.watchpoint_hit) {
+        app_append_textf(
+            buffer,
+            buffer_size,
+            &used,
+            "Write watch hit at %04X <= %02X\r\n",
+            app->debug.last_watchpoint_address,
+            app->debug.last_watchpoint_value
+        );
+    }
     app_append_textf(
         buffer,
-        sizeof(buffer),
+        buffer_size,
         &used,
         "PC:%04X  SP:%04X  IR:%02X%02X  IM:%u  IFF1:%u  IFF2:%u\r\n",
         cpu->pc,
@@ -1089,7 +1526,7 @@ static void app_debug_refresh_window(AppState *app) {
     );
     app_append_textf(
         buffer,
-        sizeof(buffer),
+        buffer_size,
         &used,
         "AF:%04X  BC:%04X  DE:%04X  HL:%04X  IX:%04X  IY:%04X\r\n",
         cpu->af,
@@ -1101,7 +1538,7 @@ static void app_debug_refresh_window(AppState *app) {
     );
     app_append_textf(
         buffer,
-        sizeof(buffer),
+        buffer_size,
         &used,
         "AF':%04X BC':%04X DE':%04X HL':%04X  Flags:%s\r\n",
         cpu->af2,
@@ -1112,7 +1549,7 @@ static void app_debug_refresh_window(AppState *app) {
     );
     app_append_textf(
         buffer,
-        sizeof(buffer),
+        buffer_size,
         &used,
         "FE:%02X  7FFD:%02X  DisplayBank:%u  PagingLocked:%u\r\n\r\n",
         app->spec.machine.last_fe_out,
@@ -1120,23 +1557,36 @@ static void app_debug_refresh_window(AppState *app) {
         (unsigned)app->spec.machine.display_ram_bank,
         app->spec.machine.memory_paging_disabled ? 1u : 0u
     );
-    app_append_textf(buffer, sizeof(buffer), &used, "Breakpoints:");
-    if (app->debug.breakpoint_count == 0) {
-        app_append_textf(buffer, sizeof(buffer), &used, " none");
-    } else {
-        for (size_t i = 0; i < app->debug.breakpoint_count; ++i) {
-            app_append_textf(buffer, sizeof(buffer), &used, " %04X", app->debug.breakpoints[i]);
-        }
-    }
-    app_append_textf(buffer, sizeof(buffer), &used, "\r\n\r\n");
+    app_append_textf(
+        buffer,
+        buffer_size,
+        &used,
+        "Shortcuts: F5 Run/Pause  F9 Toggle BP  F10 Step Over  F11 Step  Ctrl+W Toggle WP  Ctrl+T Run To\r\n"
+    );
+    app_append_textf(
+        buffer,
+        buffer_size,
+        &used,
+        "View: Ctrl+P PC  Ctrl+S SP  PgUp/PgDn page  Address Up/Down +/-10h  Ctrl+Home PC  Ctrl+End SP\r\n"
+    );
+    app_append_textf(
+        buffer,
+        buffer_size,
+        &used,
+        "Address: Enter Go  Ctrl+Enter Run To  Shift+Enter Run @  Markers: > PC  * BP\r\n\r\n"
+    );
+    app_debug_append_point_summary(buffer, buffer_size, &used, app);
+    app_append_textf(buffer, buffer_size, &used, "\r\n\r\n");
 
-    app_append_textf(buffer, sizeof(buffer), &used, "Disassembly @ %04X\r\n", app->debug.debugger_view_address);
+    app_append_textf(buffer, buffer_size, &used, "Disassembly @ %04X\r\n", app->debug.debugger_view_address);
     addr = app->debug.debugger_view_address;
-    for (int i = 0; i < 12; ++i) {
+    for (int i = 0; i < 14; ++i) {
         char mnemonic[128];
         char bytes[32];
         uint8_t len;
         size_t byte_used = 0;
+        const char pc_marker = (addr == cpu->pc) ? '>' : ' ';
+        const char bp_marker = app_debug_has_breakpoint(app, addr) ? '*' : ' ';
 
         app_debug_decode_instruction(&app->spec, addr, mnemonic, sizeof(mnemonic), &len);
         for (uint8_t byte_index = 0; byte_index < len; ++byte_index) {
@@ -1152,44 +1602,61 @@ static void app_debug_refresh_window(AppState *app) {
             }
         }
         bytes[byte_used] = '\0';
-        app_append_textf(buffer, sizeof(buffer), &used, "%04X: %-12s %s\r\n", addr, bytes, mnemonic);
+        app_append_textf(
+            buffer,
+            buffer_size,
+            &used,
+            "%c%c %04X: %-12s %s\r\n",
+            pc_marker,
+            bp_marker,
+            addr,
+            bytes,
+            mnemonic
+        );
         addr = (uint16_t)(addr + len);
     }
 
-    app_append_textf(buffer, sizeof(buffer), &used, "\r\nStack @ %04X\r\n", cpu->sp);
+    app_append_textf(buffer, buffer_size, &used, "\r\nStack @ %04X\r\n", cpu->sp);
     for (int row = 0; row < 4; ++row) {
         uint16_t row_addr = (uint16_t)(cpu->sp + (uint16_t)(row * 8));
-        app_append_textf(buffer, sizeof(buffer), &used, "%04X:", row_addr);
+        app_append_textf(buffer, buffer_size, &used, "%04X:", row_addr);
         for (int col = 0; col < 8; ++col) {
             app_append_textf(
                 buffer,
-                sizeof(buffer),
+                buffer_size,
                 &used,
                 " %02X",
                 app_debug_mem_rd(&app->spec, (uint16_t)(row_addr + col))
             );
         }
-        app_append_textf(buffer, sizeof(buffer), &used, "\r\n");
+        app_append_textf(buffer, buffer_size, &used, "\r\n");
     }
 
-    app_append_textf(buffer, sizeof(buffer), &used, "\r\nMemory @ %04X\r\n", app->debug.debugger_view_address);
-    for (int row = 0; row < 4; ++row) {
+    app_append_textf(buffer, buffer_size, &used, "\r\nMemory @ %04X\r\n", app->debug.debugger_view_address);
+    for (int row = 0; row < 6; ++row) {
         uint16_t row_addr = (uint16_t)(app->debug.debugger_view_address + (uint16_t)(row * 16));
-        app_append_textf(buffer, sizeof(buffer), &used, "%04X:", row_addr);
+        app_append_textf(buffer, buffer_size, &used, "%04X:", row_addr);
         for (int col = 0; col < 16; ++col) {
+            const uint8_t value = app_debug_mem_rd(&app->spec, (uint16_t)(row_addr + col));
             app_append_textf(
                 buffer,
-                sizeof(buffer),
+                buffer_size,
                 &used,
                 " %02X",
-                app_debug_mem_rd(&app->spec, (uint16_t)(row_addr + col))
+                value
             );
+            ascii[col] = (value >= 0x20 && value <= 0x7E) ? (char)value : '.';
         }
-        app_append_textf(buffer, sizeof(buffer), &used, "\r\n");
+        ascii[16] = '\0';
+        app_append_textf(buffer, buffer_size, &used, "  |%s|\r\n", ascii);
     }
 
     SetWindowTextA(app->debug.debugger_text, buffer);
+    app_debug_refresh_points_list(app);
     app_debug_update_controls(app);
+    if (buffer != stack_buffer) {
+        free(buffer);
+    }
 }
 
 /* Stops the temporary stepping run after exactly one completed Z80
@@ -1201,19 +1668,65 @@ static void app_debug_callback(void *user_data, uint64_t pins) {
         return;
     }
     app->debug.last_pins = pins;
+    if ((pins & (Z80_MREQ | Z80_WR)) == (Z80_MREQ | Z80_WR)) {
+        const uint16_t addr = Z80_GET_ADDR(pins);
+        if (app_debug_has_watchpoint(app, addr)) {
+            app->debug.debugger_watchpoint_pending = true;
+            app->debug.pending_watchpoint_address = addr;
+            app->debug.pending_watchpoint_value = Z80_GET_DATA(pins);
+        }
+    }
     if (z80_opdone(&app->spec.machine.cpu)) {
         uint16_t next_pc = app->spec.machine.cpu.pc;
+        bool reached_run_to = app->debug.debugger_run_to_active && app->debug.debugger_run_to_address == next_pc;
         bool skip_breakpoint = app->debug.debugger_skip_breakpoint_once && app->debug.debugger_skip_breakpoint_address == next_pc;
         if (skip_breakpoint) {
             app->debug.debugger_skip_breakpoint_once = false;
-        } else if (app_debug_has_breakpoint(app, next_pc)) {
+        }
+        if (app->debug.debugger_watchpoint_pending) {
+            app->debug.watchpoint_hit = true;
+            app->debug.last_watchpoint_address = app->debug.pending_watchpoint_address;
+            app->debug.last_watchpoint_value = app->debug.pending_watchpoint_value;
+            app->debug.debugger_watchpoint_pending = false;
+            app->debug.debugger_run_to_active = false;
+            app->debug.stop_requested = true;
+            return;
+        }
+        if (!skip_breakpoint && app_debug_has_breakpoint(app, next_pc)) {
             app->debug.breakpoint_hit = true;
             app->debug.last_breakpoint_address = next_pc;
+            app->debug.debugger_run_to_active = false;
+            app->debug.stop_requested = true;
+        }
+        if (reached_run_to) {
+            app->debug.debugger_run_to_active = false;
+            app->debug.debugger_run_to_hit = true;
+            app->debug.last_run_to_address = next_pc;
             app->debug.stop_requested = true;
         }
         if (app->debug.stepping) {
             app->debug.stop_requested = true;
         }
+    }
+}
+
+static void app_debug_resume(AppState *app) {
+    if (!app->spec.machine_ready) {
+        return;
+    }
+
+    app->debug.paused = false;
+    app->debug.stepping = false;
+    app->debug.stop_requested = false;
+    app->debug.breakpoint_hit = false;
+    app->debug.watchpoint_hit = false;
+    app->debug.debugger_run_to_hit = false;
+    app->debug.debugger_watchpoint_pending = false;
+    if (app_debug_has_breakpoint(app, app->spec.machine.cpu.pc)) {
+        app->debug.debugger_skip_breakpoint_once = true;
+        app->debug.debugger_skip_breakpoint_address = app->spec.machine.cpu.pc;
+    } else {
+        app->debug.debugger_skip_breakpoint_once = false;
     }
 }
 
@@ -1230,6 +1743,10 @@ static void app_debug_step_instruction(AppState *app) {
     app->debug.stepping = true;
     app->debug.stop_requested = false;
     app->debug.breakpoint_hit = false;
+    app->debug.watchpoint_hit = false;
+    app->debug.debugger_run_to_active = false;
+    app->debug.debugger_run_to_hit = false;
+    app->debug.debugger_watchpoint_pending = false;
     app->spec.machine.debug.callback.func = app_debug_callback;
     app->spec.machine.debug.callback.user_data = app;
     app->spec.machine.debug.stopped = &app->debug.stop_requested;
@@ -1244,23 +1761,116 @@ static void app_debug_step_instruction(AppState *app) {
     app_debug_refresh_window(app);
 }
 
-/* Runs one model-accurate frame slice with debugger breakpoints armed, then
-   pauses and refreshes the debugger if any enabled address was reached. */
-static void app_debug_run_frame(AppState *app) {
-    uint32_t frame_us;
+static void app_debug_step_over_instruction(AppState *app) {
+    uint8_t len;
+    uint16_t pc;
 
     if (!app->spec.machine_ready) {
         return;
     }
 
-    if (
+    pc = app->spec.machine.cpu.pc;
+    app_debug_decode_instruction(&app->spec, pc, NULL, 0, &len);
+    if (!app_debug_is_step_over_candidate(&app->spec, pc)) {
+        app_debug_step_instruction(app);
+        return;
+    }
+
+    app_debug_resume(app);
+    app->debug.debugger_run_to_active = true;
+    app->debug.debugger_run_to_address = (uint16_t)(pc + len);
+    app->debug.debugger_run_to_hit = false;
+    app->debug.debugger_skip_breakpoint_once = true;
+    app->debug.debugger_skip_breakpoint_address = pc;
+    if (app->debug.debugger_view_sync_pc) {
+        app->debug.debugger_view_address = pc;
+        app_debug_sync_view_controls(app);
+    }
+    app_debug_refresh_window(app);
+}
+
+static void app_debug_navigate_view(AppState *app, int delta) {
+    uint16_t address;
+
+    if (app == NULL || !app->spec.machine_ready) {
+        return;
+    }
+
+    address = (uint16_t)(app->debug.debugger_view_address + delta);
+    app_debug_set_view_address(app, address, false);
+    app_debug_refresh_window(app);
+}
+
+static void app_debug_view_pc(AppState *app) {
+    if (app == NULL || !app->spec.machine_ready) {
+        return;
+    }
+    app_debug_set_view_address(app, app->spec.machine.cpu.pc, true);
+    app_debug_refresh_window(app);
+}
+
+static void app_debug_view_sp(AppState *app) {
+    if (app == NULL || !app->spec.machine_ready) {
+        return;
+    }
+    app_debug_set_view_address(app, app->spec.machine.cpu.sp, false);
+    app_debug_refresh_window(app);
+}
+
+static void app_debug_run_to_address(AppState *app, uint16_t address) {
+    if (!app->spec.machine_ready) {
+        return;
+    }
+
+    if (address == app->spec.machine.cpu.pc) {
+        app->debug.paused = true;
+        app->debug.breakpoint_hit = false;
+        app->debug.watchpoint_hit = false;
+        app->debug.debugger_run_to_active = false;
+        app->debug.debugger_run_to_hit = true;
+        app->debug.last_run_to_address = address;
+        if (app->debug.debugger_view_sync_pc) {
+            app->debug.debugger_view_address = address;
+            app_debug_sync_view_controls(app);
+        }
+        InvalidateRect(app->main_hwnd, NULL, FALSE);
+        app_debug_refresh_window(app);
+        return;
+    }
+
+    app_debug_resume(app);
+    app->debug.debugger_run_to_active = true;
+    app->debug.debugger_run_to_address = address;
+    app->debug.last_run_to_address = address;
+    if (app->debug.debugger_view_sync_pc) {
+        app->debug.debugger_view_address = app->spec.machine.cpu.pc;
+        app_debug_sync_view_controls(app);
+    }
+    InvalidateRect(app->main_hwnd, NULL, FALSE);
+    app_debug_refresh_window(app);
+}
+
+/* Runs one model-accurate frame slice with debugger breakpoints armed, then
+   pauses and refreshes the debugger if any enabled address was reached. */
+static void app_debug_run_frame(AppState *app) {
+    uint32_t frame_us;
+    const bool debugger_active = app->debug.debugger_hwnd != NULL;
+
+    if (!app->spec.machine_ready) {
+        return;
+    }
+
+    if (debugger_active &&
+        (
         app->debug.debugger_skip_breakpoint_once &&
         app->debug.debugger_skip_breakpoint_address == app->spec.machine.cpu.pc
-    ) {
+    )) {
         app->debug.debugger_skip_breakpoint_once = false;
-    } else if (app_debug_has_breakpoint(app, app->spec.machine.cpu.pc)) {
+    } else if (debugger_active && app_debug_has_breakpoint(app, app->spec.machine.cpu.pc)) {
         app->debug.breakpoint_hit = true;
         app->debug.last_breakpoint_address = app->spec.machine.cpu.pc;
+        app->debug.debugger_run_to_active = false;
+        app->debug.debugger_watchpoint_pending = false;
         app->debug.paused = true;
         if (app->debug.debugger_view_sync_pc) {
             app->debug.debugger_view_address = app->debug.last_breakpoint_address;
@@ -1274,24 +1884,31 @@ static void app_debug_run_frame(AppState *app) {
 
     app->debug.stop_requested = false;
     app->debug.breakpoint_hit = false;
-    if (app->debug.breakpoint_count > 0) {
+    app->debug.watchpoint_hit = false;
+    app->debug.debugger_run_to_hit = false;
+    if (debugger_active &&
+        (app->debug.breakpoint_count > 0 || app->debug.watchpoint_count > 0 || app->debug.debugger_run_to_active)) {
         app->spec.machine.debug.callback.func = app_debug_callback;
         app->spec.machine.debug.callback.user_data = app;
         app->spec.machine.debug.stopped = &app->debug.stop_requested;
     }
     frame_us = (uint32_t)(app_model_frame_duration_ms(app->spec.model) * 1000.0 + 0.5);
     zx_exec(&app->spec.machine, frame_us);
-    if (app->debug.breakpoint_count > 0) {
+    if (debugger_active &&
+        (app->debug.breakpoint_count > 0 ||
+         app->debug.watchpoint_count > 0 ||
+         app->debug.debugger_run_to_active ||
+         app->debug.debugger_run_to_hit)) {
         app->spec.machine.debug.callback.func = NULL;
         app->spec.machine.debug.callback.user_data = NULL;
         app->spec.machine.debug.stopped = NULL;
     }
     spectrum_render_frame(&app->spec);
 
-    if (app->debug.breakpoint_hit) {
+    if (app->debug.breakpoint_hit || app->debug.watchpoint_hit || app->debug.debugger_run_to_hit) {
         app->debug.paused = true;
         if (app->debug.debugger_view_sync_pc) {
-            app->debug.debugger_view_address = app->debug.last_breakpoint_address;
+            app->debug.debugger_view_address = app->spec.machine.cpu.pc;
             app_debug_sync_view_controls(app);
         }
         InvalidateRect(app->main_hwnd, NULL, FALSE);
@@ -1307,10 +1924,8 @@ static void app_debug_run_from_address(AppState *app, uint16_t address) {
     }
 
     app->spec.machine.cpu.pc = address;
-    app->debug.paused = false;
-    app->debug.stepping = false;
-    app->debug.stop_requested = false;
-    app->debug.breakpoint_hit = false;
+    app_debug_resume(app);
+    app->debug.debugger_run_to_active = false;
     app->debug.debugger_skip_breakpoint_once = true;
     app->debug.debugger_skip_breakpoint_address = address;
     if (app->debug.debugger_view_sync_pc) {
@@ -1327,6 +1942,10 @@ static void app_debug_machine_changed(AppState *app) {
     app->debug.stop_requested = false;
     app->debug.stepping = false;
     app->debug.breakpoint_hit = false;
+    app->debug.watchpoint_hit = false;
+    app->debug.debugger_run_to_active = false;
+    app->debug.debugger_run_to_hit = false;
+    app->debug.debugger_watchpoint_pending = false;
     app->debug.debugger_skip_breakpoint_once = false;
     app->spec.machine.debug.callback.func = NULL;
     app->spec.machine.debug.callback.user_data = NULL;
@@ -2953,6 +3572,10 @@ static void app_debugger_layout_controls(AppState *app, HWND hwnd) {
     RECT rect;
     int width;
     int height;
+    const int side_panel_width = 180;
+    const int top_row_y = 8;
+    const int second_row_y = 38;
+    const int content_y = 72;
 
     if (app->debug.debugger_text == NULL) {
         return;
@@ -2961,15 +3584,38 @@ static void app_debugger_layout_controls(AppState *app, HWND hwnd) {
     width = rect.right - rect.left;
     height = rect.bottom - rect.top;
 
-    MoveWindow(app->debug.debugger_pause_button, 8, 8, 72, 24, TRUE);
-    MoveWindow(app->debug.debugger_step_button, 88, 8, 72, 24, TRUE);
-    MoveWindow(app->debug.debugger_refresh_button, 168, 8, 72, 24, TRUE);
-    MoveWindow(app->debug.debugger_address_edit, 248, 8, 88, 24, TRUE);
-    MoveWindow(app->debug.debugger_go_button, 344, 8, 48, 24, TRUE);
-    MoveWindow(app->debug.debugger_sync_checkbox, 400, 10, 84, 20, TRUE);
-    MoveWindow(app->debug.debugger_breakpoint_toggle_button, 492, 8, 96, 24, TRUE);
-    MoveWindow(app->debug.debugger_run_at_button, 596, 8, 64, 24, TRUE);
-    MoveWindow(app->debug.debugger_text, 8, 40, width - 16, height - 48, TRUE);
+    MoveWindow(app->debug.debugger_pause_button, 8, top_row_y, 72, 24, TRUE);
+    MoveWindow(app->debug.debugger_step_button, 88, top_row_y, 72, 24, TRUE);
+    MoveWindow(app->debug.debugger_step_over_button, 168, top_row_y, 82, 24, TRUE);
+    MoveWindow(app->debug.debugger_refresh_button, 258, top_row_y, 72, 24, TRUE);
+    MoveWindow(app->debug.debugger_address_edit, 338, top_row_y, 88, 24, TRUE);
+    MoveWindow(app->debug.debugger_go_button, 434, top_row_y, 48, 24, TRUE);
+    MoveWindow(app->debug.debugger_run_to_button, 490, top_row_y, 64, 24, TRUE);
+    MoveWindow(app->debug.debugger_run_at_button, 562, top_row_y, 64, 24, TRUE);
+    MoveWindow(app->debug.debugger_sync_checkbox, 634, top_row_y + 2, 84, 20, TRUE);
+    MoveWindow(app->debug.debugger_breakpoint_toggle_button, 8, second_row_y, 96, 24, TRUE);
+    MoveWindow(app->debug.debugger_watchpoint_toggle_button, 112, second_row_y, 96, 24, TRUE);
+    MoveWindow(app->debug.debugger_remove_selected_button, 216, second_row_y, 108, 24, TRUE);
+    MoveWindow(app->debug.debugger_view_pc_button, 332, second_row_y, 44, 24, TRUE);
+    MoveWindow(app->debug.debugger_view_sp_button, 384, second_row_y, 44, 24, TRUE);
+    MoveWindow(app->debug.debugger_page_up_button, 436, second_row_y, 64, 24, TRUE);
+    MoveWindow(app->debug.debugger_page_down_button, 508, second_row_y, 64, 24, TRUE);
+    MoveWindow(
+        app->debug.debugger_text,
+        8,
+        content_y,
+        width - side_panel_width - 24,
+        height - content_y - 8,
+        TRUE
+    );
+    MoveWindow(
+        app->debug.debugger_points_list,
+        width - side_panel_width - 8,
+        content_y,
+        side_panel_width,
+        height - content_y - 8,
+        TRUE
+    );
 }
 
 /* Sizes the assembler controls to the current client area of the tool window. */
@@ -3155,6 +3801,82 @@ static LRESULT CALLBACK app_assembler_source_wndproc(HWND hwnd, UINT msg, WPARAM
     return result;
 }
 
+static LRESULT CALLBACK app_debugger_address_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    HWND parent = GetParent(hwnd);
+    AppState *app = parent != NULL ? (AppState *)GetWindowLongPtrA(parent, GWLP_USERDATA) : NULL;
+    WNDPROC old_proc = (app != NULL && app->debug.debugger_address_edit_wndproc != NULL)
+        ? app->debug.debugger_address_edit_wndproc
+        : DefWindowProcA;
+
+    if (app != NULL && msg == WM_KEYDOWN) {
+        const bool ctrl_down = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        const bool shift_down = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+
+        if ((UINT)wparam == VK_RETURN) {
+            UINT command = APP_CTRL_DEBUG_GO;
+            if (ctrl_down) {
+                command = APP_CTRL_DEBUG_RUN_TO;
+            } else if (shift_down) {
+                command = APP_CTRL_DEBUG_RUN_AT;
+            }
+            SendMessageA(parent, WM_COMMAND, command, 0);
+            return 0;
+        }
+        if ((UINT)wparam == VK_ESCAPE) {
+            app_debug_sync_view_controls(app);
+            SendMessageA(hwnd, EM_SETSEL, 0, -1);
+            return 0;
+        }
+        if (!ctrl_down && !shift_down) {
+            switch ((UINT)wparam) {
+                case VK_UP:
+                    app_debug_navigate_view(app, -16);
+                    return 0;
+                case VK_DOWN:
+                    app_debug_navigate_view(app, 16);
+                    return 0;
+                case VK_PRIOR:
+                    app_debug_navigate_view(app, -256);
+                    return 0;
+                case VK_NEXT:
+                    app_debug_navigate_view(app, 256);
+                    return 0;
+                default:
+                    break;
+            }
+        }
+        if (ctrl_down) {
+            switch ((UINT)wparam) {
+                case VK_HOME:
+                    app_debug_view_pc(app);
+                    return 0;
+                case VK_END:
+                    app_debug_view_sp(app);
+                    return 0;
+                default:
+                    break;
+            }
+        }
+    }
+
+    return CallWindowProcA(old_proc, hwnd, msg, wparam, lparam);
+}
+
+static LRESULT CALLBACK app_debugger_points_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    HWND parent = GetParent(hwnd);
+    AppState *app = parent != NULL ? (AppState *)GetWindowLongPtrA(parent, GWLP_USERDATA) : NULL;
+    WNDPROC old_proc = (app != NULL && app->debug.debugger_points_list_wndproc != NULL)
+        ? app->debug.debugger_points_list_wndproc
+        : DefWindowProcA;
+
+    if (app != NULL && msg == WM_KEYDOWN && (UINT)wparam == VK_DELETE) {
+        SendMessageA(parent, WM_COMMAND, APP_CTRL_DEBUG_REMOVE_SELECTED, 0);
+        return 0;
+    }
+
+    return CallWindowProcA(old_proc, hwnd, msg, wparam, lparam);
+}
+
 /* Hosts the modeless debugger window with pause/run/step controls and a live
    register plus memory snapshot view. */
 static LRESULT CALLBACK app_debugger_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
@@ -3167,9 +3889,24 @@ static LRESULT CALLBACK app_debugger_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
             return TRUE;
         }
         case WM_CREATE: {
+            static const ACCEL debugger_accels[] = {
+                {FVIRTKEY, VK_F5, APP_CTRL_DEBUG_PAUSE},
+                {FVIRTKEY, VK_F9, APP_CTRL_DEBUG_BREAKPOINT_TOGGLE},
+                {FVIRTKEY, VK_F10, APP_CTRL_DEBUG_STEP_OVER},
+                {FVIRTKEY, VK_F11, APP_CTRL_DEBUG_STEP},
+                {FCONTROL | FVIRTKEY, 'G', APP_CTRL_DEBUG_GO},
+                {FCONTROL | FVIRTKEY, 'P', APP_CTRL_DEBUG_VIEW_PC},
+                {FCONTROL | FVIRTKEY, 'R', APP_CTRL_DEBUG_RUN_AT},
+                {FCONTROL | FVIRTKEY, 'S', APP_CTRL_DEBUG_VIEW_SP},
+                {FCONTROL | FVIRTKEY, 'T', APP_CTRL_DEBUG_RUN_TO},
+                {FCONTROL | FVIRTKEY, 'W', APP_CTRL_DEBUG_WATCHPOINT_TOGGLE},
+                {FVIRTKEY, VK_PRIOR, APP_CTRL_DEBUG_PAGE_UP},
+                {FVIRTKEY, VK_NEXT, APP_CTRL_DEBUG_PAGE_DOWN}
+            };
             HFONT font = (HFONT)GetStockObject(ANSI_FIXED_FONT);
             app->debug.debugger_pause_button = CreateWindowExA(0, "BUTTON", "Pause", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)APP_CTRL_DEBUG_PAUSE, NULL, NULL);
             app->debug.debugger_step_button = CreateWindowExA(0, "BUTTON", "Step", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)APP_CTRL_DEBUG_STEP, NULL, NULL);
+            app->debug.debugger_step_over_button = CreateWindowExA(0, "BUTTON", "Step Over", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)APP_CTRL_DEBUG_STEP_OVER, NULL, NULL);
             app->debug.debugger_refresh_button = CreateWindowExA(0, "BUTTON", "Refresh", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)APP_CTRL_DEBUG_REFRESH, NULL, NULL);
             app->debug.debugger_address_edit = CreateWindowExA(
                 WS_EX_CLIENTEDGE,
@@ -3201,6 +3938,104 @@ static LRESULT CALLBACK app_debugger_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
                 NULL,
                 NULL
             );
+            app->debug.debugger_watchpoint_toggle_button = CreateWindowExA(
+                0,
+                "BUTTON",
+                "Toggle WP",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                0,
+                0,
+                0,
+                0,
+                hwnd,
+                (HMENU)(INT_PTR)APP_CTRL_DEBUG_WATCHPOINT_TOGGLE,
+                NULL,
+                NULL
+            );
+            app->debug.debugger_remove_selected_button = CreateWindowExA(
+                0,
+                "BUTTON",
+                "Remove Sel",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                0,
+                0,
+                0,
+                0,
+                hwnd,
+                (HMENU)(INT_PTR)APP_CTRL_DEBUG_REMOVE_SELECTED,
+                NULL,
+                NULL
+            );
+            app->debug.debugger_view_pc_button = CreateWindowExA(
+                0,
+                "BUTTON",
+                "PC",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                0,
+                0,
+                0,
+                0,
+                hwnd,
+                (HMENU)(INT_PTR)APP_CTRL_DEBUG_VIEW_PC,
+                NULL,
+                NULL
+            );
+            app->debug.debugger_view_sp_button = CreateWindowExA(
+                0,
+                "BUTTON",
+                "SP",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                0,
+                0,
+                0,
+                0,
+                hwnd,
+                (HMENU)(INT_PTR)APP_CTRL_DEBUG_VIEW_SP,
+                NULL,
+                NULL
+            );
+            app->debug.debugger_page_up_button = CreateWindowExA(
+                0,
+                "BUTTON",
+                "Page -",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                0,
+                0,
+                0,
+                0,
+                hwnd,
+                (HMENU)(INT_PTR)APP_CTRL_DEBUG_PAGE_UP,
+                NULL,
+                NULL
+            );
+            app->debug.debugger_page_down_button = CreateWindowExA(
+                0,
+                "BUTTON",
+                "Page +",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                0,
+                0,
+                0,
+                0,
+                hwnd,
+                (HMENU)(INT_PTR)APP_CTRL_DEBUG_PAGE_DOWN,
+                NULL,
+                NULL
+            );
+            app->debug.debugger_run_to_button = CreateWindowExA(
+                0,
+                "BUTTON",
+                "Run To",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                0,
+                0,
+                0,
+                0,
+                hwnd,
+                (HMENU)(INT_PTR)APP_CTRL_DEBUG_RUN_TO,
+                NULL,
+                NULL
+            );
             app->debug.debugger_run_at_button = CreateWindowExA(
                 0,
                 "BUTTON",
@@ -3229,9 +4064,35 @@ static LRESULT CALLBACK app_debugger_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
                 NULL,
                 NULL
             );
+            app->debug.debugger_points_list = CreateWindowExA(
+                WS_EX_CLIENTEDGE,
+                "LISTBOX",
+                "",
+                WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+                0,
+                0,
+                0,
+                0,
+                hwnd,
+                (HMENU)(INT_PTR)APP_CTRL_DEBUG_POINTS_LIST,
+                NULL,
+                NULL
+            );
+            app->debug.debugger_accel = CreateAcceleratorTableA((LPACCEL)debugger_accels, (int)(sizeof(debugger_accels) / sizeof(debugger_accels[0])));
             SendMessageA(app->debug.debugger_address_edit, EM_SETLIMITTEXT, 15, 0);
             SendMessageA(app->debug.debugger_address_edit, WM_SETFONT, (WPARAM)font, TRUE);
             SendMessageA(app->debug.debugger_text, WM_SETFONT, (WPARAM)font, TRUE);
+            SendMessageA(app->debug.debugger_points_list, WM_SETFONT, (WPARAM)font, TRUE);
+            app->debug.debugger_address_edit_wndproc = (WNDPROC)SetWindowLongPtrA(
+                app->debug.debugger_address_edit,
+                GWLP_WNDPROC,
+                (LONG_PTR)app_debugger_address_wndproc
+            );
+            app->debug.debugger_points_list_wndproc = (WNDPROC)SetWindowLongPtrA(
+                app->debug.debugger_points_list,
+                GWLP_WNDPROC,
+                (LONG_PTR)app_debugger_points_wndproc
+            );
             app_debugger_layout_controls(app, hwnd);
             app_debug_sync_view_controls(app);
             app_debug_refresh_window(app);
@@ -3260,20 +4121,44 @@ static LRESULT CALLBACK app_debugger_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
             }
             switch (LOWORD(wparam)) {
                 case APP_CTRL_DEBUG_PAUSE:
-                    app->debug.paused = !app->debug.paused;
-                    if (!app->debug.paused) {
+                    if (!app->spec.machine_ready) {
+                        return 0;
+                    }
+                    if (app->debug.paused) {
+                        app_debug_resume(app);
+                    } else {
+                        app->debug.paused = true;
+                        app->debug.debugger_run_to_active = false;
+                        app->debug.debugger_run_to_hit = false;
                         app->debug.breakpoint_hit = false;
+                        app->debug.watchpoint_hit = false;
                     }
                     app_debug_refresh_window(app);
                     return 0;
                 case APP_CTRL_DEBUG_STEP:
+                    if (!app->spec.machine_ready) {
+                        return 0;
+                    }
                     app_debug_step_instruction(app);
                     return 0;
+                case APP_CTRL_DEBUG_STEP_OVER:
+                    if (!app->spec.machine_ready) {
+                        return 0;
+                    }
+                    app_debug_step_over_instruction(app);
+                    return 0;
                 case APP_CTRL_DEBUG_REFRESH:
+                    if (!app->spec.machine_ready) {
+                        app_debug_refresh_window(app);
+                        return 0;
+                    }
                     app_debug_refresh_window(app);
                     return 0;
                 case APP_CTRL_DEBUG_GO: {
                     char error[128];
+                    if (!app->spec.machine_ready) {
+                        return 0;
+                    }
                     if (!app_debug_apply_address_input(app, error, sizeof(error))) {
                         MessageBoxA(hwnd, error, "Debugger", MB_OK | MB_ICONERROR);
                         return 0;
@@ -3281,24 +4166,95 @@ static LRESULT CALLBACK app_debugger_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
                     app_debug_refresh_window(app);
                     return 0;
                 }
+                case APP_CTRL_DEBUG_VIEW_PC:
+                    if (!app->spec.machine_ready) {
+                        return 0;
+                    }
+                    app_debug_view_pc(app);
+                    return 0;
+                case APP_CTRL_DEBUG_VIEW_SP:
+                    if (!app->spec.machine_ready) {
+                        return 0;
+                    }
+                    app_debug_view_sp(app);
+                    return 0;
+                case APP_CTRL_DEBUG_PAGE_UP:
+                    if (!app->spec.machine_ready) {
+                        return 0;
+                    }
+                    app_debug_navigate_view(app, -256);
+                    return 0;
+                case APP_CTRL_DEBUG_PAGE_DOWN:
+                    if (!app->spec.machine_ready) {
+                        return 0;
+                    }
+                    app_debug_navigate_view(app, 256);
+                    return 0;
+                case APP_CTRL_DEBUG_RUN_TO: {
+                    char error[128];
+                    uint16_t address;
+                    if (!app->spec.machine_ready) {
+                        return 0;
+                    }
+                    if (!app_debug_parse_address_input(app, &address, error, sizeof(error))) {
+                        MessageBoxA(hwnd, error, "Debugger", MB_OK | MB_ICONERROR);
+                        return 0;
+                    }
+                    app_debug_run_to_address(app, address);
+                    return 0;
+                }
                 case APP_CTRL_DEBUG_BREAKPOINT_TOGGLE: {
                     char error[128];
                     uint16_t address;
                     bool enabled;
+                    if (!app->spec.machine_ready) {
+                        return 0;
+                    }
                     if (!app_debug_parse_address_input(app, &address, error, sizeof(error))) {
                         MessageBoxA(hwnd, error, "Debugger", MB_OK | MB_ICONERROR);
                         return 0;
                     }
                     if (!app_debug_toggle_breakpoint(app, address, &enabled)) {
-                        MessageBoxA(hwnd, "Breakpoint list is full.", "Debugger", MB_OK | MB_ICONERROR);
+                        MessageBoxA(hwnd, "Could not update the breakpoint list.", "Debugger", MB_OK | MB_ICONERROR);
                         return 0;
                     }
                     app_debug_refresh_window(app);
                     return 0;
                 }
+                case APP_CTRL_DEBUG_WATCHPOINT_TOGGLE: {
+                    char error[128];
+                    uint16_t address;
+                    bool enabled;
+                    if (!app->spec.machine_ready) {
+                        return 0;
+                    }
+                    if (!app_debug_parse_address_input(app, &address, error, sizeof(error))) {
+                        MessageBoxA(hwnd, error, "Debugger", MB_OK | MB_ICONERROR);
+                        return 0;
+                    }
+                    if (!app_debug_toggle_watchpoint(app, address, &enabled)) {
+                        MessageBoxA(hwnd, "Could not update the watchpoint list.", "Debugger", MB_OK | MB_ICONERROR);
+                        return 0;
+                    }
+                    app_debug_refresh_window(app);
+                    return 0;
+                }
+                case APP_CTRL_DEBUG_REMOVE_SELECTED:
+                    if (!app->spec.machine_ready) {
+                        return 0;
+                    }
+                    if (!app_debug_remove_selected_point(app)) {
+                        MessageBoxA(hwnd, "Select a breakpoint or watchpoint first.", "Debugger", MB_OK | MB_ICONERROR);
+                        return 0;
+                    }
+                    app_debug_refresh_window(app);
+                    return 0;
                 case APP_CTRL_DEBUG_RUN_AT: {
                     char error[128];
                     uint16_t address;
+                    if (!app->spec.machine_ready) {
+                        return 0;
+                    }
                     if (!app_debug_parse_address_input(app, &address, error, sizeof(error))) {
                         MessageBoxA(hwnd, error, "Debugger", MB_OK | MB_ICONERROR);
                         return 0;
@@ -3319,6 +4275,31 @@ static LRESULT CALLBACK app_debugger_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
                         return 0;
                     }
                     break;
+                case APP_CTRL_DEBUG_POINTS_LIST:
+                    if (HIWORD(wparam) == LBN_SELCHANGE) {
+                        if (!app->spec.machine_ready) {
+                            app_debug_update_controls(app);
+                            return 0;
+                        }
+                        uint16_t address = 0;
+                        if (app_debug_get_selected_point(app, NULL, &address)) {
+                            app_debug_set_view_address(app, address, false);
+                            app_debug_refresh_window(app);
+                        } else {
+                            app_debug_update_controls(app);
+                        }
+                        return 0;
+                    }
+                    if (HIWORD(wparam) == LBN_DBLCLK) {
+                        if (!app->spec.machine_ready) {
+                            return 0;
+                        }
+                        if (app_debug_remove_selected_point(app)) {
+                            app_debug_refresh_window(app);
+                        }
+                        return 0;
+                    }
+                    break;
                 default:
                     break;
             }
@@ -3332,16 +4313,33 @@ static LRESULT CALLBACK app_debugger_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
                 app->debug.paused = false;
                 app->debug.stepping = false;
                 app->debug.stop_requested = false;
+                app->debug.debugger_run_to_active = false;
+                app->debug.debugger_run_to_hit = false;
                 app->debug.debugger_hwnd = NULL;
                 app->debug.debugger_text = NULL;
                 app->debug.debugger_pause_button = NULL;
                 app->debug.debugger_step_button = NULL;
+                app->debug.debugger_step_over_button = NULL;
                 app->debug.debugger_refresh_button = NULL;
                 app->debug.debugger_address_edit = NULL;
                 app->debug.debugger_go_button = NULL;
                 app->debug.debugger_sync_checkbox = NULL;
                 app->debug.debugger_breakpoint_toggle_button = NULL;
                 app->debug.debugger_run_at_button = NULL;
+                app->debug.debugger_run_to_button = NULL;
+                app->debug.debugger_watchpoint_toggle_button = NULL;
+                app->debug.debugger_remove_selected_button = NULL;
+                app->debug.debugger_view_pc_button = NULL;
+                app->debug.debugger_view_sp_button = NULL;
+                app->debug.debugger_page_up_button = NULL;
+                app->debug.debugger_page_down_button = NULL;
+                app->debug.debugger_points_list = NULL;
+                if (app->debug.debugger_accel != NULL) {
+                    DestroyAcceleratorTable(app->debug.debugger_accel);
+                    app->debug.debugger_accel = NULL;
+                }
+                app->debug.debugger_address_edit_wndproc = NULL;
+                app->debug.debugger_points_list_wndproc = NULL;
             }
             return 0;
         default:
@@ -3583,7 +4581,7 @@ static void app_open_debugger_window(AppState *app) {
         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
-        620,
+        960,
         520,
         app->main_hwnd,
         NULL,
@@ -6181,6 +7179,12 @@ int main(int argc, char **argv) {
     while (app.running) {
         MSG msg;
         while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+            if (app.debug.debugger_hwnd != NULL &&
+                app.debug.debugger_accel != NULL &&
+                (msg.hwnd == app.debug.debugger_hwnd || IsChild(app.debug.debugger_hwnd, msg.hwnd)) &&
+                TranslateAcceleratorA(app.debug.debugger_hwnd, app.debug.debugger_accel, &msg)) {
+                continue;
+            }
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }
@@ -6197,5 +7201,6 @@ int main(int argc, char **argv) {
     app_controller_shutdown(&app);
     app_audio_shutdown(&app);
     tape_discard(&app.tape);
+    app_debug_free_storage(&app);
     return 0;
 }
