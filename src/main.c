@@ -82,6 +82,9 @@ enum {
     APP_MENU_ASM_EDIT_PASTE = 2213,
     APP_MENU_ASM_EDIT_DELETE = 2214,
     APP_MENU_ASM_EDIT_SELECT_ALL = 2215,
+    APP_MENU_ASM_EDIT_FONT = 2216,
+    APP_MENU_ASM_EDIT_FORMAT = 2217,
+    APP_MENU_ASM_EDIT_UPPERCASE = 2218,
     APP_MENU_ASM_BUILD_ASSEMBLE = 2221,
     APP_MENU_ASM_HELP_SHOW = 2231,
     APP_TIMER_MODAL_LOOP = 3001,
@@ -181,6 +184,7 @@ typedef struct DebugState {
     HWND assembler_help_button;
     HWND assembler_load_button;
     HWND assembler_save_button;
+    HBRUSH assembler_source_brush;
     HFONT assembler_font;
     WNDPROC assembler_source_wndproc;
     bool assembler_dirty;
@@ -370,6 +374,11 @@ static void app_assembler_update_title(AppState *app);
 static void app_assembler_set_current_path(AppState *app, const char *path);
 static bool app_assembler_load_last_path(char *out_path, size_t out_size);
 static void app_assembler_save_last_path(const char *path);
+static bool app_assembler_load_saved_font(LOGFONTA *font);
+static void app_assembler_save_font(const LOGFONTA *font);
+static HFONT app_create_assembler_font_from_logfont(const LOGFONTA *font);
+static void app_assembler_apply_font(AppState *app, const LOGFONTA *font);
+static void app_assembler_choose_font(HWND hwnd, AppState *app);
 static bool app_assembler_load_source_path(const char *path, AppState *app, char *status_buffer, size_t status_buffer_size);
 static bool app_assembler_load_source(HWND hwnd, AppState *app, char *status_buffer, size_t status_buffer_size);
 static bool app_assembler_write_source_to_path(AppState *app, const char *path, char *status_buffer, size_t status_buffer_size);
@@ -396,6 +405,10 @@ static void app_assembler_format_location_error(
 static bool app_assembler_find_source_org(const char *source, uint16_t *out_address);
 static HFONT app_create_monospace_font(void);
 static bool app_assembler_handle_edit_command(AppState *app, UINT command_id);
+static bool app_assembler_format_source_text(const char *source, char **formatted_output);
+static void app_assembler_format_source(HWND hwnd, AppState *app);
+static bool app_assembler_uppercase_source_text(const char *source, char **uppercase_output);
+static void app_assembler_uppercase_source(HWND hwnd, AppState *app);
 static void app_assembler_clear_error_marker(AppState *app);
 static void app_assembler_focus_line(AppState *app, size_t line_number);
 static void app_assembler_sync_error_from_status(AppState *app, const char *status_text);
@@ -482,6 +495,18 @@ static const char *app_tape_autoload_settings_value(bool enabled) {
     return enabled ? "1" : "0";
 }
 
+static void app_default_assembler_logfont(LOGFONTA *font) {
+    ZeroMemory(font, sizeof(*font));
+    font->lfHeight = -16;
+    font->lfWeight = FW_NORMAL;
+    font->lfCharSet = DEFAULT_CHARSET;
+    font->lfOutPrecision = OUT_DEFAULT_PRECIS;
+    font->lfClipPrecision = CLIP_DEFAULT_PRECIS;
+    font->lfQuality = CLEARTYPE_QUALITY;
+    font->lfPitchAndFamily = FIXED_PITCH | FF_MODERN;
+    snprintf(font->lfFaceName, sizeof(font->lfFaceName), "Consolas");
+}
+
 /* Creates a simple document-style menu for the assembler window with file,
    edit, build, and help actions. */
 static HMENU app_create_assembler_menu(void) {
@@ -522,6 +547,10 @@ static HMENU app_create_assembler_menu(void) {
     AppendMenuA(edit_menu, MF_STRING, APP_MENU_ASM_EDIT_DELETE, "Delete\tDel");
     AppendMenuA(edit_menu, MF_SEPARATOR, 0, NULL);
     AppendMenuA(edit_menu, MF_STRING, APP_MENU_ASM_EDIT_SELECT_ALL, "Select All\tCtrl+A");
+    AppendMenuA(edit_menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(edit_menu, MF_STRING, APP_MENU_ASM_EDIT_FONT, "Font...\tCtrl+Shift+F");
+    AppendMenuA(edit_menu, MF_STRING, APP_MENU_ASM_EDIT_FORMAT, "Format Source\tCtrl+Shift+L");
+    AppendMenuA(edit_menu, MF_STRING, APP_MENU_ASM_EDIT_UPPERCASE, "Uppercase Source\tCtrl+Shift+U");
     AppendMenuA(build_menu, MF_STRING, APP_MENU_ASM_BUILD_ASSEMBLE, "&Assemble\tCtrl+B");
     AppendMenuA(help_menu, MF_STRING, APP_MENU_ASM_HELP_SHOW, "Assembler &Help\tF1");
     AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)file_menu, "File");
@@ -573,25 +602,12 @@ static void app_update_tape_menu(HWND hwnd, bool enabled) {
     );
 }
 
-/* Creates a readable Windows monospace UI font for the assembler editor and
-   falls back to the stock fixed font if the requested face is unavailable. */
+/* Creates the default assembler editor font used when the user has not chosen
+   a persisted replacement yet. */
 static HFONT app_create_monospace_font(void) {
-    return CreateFontA(
-        -16,
-        0,
-        0,
-        0,
-        FW_NORMAL,
-        FALSE,
-        FALSE,
-        FALSE,
-        DEFAULT_CHARSET,
-        OUT_DEFAULT_PRECIS,
-        CLIP_DEFAULT_PRECIS,
-        CLEARTYPE_QUALITY,
-        FIXED_PITCH | FF_MODERN,
-        "Consolas"
-    );
+    LOGFONTA font;
+    app_default_assembler_logfont(&font);
+    return CreateFontIndirectA(&font);
 }
 
 /* Appends formatted text into a caller-owned buffer while preserving a valid
@@ -3498,7 +3514,7 @@ static LRESULT CALLBACK app_assembler_gutter_wndproc(HWND hwnd, UINT msg, WPARAM
             BeginPaint(hwnd, &ps);
             GetClientRect(hwnd, &rect);
             hdc = ps.hdc;
-            background_brush = CreateSolidBrush(RGB(248, 248, 248));
+            background_brush = CreateSolidBrush(RGB(244, 240, 228));
             FillRect(hdc, &rect, background_brush);
             DeleteObject(background_brush);
             if (app == NULL || app->debug.assembler_source == NULL) {
@@ -3757,6 +3773,15 @@ static LRESULT CALLBACK app_assembler_source_wndproc(HWND hwnd, UINT msg, WPARAM
             switch ((UINT)wparam) {
                 case 'S':
                     SendMessageA(parent, WM_COMMAND, APP_MENU_ASM_FILE_SAVE_AS, 0);
+                    return 0;
+                case 'F':
+                    SendMessageA(parent, WM_COMMAND, APP_MENU_ASM_EDIT_FONT, 0);
+                    return 0;
+                case 'L':
+                    SendMessageA(parent, WM_COMMAND, APP_MENU_ASM_EDIT_FORMAT, 0);
+                    return 0;
+                case 'U':
+                    SendMessageA(parent, WM_COMMAND, APP_MENU_ASM_EDIT_UPPERCASE, 0);
                     return 0;
                 default:
                     break;
@@ -4362,7 +4387,13 @@ static LRESULT CALLBACK app_assembler_wndproc(HWND hwnd, UINT msg, WPARAM wparam
         case WM_CREATE: {
             HFONT font;
             HMENU menu;
-            app->debug.assembler_font = app_create_monospace_font();
+            LOGFONTA assembler_font;
+            app->debug.assembler_source_brush = CreateSolidBrush(RGB(244, 240, 228));
+            if (app_assembler_load_saved_font(&assembler_font)) {
+                app->debug.assembler_font = app_create_assembler_font_from_logfont(&assembler_font);
+            } else {
+                app->debug.assembler_font = app_create_monospace_font();
+            }
             font = app->debug.assembler_font != NULL
                 ? app->debug.assembler_font
                 : (HFONT)GetStockObject(ANSI_FIXED_FONT);
@@ -4403,7 +4434,8 @@ static LRESULT CALLBACK app_assembler_wndproc(HWND hwnd, UINT msg, WPARAM wparam
                 0,
                 "EDIT",
                 "",
-                WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN,
+                WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | WS_HSCROLL |
+                    ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_WANTRETURN,
                 0,
                 0,
                 0,
@@ -4428,6 +4460,16 @@ static LRESULT CALLBACK app_assembler_wndproc(HWND hwnd, UINT msg, WPARAM wparam
             app_assembler_refresh_window(app);
             return 0;
         }
+        case WM_CTLCOLOREDIT:
+            if (app != NULL && (HWND)lparam == app->debug.assembler_source) {
+                HDC hdc = (HDC)wparam;
+                SetTextColor(hdc, RGB(32, 32, 32));
+                SetBkColor(hdc, RGB(244, 240, 228));
+                return (LRESULT)(app->debug.assembler_source_brush != NULL
+                    ? app->debug.assembler_source_brush
+                    : GetSysColorBrush(COLOR_WINDOW));
+            }
+            break;
         case WM_SIZE:
             if (app != NULL) {
                 app_assembler_layout_controls(app, hwnd);
@@ -4460,6 +4502,18 @@ static LRESULT CALLBACK app_assembler_wndproc(HWND hwnd, UINT msg, WPARAM wparam
             }
             if (LOWORD(wparam) == APP_CTRL_ASM_HELP || LOWORD(wparam) == APP_MENU_ASM_HELP_SHOW) {
                 app_show_assembler_help(hwnd);
+                return 0;
+            }
+            if (LOWORD(wparam) == APP_MENU_ASM_EDIT_FONT) {
+                app_assembler_choose_font(hwnd, app);
+                return 0;
+            }
+            if (LOWORD(wparam) == APP_MENU_ASM_EDIT_FORMAT) {
+                app_assembler_format_source(hwnd, app);
+                return 0;
+            }
+            if (LOWORD(wparam) == APP_MENU_ASM_EDIT_UPPERCASE) {
+                app_assembler_uppercase_source(hwnd, app);
                 return 0;
             }
             if (LOWORD(wparam) == APP_MENU_ASM_FILE_NEW) {
@@ -4503,6 +4557,10 @@ static LRESULT CALLBACK app_assembler_wndproc(HWND hwnd, UINT msg, WPARAM wparam
         case WM_DESTROY:
             if (app != NULL) {
                 app_set_modal_loop_timer(app, hwnd, false);
+                if (app->debug.assembler_source_brush != NULL) {
+                    DeleteObject(app->debug.assembler_source_brush);
+                    app->debug.assembler_source_brush = NULL;
+                }
                 if (app->debug.assembler_font != NULL) {
                     DeleteObject(app->debug.assembler_font);
                     app->debug.assembler_font = NULL;
@@ -4648,6 +4706,9 @@ static void app_show_assembler_help(HWND hwnd) {
         "  Ctrl+O Load\r\n"
         "  Ctrl+S Save\r\n"
         "  Ctrl+Shift+S Save As\r\n"
+        "  Ctrl+Shift+F Choose Font\r\n"
+        "  Ctrl+Shift+L Format Source\r\n"
+        "  Ctrl+Shift+U Uppercase Source\r\n"
         "  Ctrl+A Select All\r\n"
         "  Ctrl+B Assemble\r\n"
         "  F1 Assembler Help\r\n"
@@ -6147,6 +6208,376 @@ static void app_assembler_save_last_path(const char *path_value) {
         return;
     }
     WritePrivateProfileStringA("assembler", "last_file", path_value, path);
+}
+
+static bool app_assembler_load_saved_font(LOGFONTA *font) {
+    char path[MAX_PATH];
+    char value[64];
+    char face_name[LF_FACESIZE];
+    bool loaded = false;
+
+    app_default_assembler_logfont(font);
+    if (!app_settings_path(path, sizeof(path))) {
+        return false;
+    }
+
+    GetPrivateProfileStringA("assembler", "font_face", "", face_name, sizeof(face_name), path);
+    if (face_name[0] != '\0') {
+        snprintf(font->lfFaceName, sizeof(font->lfFaceName), "%s", face_name);
+        loaded = true;
+    }
+    GetPrivateProfileStringA("assembler", "font_height", "", value, sizeof(value), path);
+    if (value[0] != '\0') {
+        font->lfHeight = atoi(value);
+        loaded = true;
+    }
+    GetPrivateProfileStringA("assembler", "font_weight", "", value, sizeof(value), path);
+    if (value[0] != '\0') {
+        font->lfWeight = atoi(value);
+        loaded = true;
+    }
+    GetPrivateProfileStringA("assembler", "font_italic", "", value, sizeof(value), path);
+    if (value[0] != '\0') {
+        font->lfItalic = (BYTE)(atoi(value) != 0 ? TRUE : FALSE);
+        loaded = true;
+    }
+    GetPrivateProfileStringA("assembler", "font_charset", "", value, sizeof(value), path);
+    if (value[0] != '\0') {
+        font->lfCharSet = (BYTE)atoi(value);
+        loaded = true;
+    }
+
+    return loaded;
+}
+
+static void app_assembler_save_font(const LOGFONTA *font) {
+    char path[MAX_PATH];
+    char value[64];
+
+    if (!app_settings_path(path, sizeof(path))) {
+        return;
+    }
+
+    WritePrivateProfileStringA("assembler", "font_face", font->lfFaceName, path);
+    snprintf(value, sizeof(value), "%ld", font->lfHeight);
+    WritePrivateProfileStringA("assembler", "font_height", value, path);
+    snprintf(value, sizeof(value), "%ld", font->lfWeight);
+    WritePrivateProfileStringA("assembler", "font_weight", value, path);
+    snprintf(value, sizeof(value), "%u", font->lfItalic ? 1u : 0u);
+    WritePrivateProfileStringA("assembler", "font_italic", value, path);
+    snprintf(value, sizeof(value), "%u", (unsigned)font->lfCharSet);
+    WritePrivateProfileStringA("assembler", "font_charset", value, path);
+}
+
+static HFONT app_create_assembler_font_from_logfont(const LOGFONTA *font) {
+    return CreateFontIndirectA(font);
+}
+
+static void app_assembler_apply_font(AppState *app, const LOGFONTA *font) {
+    HFONT new_font;
+
+    if (app == NULL || font == NULL) {
+        return;
+    }
+
+    new_font = app_create_assembler_font_from_logfont(font);
+    if (new_font == NULL) {
+        return;
+    }
+
+    if (app->debug.assembler_font != NULL) {
+        DeleteObject(app->debug.assembler_font);
+    }
+    app->debug.assembler_font = new_font;
+
+    if (app->debug.assembler_line_numbers != NULL) {
+        SendMessageA(app->debug.assembler_line_numbers, WM_SETFONT, (WPARAM)new_font, TRUE);
+        InvalidateRect(app->debug.assembler_line_numbers, NULL, TRUE);
+    }
+    if (app->debug.assembler_source != NULL) {
+        SendMessageA(app->debug.assembler_source, WM_SETFONT, (WPARAM)new_font, TRUE);
+        InvalidateRect(app->debug.assembler_source, NULL, TRUE);
+    }
+    app_assembler_update_line_numbers(app);
+}
+
+static void app_assembler_choose_font(HWND hwnd, AppState *app) {
+    CHOOSEFONTA choose_font;
+    LOGFONTA font;
+
+    if (app == NULL) {
+        return;
+    }
+
+    if (app->debug.assembler_font != NULL) {
+        GetObjectA(app->debug.assembler_font, sizeof(font), &font);
+    } else if (!app_assembler_load_saved_font(&font)) {
+        app_default_assembler_logfont(&font);
+    }
+
+    ZeroMemory(&choose_font, sizeof(choose_font));
+    choose_font.lStructSize = sizeof(choose_font);
+    choose_font.hwndOwner = hwnd;
+    choose_font.lpLogFont = &font;
+    choose_font.Flags = CF_SCREENFONTS | CF_INITTOLOGFONTSTRUCT | CF_FORCEFONTEXIST | CF_FIXEDPITCHONLY;
+
+    if (!ChooseFontA(&choose_font)) {
+        return;
+    }
+
+    app_assembler_apply_font(app, &font);
+    app_assembler_save_font(&font);
+    app_assembler_set_status(app, "Assembler font updated.");
+}
+
+static bool app_assembler_format_source_text(const char *source, char **formatted_output) {
+    size_t source_length;
+    size_t capacity;
+    size_t used = 0;
+    char *formatted;
+    const char *cursor;
+
+    if (source == NULL || formatted_output == NULL) {
+        return false;
+    }
+
+    source_length = strlen(source);
+    capacity = source_length + (source_length / 2) + 64;
+    formatted = (char *)malloc(capacity);
+    if (formatted == NULL) {
+        return false;
+    }
+
+    cursor = source;
+    while (*cursor != '\0') {
+        const char *line_start = cursor;
+        const char *line_end = cursor;
+        const char *trimmed_start;
+        const char *trimmed_end;
+        const char *body_start;
+        const char *body_end;
+        const char *label_end;
+        const char *next_cursor;
+        bool has_crlf = false;
+        bool is_blank;
+        bool has_label = false;
+        char label[64];
+
+        while (*line_end != '\0' && *line_end != '\r' && *line_end != '\n') {
+            line_end++;
+        }
+        next_cursor = line_end;
+        if (*next_cursor == '\r') {
+            has_crlf = true;
+            next_cursor++;
+        }
+        if (*next_cursor == '\n') {
+            has_crlf = true;
+            next_cursor++;
+        }
+
+        trimmed_start = line_start;
+        while (trimmed_start < line_end && isspace((unsigned char)*trimmed_start)) {
+            trimmed_start++;
+        }
+        trimmed_end = line_end;
+        while (trimmed_end > trimmed_start && isspace((unsigned char)trimmed_end[-1])) {
+            trimmed_end--;
+        }
+        is_blank = trimmed_start == trimmed_end;
+
+        if (!is_blank) {
+            body_start = trimmed_start;
+            body_end = trimmed_end;
+            label_end = trimmed_start;
+            while (app_parse_leading_label((char **)&body_start, label, sizeof(label))) {
+                has_label = true;
+                label_end = body_start;
+                while (body_start < body_end && isspace((unsigned char)*body_start)) {
+                    body_start++;
+                }
+                if (body_start >= body_end) {
+                    break;
+                }
+            }
+
+            if (has_label) {
+                size_t line_length = (size_t)(trimmed_end - trimmed_start);
+                if (used + line_length + 4 >= capacity) {
+                    capacity = capacity + line_length + 256;
+                    formatted = (char *)realloc(formatted, capacity);
+                    if (formatted == NULL) {
+                        return false;
+                    }
+                }
+                memcpy(formatted + used, trimmed_start, (size_t)(label_end - trimmed_start));
+                used += (size_t)(label_end - trimmed_start);
+                if (body_start < body_end) {
+                    formatted[used++] = '\t';
+                    memcpy(formatted + used, body_start, (size_t)(body_end - body_start));
+                    used += (size_t)(body_end - body_start);
+                }
+            } else {
+                size_t line_length = (size_t)(trimmed_end - trimmed_start);
+                if (used + line_length + 4 >= capacity) {
+                    capacity = capacity + line_length + 256;
+                    formatted = (char *)realloc(formatted, capacity);
+                    if (formatted == NULL) {
+                        return false;
+                    }
+                }
+                formatted[used++] = '\t';
+                memcpy(formatted + used, trimmed_start, line_length);
+                used += line_length;
+            }
+        }
+
+        if (has_crlf) {
+            if (used + 2 >= capacity) {
+                capacity += 256;
+                formatted = (char *)realloc(formatted, capacity);
+                if (formatted == NULL) {
+                    return false;
+                }
+            }
+            formatted[used++] = '\r';
+            formatted[used++] = '\n';
+        }
+
+        cursor = next_cursor;
+    }
+
+    if (used + 1 >= capacity) {
+        capacity += 1;
+        formatted = (char *)realloc(formatted, capacity);
+        if (formatted == NULL) {
+            return false;
+        }
+    }
+    formatted[used] = '\0';
+    *formatted_output = formatted;
+    return true;
+}
+
+static void app_assembler_format_source(HWND hwnd, AppState *app) {
+    int source_length;
+    char *source;
+    char *formatted;
+
+    if (app == NULL || app->debug.assembler_source == NULL) {
+        return;
+    }
+
+    source_length = GetWindowTextLengthA(app->debug.assembler_source);
+    source = (char *)malloc((size_t)source_length + 1);
+    if (source == NULL) {
+        app_assembler_set_status(app, "Out of memory.");
+        return;
+    }
+    GetWindowTextA(app->debug.assembler_source, source, source_length + 1);
+
+    if (!app_assembler_format_source_text(source, &formatted)) {
+        free(source);
+        app_assembler_set_status(app, "Could not format assembler source.");
+        return;
+    }
+
+    app->debug.assembler_ignore_change = true;
+    SetWindowTextA(app->debug.assembler_source, formatted);
+    app->debug.assembler_ignore_change = false;
+    app->debug.assembler_dirty = true;
+    app_assembler_clear_error_marker(app);
+    app_assembler_update_line_numbers(app);
+    app_assembler_set_status(app, "Assembler source formatted.");
+    SetFocus(app->debug.assembler_source);
+
+    free(formatted);
+    free(source);
+    (void)hwnd;
+}
+
+static bool app_assembler_uppercase_source_text(const char *source, char **uppercase_output) {
+    size_t source_length;
+    char *uppercase_text;
+    bool in_single = false;
+    bool in_double = false;
+    bool in_comment = false;
+
+    if (source == NULL || uppercase_output == NULL) {
+        return false;
+    }
+
+    source_length = strlen(source);
+    uppercase_text = (char *)malloc(source_length + 1);
+    if (uppercase_text == NULL) {
+        return false;
+    }
+
+    for (size_t i = 0; i < source_length; ++i) {
+        const char ch = source[i];
+
+        if (in_comment) {
+            uppercase_text[i] = ch;
+        } else if (ch == '\'' && !in_double) {
+            in_single = !in_single;
+            uppercase_text[i] = ch;
+        } else if (ch == '"' && !in_single) {
+            in_double = !in_double;
+            uppercase_text[i] = ch;
+        } else if (ch == ';' && !in_single && !in_double) {
+            in_comment = true;
+            uppercase_text[i] = ch;
+        } else if (!in_single && !in_double) {
+            uppercase_text[i] = (char)toupper((unsigned char)ch);
+        } else {
+            uppercase_text[i] = ch;
+        }
+
+        if (ch == '\n' || ch == '\r') {
+            in_comment = false;
+        }
+    }
+
+    uppercase_text[source_length] = '\0';
+    *uppercase_output = uppercase_text;
+    return true;
+}
+
+static void app_assembler_uppercase_source(HWND hwnd, AppState *app) {
+    int source_length;
+    char *source;
+    char *uppercase_text;
+
+    if (app == NULL || app->debug.assembler_source == NULL) {
+        return;
+    }
+
+    source_length = GetWindowTextLengthA(app->debug.assembler_source);
+    source = (char *)malloc((size_t)source_length + 1);
+    if (source == NULL) {
+        app_assembler_set_status(app, "Out of memory.");
+        return;
+    }
+    GetWindowTextA(app->debug.assembler_source, source, source_length + 1);
+
+    if (!app_assembler_uppercase_source_text(source, &uppercase_text)) {
+        free(source);
+        app_assembler_set_status(app, "Could not convert assembler source to upper case.");
+        return;
+    }
+
+    app->debug.assembler_ignore_change = true;
+    SetWindowTextA(app->debug.assembler_source, uppercase_text);
+    app->debug.assembler_ignore_change = false;
+    app->debug.assembler_dirty = true;
+    app_assembler_clear_error_marker(app);
+    app_assembler_update_line_numbers(app);
+    app_assembler_set_status(app, "Assembler source converted to upper case.");
+    SetFocus(app->debug.assembler_source);
+
+    free(uppercase_text);
+    free(source);
+    (void)hwnd;
 }
 
 /* Returns true only when the supplied path exists and resolves to a file
