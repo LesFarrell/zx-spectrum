@@ -110,7 +110,6 @@ typedef struct AppTapeLoadJob {
     HWND hwnd;
     char path[MAX_PATH];
     uint32_t tick_hz;
-    bool stop_in_48k_mode;
     TapePlayer tape;
     char error[256];
     bool ok;
@@ -295,6 +294,7 @@ static bool app_load_snapshot_file(HWND hwnd, AppState *app, const char *path, c
 static bool app_apply_loaded_snapshot(HWND hwnd, AppState *app, AppSnapshotLoadJob *job, char *error_buffer, size_t error_buffer_size);
 static void app_play_tape(AppState *app);
 static void app_stop_tape(AppState *app);
+static void app_sync_tape_stop_mode(AppState *app);
 static void app_set_modal_loop_timer(AppState *app, HWND hwnd, bool enabled);
 static void app_controller_init(AppState *app);
 static void app_controller_shutdown(AppState *app);
@@ -4298,7 +4298,6 @@ static DWORD WINAPI app_tape_load_worker(void *param) {
         &job->tape,
         job->path,
         job->tick_hz,
-        job->stop_in_48k_mode,
         job->error,
         sizeof(job->error)
     );
@@ -4362,7 +4361,6 @@ static bool app_load_tape_file(
 
     job->hwnd = hwnd;
     job->tick_hz = (uint32_t)app->spec.machine.freq_hz;
-    job->stop_in_48k_mode = app->spec.model == SPECTRUM_MODEL_48K;
     snprintf(job->path, sizeof(job->path), "%s", path);
 
     thread_handle = CreateThread(NULL, 0, app_tape_load_worker, job, 0, NULL);
@@ -4430,7 +4428,6 @@ static bool app_apply_loaded_tape(
     tape_discard(&app->tape);
     app->tape = *loaded_tape;
     tape_stop(&app->tape);
-    tape_rewind(&app->tape, (uint32_t)app->spec.machine.freq_hz);
 
     if (app->tape_autoload_enabled) {
         if (autoload_target == TAPE_AUTOLOAD_TARGET_128_MENU) {
@@ -4451,6 +4448,7 @@ static bool app_apply_loaded_tape(
             app_update_model_menu(hwnd, app->spec.model);
         }
         spectrum_reset(&app->spec);
+        app_sync_tape_stop_mode(app);
         tape_rewind(&app->tape, (uint32_t)app->spec.machine.freq_hz);
         if (autoload_model == SPECTRUM_MODEL_128K) {
             app->tape_autoplay_pending = app_start_autotype(app, L"\r");
@@ -4463,6 +4461,9 @@ static bool app_apply_loaded_tape(
         if (!app->tape_autoplay_pending) {
             tape_start(&app->tape, app->spec.machine.tick_count);
         }
+    } else {
+        app_sync_tape_stop_mode(app);
+        tape_rewind(&app->tape, (uint32_t)app->spec.machine.freq_hz);
     }
 
     app_debug_machine_changed(app);
@@ -4479,23 +4480,33 @@ static bool app_apply_loaded_snapshot(
     char *error_buffer,
     size_t error_buffer_size
 ) {
+    const bool model_changed = job->model != app->spec.model;
+    const Spectrum previous_spec = app->spec;
+
     app_autotype_clear(app);
     app_release_all_keys(app);
     app_audio_flush(app);
     tape_stop(&app->tape);
 
-    if (job->model != app->spec.model) {
+    if (model_changed) {
         const RomSet *set = app_rom_set_for_model_const(&app->roms, job->model);
         if (!app_load_model_roms(app, job->model, set, error_buffer, error_buffer_size)) {
             return false;
         }
-        tape_rewind(&app->tape, (uint32_t)app->spec.machine.freq_hz);
     }
     if (!spectrum_load_snapshot_z80_data(&app->spec, job->data, job->size, error_buffer, error_buffer_size)) {
+        if (model_changed) {
+            app->spec = previous_spec;
+            app_sync_tape_stop_mode(app);
+        }
         return false;
     }
 
     app_audio_flush(app);
+    app_sync_tape_stop_mode(app);
+    if (model_changed) {
+        tape_rewind(&app->tape, (uint32_t)app->spec.machine.freq_hz);
+    }
     app_update_title(hwnd, &app->spec);
     app_update_model_menu(hwnd, app->spec.model);
     app_debug_machine_changed(app);
@@ -4537,13 +4548,14 @@ static void app_run_autotype(AppState *app) {
     app->auto_type.hold_frames = APP_AUTOTYPE_HOLD_FRAMES;
 }
 
-/* Restarts the inserted tape from the beginning and begins playback. */
+/* Starts the inserted tape from the current position, rewinding only after
+   the decoded waveform has already reached the end. */
 static void app_play_tape(AppState *app) {
     if (!tape_has_tape(&app->tape)) {
         return;
     }
     app->tape_autoplay_pending = false;
-    tape_rewind(&app->tape, (uint32_t)app->spec.machine.freq_hz);
+    app_sync_tape_stop_mode(app);
     tape_start(&app->tape, app->spec.machine.tick_count);
 }
 
@@ -4551,6 +4563,10 @@ static void app_play_tape(AppState *app) {
 static void app_stop_tape(AppState *app) {
     app->tape_autoplay_pending = false;
     tape_stop(&app->tape);
+}
+
+static void app_sync_tape_stop_mode(AppState *app) {
+    tape_set_stop_mode(&app->tape, app->spec.model == SPECTRUM_MODEL_48K);
 }
 
 /* Switches the running machine between 48K and 128K by reloading the ROM
@@ -4575,6 +4591,7 @@ static void app_switch_model(HWND hwnd, AppState *app, SpectrumModel model) {
         app_update_model_menu(hwnd, app->spec.model);
         return;
     }
+    app_sync_tape_stop_mode(app);
     tape_rewind(&app->tape, (uint32_t)app->spec.machine.freq_hz);
 
     app_save_model(model);
@@ -6077,6 +6094,7 @@ int main(int argc, char **argv) {
         tape_discard(&app.tape);
         return 1;
     }
+    app_sync_tape_stop_mode(&app);
 
     app.bitmap_info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     app.bitmap_info.bmiHeader.biWidth = ZX_SCREEN_WIDTH;

@@ -402,6 +402,7 @@ bool spectrum_load_snapshot_z80_data(
     char *error_buffer,
     size_t error_buffer_size
 ) {
+    Spectrum previous_spec = *spec;
     SpectrumModel snapshot_model;
 
     if (!spectrum_detect_snapshot_model_data(data, data_size, &snapshot_model)) {
@@ -416,6 +417,7 @@ bool spectrum_load_snapshot_z80_data(
     }
 
     if (!zx_quickload(&spec->machine, (chips_range_t){ .ptr = (void *)data, .size = data_size })) {
+        *spec = previous_spec;
         snprintf(
             error_buffer,
             error_buffer_size,

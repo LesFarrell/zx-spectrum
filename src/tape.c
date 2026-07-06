@@ -226,7 +226,7 @@ static bool tape_append_level(TapePlayer *player, uint32_t duration_ticks, bool 
     }
     if (player->segment_count > 0) {
         segment = &player->segments[player->segment_count - 1];
-        if (segment->level_high == level_high) {
+        if (segment->level_high == level_high && segment->stop_after == TAPE_STOP_NONE) {
             if (segment->duration_ticks > UINT32_MAX - duration_ticks) {
                 return false;
             }
@@ -240,6 +240,24 @@ static bool tape_append_level(TapePlayer *player, uint32_t duration_ticks, bool 
     segment = &player->segments[player->segment_count++];
     segment->duration_ticks = duration_ticks;
     segment->level_high = level_high;
+    segment->stop_after = TAPE_STOP_NONE;
+    return true;
+}
+
+static bool tape_mark_stop(TapePlayer *player, TapeStopMode stop_mode) {
+    TapeSegment *segment;
+
+    if (player->segment_count == 0) {
+        return true;
+    }
+
+    segment = &player->segments[player->segment_count - 1];
+    if (segment->stop_after == TAPE_STOP_ALWAYS || segment->stop_after == stop_mode) {
+        return true;
+    }
+    if (stop_mode == TAPE_STOP_ALWAYS || segment->stop_after == TAPE_STOP_NONE) {
+        segment->stop_after = stop_mode;
+    }
     return true;
 }
 
@@ -249,6 +267,9 @@ static bool tape_append_pulse(TapeBuilder *builder, uint32_t duration_ticks) {
 }
 
 static bool tape_append_pause(TapeBuilder *builder, uint16_t duration_ms) {
+    if (duration_ms == 0) {
+        return true;
+    }
     builder->current_level = false;
     return tape_append_level(
         builder->player,
@@ -307,7 +328,10 @@ static bool tape_append_standard_block(
     if (!tape_append_data_bits(builder, data, length, 8, TAPE_ZERO_PULSE_TICKS, TAPE_ONE_PULSE_TICKS)) {
         return false;
     }
-    return tape_append_pause(builder, pause_ms);
+    if (pause_ms > 0) {
+        return tape_append_pause(builder, pause_ms);
+    }
+    return true;
 }
 
 static bool tape_append_turbo_block(
@@ -335,7 +359,10 @@ static bool tape_append_turbo_block(
     if (!tape_append_data_bits(builder, data, length, used_bits_last, zero_pulse_ticks, one_pulse_ticks)) {
         return false;
     }
-    return tape_append_pause(builder, pause_ms);
+    if (pause_ms > 0) {
+        return tape_append_pause(builder, pause_ms);
+    }
+    return true;
 }
 
 static bool tape_parse_tap(
@@ -382,7 +409,6 @@ static bool tape_parse_tzx(
     TapePlayer *player,
     const uint8_t *data,
     size_t size,
-    bool stop_in_48k_mode,
     char *error_buffer,
     size_t error_buffer_size,
     const char *path
@@ -427,9 +453,6 @@ static bool tape_parse_tzx(
                     return false;
                 }
                 offset += block_length;
-                if (pause_ms == 0) {
-                    return true;
-                }
                 break;
             }
 
@@ -478,9 +501,6 @@ static bool tape_parse_tzx(
                     return false;
                 }
                 offset += block_length;
-                if (pause_ms == 0) {
-                    return true;
-                }
                 break;
             }
 
@@ -551,14 +571,11 @@ static bool tape_parse_tzx(
                         used_bits_last,
                         zero_pulse_ticks,
                         one_pulse_ticks) ||
-                    !tape_append_pause(&builder, pause_ms)) {
+                    (pause_ms > 0 && !tape_append_pause(&builder, pause_ms))) {
                     tape_set_error(error_buffer, error_buffer_size, "Out of memory while decoding TZX data", path);
                     return false;
                 }
                 offset += block_length;
-                if (pause_ms == 0) {
-                    return true;
-                }
                 break;
             }
 
@@ -571,7 +588,11 @@ static bool tape_parse_tzx(
                 pause_ms = tape_read_u16(&data[offset]);
                 offset += 2;
                 if (pause_ms == 0) {
-                    return true;
+                    if (!tape_mark_stop(player, TAPE_STOP_ALWAYS)) {
+                        tape_set_error(error_buffer, error_buffer_size, "Out of memory while decoding TZX data", path);
+                        return false;
+                    }
+                    break;
                 }
                 if (!tape_append_pause(&builder, pause_ms)) {
                     tape_set_error(error_buffer, error_buffer_size, "Out of memory while decoding TZX data", path);
@@ -636,8 +657,9 @@ static bool tape_parse_tzx(
                 }
                 offset += 4;
                 player->autoload_target = TAPE_AUTOLOAD_TARGET_128_MENU;
-                if (stop_in_48k_mode) {
-                    return true;
+                if (!tape_mark_stop(player, TAPE_STOP_48K_ONLY)) {
+                    tape_set_error(error_buffer, error_buffer_size, "Out of memory while decoding TZX data", path);
+                    return false;
                 }
                 break;
 
@@ -774,7 +796,6 @@ bool tape_load_file(
     TapePlayer *player,
     const char *path,
     uint32_t tick_hz,
-    bool stop_in_48k_mode,
     char *error_buffer,
     size_t error_buffer_size
 ) {
@@ -832,7 +853,6 @@ bool tape_load_file(
             player,
             data,
             (size_t)file_size,
-            stop_in_48k_mode,
             error_buffer,
             error_buffer_size,
             path);
@@ -867,13 +887,22 @@ void tape_rewind(TapePlayer *player, uint32_t tick_hz) {
     player->playing = false;
 }
 
+void tape_set_stop_mode(TapePlayer *player, bool stop_in_48k_mode) {
+    if (player == NULL) {
+        return;
+    }
+    player->stop_in_48k_mode = stop_in_48k_mode;
+}
+
 void tape_start(TapePlayer *player, uint64_t tick_count) {
     if (player == NULL || !player->inserted || player->segment_count == 0) {
         return;
     }
-    player->play_index = 0;
+    if (player->play_index >= player->segment_count) {
+        player->play_index = 0;
+    }
     player->playing = true;
-    player->segment_end_tick = tick_count + player->segments[0].duration_ticks;
+    player->segment_end_tick = tick_count + player->segments[player->play_index].duration_ticks;
 }
 
 void tape_stop(TapePlayer *player) {
@@ -889,7 +918,16 @@ bool tape_input_level(TapePlayer *player, uint64_t tick_count) {
     }
 
     while (tick_count >= player->segment_end_tick) {
+        const TapeSegment *segment = &player->segments[player->play_index];
+        const bool should_stop =
+            segment->stop_after == TAPE_STOP_ALWAYS ||
+            (segment->stop_after == TAPE_STOP_48K_ONLY && player->stop_in_48k_mode);
+
         player->play_index++;
+        if (should_stop) {
+            player->playing = false;
+            return false;
+        }
         if (player->play_index >= player->segment_count) {
             player->playing = false;
             return false;
