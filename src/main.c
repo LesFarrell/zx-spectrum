@@ -225,6 +225,11 @@ typedef struct AssemblerLabel {
     uint16_t address;
 } AssemblerLabel;
 
+typedef struct AssemblerConstant {
+    char name[64];
+    int value;
+} AssemblerConstant;
+
 typedef struct AssemblerValue {
     int value;
     bool resolved;
@@ -239,6 +244,8 @@ typedef struct AssemblerContext {
     int pass;
     AssemblerLabel labels[512];
     size_t label_count;
+    AssemblerConstant constants[512];
+    size_t constant_count;
 } AssemblerContext;
 
 /* Stores the selected machine type and the resolved ROM paths after command
@@ -403,6 +410,7 @@ static void app_assembler_format_location_error(
     size_t out_error_size
 );
 static bool app_assembler_find_source_org(const char *source, uint16_t *out_address);
+static bool app_parse_value(const AssemblerContext *ctx, const char *text, AssemblerValue *out_value);
 static HFONT app_create_monospace_font(void);
 static bool app_assembler_handle_edit_command(AppState *app, UINT command_id);
 static bool app_assembler_format_source_text(const char *source, char **formatted_output);
@@ -1982,57 +1990,6 @@ static void app_debug_machine_changed(AppState *app) {
     app_assembler_refresh_window(app);
 }
 
-/* Splits a comma-separated operand list while respecting quoted strings so
-   assembler directives can accept text literals and normal arguments. */
-static bool app_read_operand(char **text, char *operand, size_t operand_size) {
-    char *cursor;
-    char *start;
-    bool in_single = false;
-    bool in_double = false;
-
-    if (text == NULL || *text == NULL) {
-        return false;
-    }
-
-    start = *text;
-    while (*start != '\0' && isspace((unsigned char)*start)) {
-        start++;
-    }
-    if (*start == '\0') {
-        *text = start;
-        return false;
-    }
-
-    cursor = start;
-    while (*cursor != '\0') {
-        if (*cursor == '\'' && !in_double) {
-            in_single = !in_single;
-        } else if (*cursor == '"' && !in_single) {
-            in_double = !in_double;
-        } else if (*cursor == ',' && !in_single && !in_double) {
-            break;
-        }
-        cursor++;
-    }
-
-    {
-        size_t length = (size_t)(cursor - start);
-        size_t copy_length = (length < operand_size - 1) ? length : (operand_size - 1);
-        memcpy(operand, start, copy_length);
-        operand[copy_length] = '\0';
-    }
-
-    {
-        char *trimmed = app_trim_inplace(operand);
-        if (trimmed != operand) {
-            memmove(operand, trimmed, strlen(trimmed) + 1);
-        }
-    }
-
-    *text = (*cursor == ',') ? (cursor + 1) : cursor;
-    return true;
-}
-
 /* Strict operand reader for assembly syntax checks. Returns 1 when an operand
    was read, 0 when no more operands are present, and -1 on malformed lists. */
 static int app_read_operand_strict(
@@ -2226,10 +2183,48 @@ static bool app_is_label_char(char ch) {
     return isalnum((unsigned char)ch) || ch == '_' || ch == '.' || ch == '?' || ch == '$';
 }
 
+/* Returns true when a symbol name matches the assembler's identifier rules. */
+static bool app_is_symbol_name(const char *text) {
+    if (text == NULL || !app_is_label_start_char(text[0])) {
+        return false;
+    }
+    for (size_t i = 1; text[i] != '\0'; ++i) {
+        if (!app_is_label_char(text[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Reports why a symbol name is invalid so assembler diagnostics can point to
+   naming rules instead of falling back to unrelated mnemonic errors. */
+static void app_format_invalid_symbol_error(
+    const char *name,
+    char *error_buffer,
+    size_t error_buffer_size
+) {
+    snprintf(
+        error_buffer,
+        error_buffer_size,
+        "Invalid symbol name: %s. Use letters, digits, '_', '.', '?', or '$'; the first character cannot be a digit.",
+        name != NULL ? name : ""
+    );
+}
+
 /* Looks up a previously defined label by name and returns its table index. */
 static int app_find_label_index(const AssemblerContext *ctx, const char *name) {
     for (size_t i = 0; i < ctx->label_count; ++i) {
         if (_stricmp(ctx->labels[i].name, name) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+/* Looks up a previously defined constant by name and returns its table index. */
+static int app_find_constant_index(const AssemblerContext *ctx, const char *name) {
+    for (size_t i = 0; i < ctx->constant_count; ++i) {
+        if (_stricmp(ctx->constants[i].name, name) == 0) {
             return (int)i;
         }
     }
@@ -2252,6 +2247,10 @@ static bool app_define_label(
             snprintf(error_buffer, error_buffer_size, "Duplicate label: %s", name);
             return false;
         }
+        if (app_find_constant_index(ctx, name) >= 0) {
+            snprintf(error_buffer, error_buffer_size, "Symbol already defined as a constant: %s", name);
+            return false;
+        }
         if (ctx->label_count >= sizeof(ctx->labels) / sizeof(ctx->labels[0])) {
             snprintf(error_buffer, error_buffer_size, "Too many labels in assembler source.");
             return false;
@@ -2271,6 +2270,121 @@ static bool app_define_label(
         return false;
     }
     return true;
+}
+
+/* Defines a named constant during pass 1 and verifies pass 2 sees the same
+   value so `EQU` symbols stay stable across both assembly passes. */
+static bool app_define_constant(
+    AssemblerContext *ctx,
+    const char *name,
+    int value,
+    char *error_buffer,
+    size_t error_buffer_size
+) {
+    int existing_index = app_find_constant_index(ctx, name);
+
+    if (ctx->pass == 1) {
+        if (existing_index >= 0) {
+            snprintf(error_buffer, error_buffer_size, "Duplicate constant: %s", name);
+            return false;
+        }
+        if (app_find_label_index(ctx, name) >= 0) {
+            snprintf(error_buffer, error_buffer_size, "Symbol already defined as a label: %s", name);
+            return false;
+        }
+        if (ctx->constant_count >= sizeof(ctx->constants) / sizeof(ctx->constants[0])) {
+            snprintf(error_buffer, error_buffer_size, "Too many constants in assembler source.");
+            return false;
+        }
+        snprintf(ctx->constants[ctx->constant_count].name, sizeof(ctx->constants[ctx->constant_count].name), "%s", name);
+        ctx->constants[ctx->constant_count].value = value;
+        ctx->constant_count++;
+        return true;
+    }
+
+    if (existing_index < 0) {
+        snprintf(error_buffer, error_buffer_size, "Unknown constant during second pass: %s", name);
+        return false;
+    }
+    if (ctx->constants[existing_index].value != value) {
+        snprintf(error_buffer, error_buffer_size, "Constant value changed between passes: %s", name);
+        return false;
+    }
+    return true;
+}
+
+/* Parses a traditional `NAME EQU value` constant definition and adds it to
+   the active symbol table when present on the current line. */
+static bool app_parse_equ_definition(
+    AssemblerContext *ctx,
+    char *text,
+    bool *handled,
+    char *error_buffer,
+    size_t error_buffer_size
+) {
+    char name[64];
+    char directive[32];
+    char operand[256];
+    AssemblerValue value;
+    char *cursor;
+    char *operand_cursor;
+    size_t name_chars;
+    size_t directive_chars;
+    int operand_result;
+
+    if (handled != NULL) {
+        *handled = false;
+    }
+    if (ctx == NULL || text == NULL) {
+        return false;
+    }
+
+    name_chars = app_read_upper_token(text, name, sizeof(name));
+    if (name_chars == 0) {
+        return true;
+    }
+
+    cursor = text + name_chars;
+    if (*cursor == '\0' || !isspace((unsigned char)*cursor)) {
+        return true;
+    }
+    while (*cursor != '\0' && isspace((unsigned char)*cursor)) {
+        cursor++;
+    }
+
+    directive_chars = app_read_upper_token(cursor, directive, sizeof(directive));
+    if (directive_chars == 0 || !app_equals_ignore_case(directive, "EQU")) {
+        return true;
+    }
+    if (handled != NULL) {
+        *handled = true;
+    }
+    if (!app_is_symbol_name(name)) {
+        app_format_invalid_symbol_error(name, error_buffer, error_buffer_size);
+        return false;
+    }
+
+    operand_cursor = cursor + directive_chars;
+    operand_result = app_read_operand_strict(&operand_cursor, operand, sizeof(operand), error_buffer, error_buffer_size);
+    if (operand_result <= 0) {
+        if (operand_result == 0) {
+            snprintf(error_buffer, error_buffer_size, "EQU expects 1 operand.");
+        }
+        return false;
+    }
+    if (app_read_operand_strict(&operand_cursor, directive, sizeof(directive), error_buffer, error_buffer_size) > 0) {
+        snprintf(error_buffer, error_buffer_size, "EQU expects 1 operand.");
+        return false;
+    }
+    if (!app_parse_value(ctx, operand, &value)) {
+        snprintf(error_buffer, error_buffer_size, "Invalid EQU value: %s", operand);
+        return false;
+    }
+    if (!value.resolved) {
+        snprintf(error_buffer, error_buffer_size, "EQU requires an already-defined value: %s", operand);
+        return false;
+    }
+    return app_define_constant(ctx, name, value.value, error_buffer, error_buffer_size);
 }
 
 /* Consumes one leading `label:` definition from the current line if present. */
@@ -2314,9 +2428,13 @@ static bool app_parse_leading_label(char **text, char *label, size_t label_size)
 /* Scans assembler source for the first explicit ORG directive so assembly can
    start from source-defined addresses without separate UI state. */
 static bool app_assembler_find_source_org(const char *source, uint16_t *out_address) {
+    AssemblerContext ctx;
     char *mutable_source;
     char *cursor;
     char *line;
+
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.pass = 1;
 
     mutable_source = _strdup(source);
     if (mutable_source == NULL) {
@@ -2362,6 +2480,18 @@ static bool app_assembler_find_source_org(const char *source, uint16_t *out_addr
         if (*text == '\0') {
             continue;
         }
+        {
+            bool handled_equ = false;
+            char scan_error[256];
+
+            if (!app_parse_equ_definition(&ctx, text, &handled_equ, scan_error, sizeof(scan_error))) {
+                free(mutable_source);
+                return false;
+            }
+            if (handled_equ) {
+                continue;
+            }
+        }
 
         mnemonic_chars = app_read_upper_token(text, mnemonic, sizeof(mnemonic));
         text += mnemonic_chars;
@@ -2372,9 +2502,19 @@ static bool app_assembler_find_source_org(const char *source, uint16_t *out_addr
         operand[0] = '\0';
         if (*text != '\0') {
             char *operand_cursor = text;
-            app_read_operand(&operand_cursor, operand, sizeof(operand));
+            if (app_read_operand_strict(&operand_cursor, operand, sizeof(operand), mnemonic, sizeof(mnemonic)) <= 0) {
+                continue;
+            }
         }
-        if (app_parse_number(operand, &org_value) && org_value >= 0 && org_value <= 0xFFFF) {
+        {
+            AssemblerValue value;
+
+            if (!app_parse_value(&ctx, operand, &value) || !value.resolved) {
+                continue;
+            }
+            org_value = value.value;
+        }
+        if (org_value >= 0 && org_value <= 0xFFFF) {
             *out_address = (uint16_t)org_value;
             free(mutable_source);
             return true;
@@ -2394,6 +2534,7 @@ static bool app_parse_value(
 ) {
     char token[128];
     int numeric_value;
+    int constant_index;
     int label_index;
 
     snprintf(token, sizeof(token), "%s", text);
@@ -2414,13 +2555,16 @@ static bool app_parse_value(
         return true;
     }
 
-    if (!app_is_label_start_char(token[0])) {
+    if (!app_is_symbol_name(token)) {
         return false;
     }
-    for (size_t i = 1; token[i] != '\0'; ++i) {
-        if (!app_is_label_char(token[i])) {
-            return false;
-        }
+
+    constant_index = app_find_constant_index(ctx, token);
+    if (constant_index >= 0) {
+        out_value->value = ctx->constants[constant_index].value;
+        out_value->resolved = true;
+        out_value->numeric_literal = false;
+        return true;
     }
 
     label_index = app_find_label_index(ctx, token);
@@ -2635,6 +2779,17 @@ static bool app_assemble_line(
         }
     }
 
+    {
+        bool handled_equ = false;
+
+        if (!app_parse_equ_definition(ctx, operands, &handled_equ, error_buffer, error_buffer_size)) {
+            return false;
+        }
+        if (handled_equ) {
+            return true;
+        }
+    }
+
     mnemonic_chars = app_read_upper_token(operands, mnemonic, sizeof(mnemonic));
     operands += mnemonic_chars;
     operands = app_trim_inplace(operands);
@@ -2668,15 +2823,14 @@ static bool app_assemble_line(
     }
 
     if (app_equals_ignore_case(mnemonic, "ORG")) {
-        int new_address;
         if (!app_require_operand_count("ORG", operand_count, 1, 1, error_buffer, error_buffer_size)) {
             return false;
         }
-        if (!app_parse_number(lhs, &new_address) || new_address < 0 || new_address > 0xFFFF) {
+        if (!app_parse_value(ctx, lhs, &value) || !value.resolved || value.value < 0 || value.value > 0xFFFF) {
             snprintf(error_buffer, error_buffer_size, "Invalid ORG address: %s", lhs);
             return false;
         }
-        ctx->address = (uint16_t)new_address;
+        ctx->address = (uint16_t)value.value;
         return true;
     }
 
@@ -3369,11 +3523,13 @@ static bool app_assemble_source(
     snprintf(
         status_buffer,
         status_buffer_size,
-        "Assembled %zu byte%s with %zu label%s to RAM starting at %04Xh. Next address: %04Xh.",
+        "Assembled %zu byte%s with %zu label%s and %zu constant%s to RAM starting at %04Xh. Next address: %04Xh.",
         ctx.total_written,
         ctx.total_written == 1 ? "" : "s",
         ctx.label_count,
         ctx.label_count == 1 ? "" : "s",
+        ctx.constant_count,
+        ctx.constant_count == 1 ? "" : "s",
         start_address,
         ctx.address
     );
@@ -4459,7 +4615,7 @@ static LRESULT CALLBACK app_assembler_wndproc(HWND hwnd, UINT msg, WPARAM wparam
             app_assembler_layout_controls(app, hwnd);
             app_assembler_set_status(
                 app,
-                "Mini assembler with labels and Load/Save. ORG in the source sets the assembly address; otherwise the current PC is used."
+                "Mini assembler with labels, EQU constants, and Load/Save. ORG in the source sets the assembly address; otherwise the current PC is used."
             );
             app_assembler_refresh_window(app);
             return 0;
@@ -4744,6 +4900,10 @@ static void app_show_assembler_help(HWND hwnd) {
         "  start:\r\n"
         "  loop: JR NZ,loop\r\n"
         "\r\n"
+        "Constants:\r\n"
+        "  SCREEN EQU 4000h\r\n"
+        "  ATTRS  EQU 5800h\r\n"
+        "\r\n"
         "Directives:\r\n"
         "  ORG address\r\n"
         "  DB value[, value...]\r\n"
@@ -4779,10 +4939,11 @@ static void app_show_assembler_help(HWND hwnd) {
         "\r\n"
         "Notes:\r\n"
         "  - Numbers may be decimal, $hex, 0xhex, hex with H suffix, or %binary.\r\n"
+        "  - Constants use NAME EQU value and can reference earlier labels or constants.\r\n"
         "  - Quoted text works in DB, for example DB \"HELLO\",13.\r\n"
         "  - INCLUDE expands in place, so it can appear mid-file.\r\n"
         "  - INCLUDE paths are resolved relative to the current source file.\r\n"
-        "  - Labels are supported.\r\n"
+        "  - Labels and constants share one symbol namespace.\r\n"
         "  - Macros are not supported.\r\n"
         "  - Writes are limited to RAM at 4000h-FFFFh.\r\n",
         "Assembler Help",

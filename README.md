@@ -86,7 +86,7 @@ With no arguments, the emulator looks for `128.rom` in `.\src` first and starts 
 
 ## Assembler Notes
 
-- The built-in assembler is intentionally small: it supports labels and a practical subset of Z80 mnemonics, not a full macro assembler
+- The built-in assembler is intentionally small: it supports labels, `EQU` constants, and a practical subset of Z80 mnemonics, not a full macro assembler
 - `File -> New` clears the current source after prompting to save when needed
 - `INCLUDE "file.asm"` expands another source file in place during assembly, so it can appear in the middle of a source file; relative paths are resolved from the current source file
 - `Ctrl+B` assembles the current source
