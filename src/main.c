@@ -417,6 +417,10 @@ static LRESULT CALLBACK app_debugger_address_wndproc(HWND hwnd, UINT msg, WPARAM
 static LRESULT CALLBACK app_debugger_points_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
 static LRESULT CALLBACK app_assembler_gutter_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
 static LRESULT CALLBACK app_assembler_source_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
+static HICON app_get_window_icon(bool small);
+static void app_apply_window_icons(HWND hwnd);
+
+#define APP_ICON_RESOURCE_ID 1
 
 /* Creates the application's menu bar so snapshot loading and other emulator
    actions are available from the standard Windows chrome. */
@@ -4623,6 +4627,49 @@ static bool app_register_tool_window_classes(HINSTANCE instance) {
     return true;
 }
 
+/* Loads the executable's icon resource at the requested system size and caches
+   it so each top-level window can reuse the same handles. */
+static HICON app_get_window_icon(bool small) {
+    static HICON large_icon = NULL;
+    static HICON small_icon = NULL;
+    HICON *target = small ? &small_icon : &large_icon;
+    int width = GetSystemMetrics(small ? SM_CXSMICON : SM_CXICON);
+    int height = GetSystemMetrics(small ? SM_CYSMICON : SM_CYICON);
+
+    if (*target == NULL) {
+        *target = (HICON)LoadImageA(
+            GetModuleHandleA(NULL),
+            MAKEINTRESOURCEA(APP_ICON_RESOURCE_ID),
+            IMAGE_ICON,
+            width,
+            height,
+            LR_DEFAULTCOLOR
+        );
+    }
+
+    return *target;
+}
+
+/* Applies the app's large and small icons so caption bars and task switching
+   use the bundled emulator icon on each top-level window. */
+static void app_apply_window_icons(HWND hwnd) {
+    HICON large_icon;
+    HICON small_icon;
+
+    if (hwnd == NULL) {
+        return;
+    }
+
+    large_icon = app_get_window_icon(false);
+    small_icon = app_get_window_icon(true);
+    if (large_icon != NULL) {
+        SendMessageA(hwnd, WM_SETICON, ICON_BIG, (LPARAM)large_icon);
+    }
+    if (small_icon != NULL) {
+        SendMessageA(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)small_icon);
+    }
+}
+
 /* Creates or focuses the debugger tool window from the Tools menu. */
 static void app_open_debugger_window(AppState *app) {
     if (app->debug.debugger_hwnd != NULL) {
@@ -4646,6 +4693,7 @@ static void app_open_debugger_window(AppState *app) {
         GetModuleHandleA(NULL),
         app
     );
+    app_apply_window_icons(app->debug.debugger_hwnd);
 }
 
 /* Creates or focuses the assembler tool window from the Tools menu. */
@@ -4674,6 +4722,7 @@ static void app_open_assembler_window(AppState *app) {
         GetModuleHandleA(NULL),
         app
     );
+    app_apply_window_icons(app->debug.assembler_hwnd);
     app_assembler_update_title(app);
     if (app_assembler_load_last_path(path, sizeof(path))) {
         if (app_assembler_load_source_path(path, app, status, sizeof(status))) {
@@ -6330,6 +6379,74 @@ static void app_assembler_choose_font(HWND hwnd, AppState *app) {
     app_assembler_set_status(app, "Assembler font updated.");
 }
 
+/* Finds the first assembler comment marker in a text range while respecting
+   single- and double-quoted string literals. */
+static const char *app_find_comment_start(const char *start, const char *end) {
+    bool in_single = false;
+    bool in_double = false;
+
+    for (const char *cursor = start; cursor < end; ++cursor) {
+        if (*cursor == '\'' && !in_double) {
+            in_single = !in_single;
+        } else if (*cursor == '"' && !in_single) {
+            in_double = !in_double;
+        } else if (*cursor == ';' && !in_single && !in_double) {
+            return cursor;
+        }
+    }
+
+    return NULL;
+}
+
+/* Appends a comment while normalizing its prefix to `; ` when text follows. */
+static bool app_append_formatted_comment(
+    char **formatted,
+    size_t *capacity,
+    size_t *used,
+    const char *comment_start,
+    const char *comment_end
+) {
+    const char *comment_text_start;
+    size_t required;
+    char *resized;
+
+    if (
+        formatted == NULL || *formatted == NULL ||
+        capacity == NULL || used == NULL ||
+        comment_start == NULL || comment_end == NULL ||
+        comment_start >= comment_end || *comment_start != ';'
+    ) {
+        return false;
+    }
+
+    comment_text_start = comment_start + 1;
+    while (comment_text_start < comment_end && isspace((unsigned char)*comment_text_start)) {
+        comment_text_start++;
+    }
+
+    required = 1;
+    if (comment_text_start < comment_end) {
+        required += 1 + (size_t)(comment_end - comment_text_start);
+    }
+    if (*used + required + 1 >= *capacity) {
+        *capacity = *capacity + required + 256;
+        resized = (char *)realloc(*formatted, *capacity);
+        if (resized == NULL) {
+            return false;
+        }
+        *formatted = resized;
+    }
+
+    (*formatted)[(*used)++] = ';';
+    if (comment_text_start < comment_end) {
+        (*formatted)[(*used)++] = ' ';
+        memcpy(*formatted + *used, comment_text_start, (size_t)(comment_end - comment_text_start));
+        *used += (size_t)(comment_end - comment_text_start);
+    }
+
+    return true;
+}
+
 static bool app_assembler_format_source_text(const char *source, char **formatted_output) {
     size_t source_length;
     size_t capacity;
@@ -6403,7 +6520,7 @@ static bool app_assembler_format_source_text(const char *source, char **formatte
 
             if (has_label) {
                 size_t line_length = (size_t)(trimmed_end - trimmed_start);
-                if (used + line_length + 4 >= capacity) {
+                if (used + line_length + 7 >= capacity) {
                     capacity = capacity + line_length + 256;
                     formatted = (char *)realloc(formatted, capacity);
                     if (formatted == NULL) {
@@ -6413,22 +6530,62 @@ static bool app_assembler_format_source_text(const char *source, char **formatte
                 memcpy(formatted + used, trimmed_start, (size_t)(label_end - trimmed_start));
                 used += (size_t)(label_end - trimmed_start);
                 if (body_start < body_end) {
-                    formatted[used++] = '\t';
-                    memcpy(formatted + used, body_start, (size_t)(body_end - body_start));
-                    used += (size_t)(body_end - body_start);
+                    const char *comment_start = app_find_comment_start(body_start, body_end);
+                    const char *code_end = comment_start != NULL ? comment_start : body_end;
+
+                    while (code_end > body_start && isspace((unsigned char)code_end[-1])) {
+                        code_end--;
+                    }
+                    formatted[used++] = '\r';
+                    formatted[used++] = '\n';
+                    if (comment_start == NULL || comment_start > body_start) {
+                        formatted[used++] = '\t';
+                    }
+                    if (code_end > body_start) {
+                        memcpy(formatted + used, body_start, (size_t)(code_end - body_start));
+                        used += (size_t)(code_end - body_start);
+                    }
+                    if (comment_start != NULL) {
+                        if (code_end > body_start) {
+                            formatted[used++] = '\t';
+                        }
+                        if (!app_append_formatted_comment(&formatted, &capacity, &used, comment_start, body_end)) {
+                            free(formatted);
+                            return false;
+                        }
+                    }
                 }
             } else {
                 size_t line_length = (size_t)(trimmed_end - trimmed_start);
-                if (used + line_length + 4 >= capacity) {
+                const char *comment_start = app_find_comment_start(trimmed_start, trimmed_end);
+                const char *code_end = comment_start != NULL ? comment_start : trimmed_end;
+
+                while (code_end > trimmed_start && isspace((unsigned char)code_end[-1])) {
+                    code_end--;
+                }
+                if (used + line_length + 5 >= capacity) {
                     capacity = capacity + line_length + 256;
                     formatted = (char *)realloc(formatted, capacity);
                     if (formatted == NULL) {
                         return false;
                     }
                 }
-                formatted[used++] = '\t';
-                memcpy(formatted + used, trimmed_start, line_length);
-                used += line_length;
+                if (comment_start == NULL || comment_start > trimmed_start) {
+                    formatted[used++] = '\t';
+                }
+                if (code_end > trimmed_start) {
+                    memcpy(formatted + used, trimmed_start, (size_t)(code_end - trimmed_start));
+                    used += (size_t)(code_end - trimmed_start);
+                }
+                if (comment_start != NULL) {
+                    if (code_end > trimmed_start) {
+                        formatted[used++] = '\t';
+                    }
+                    if (!app_append_formatted_comment(&formatted, &capacity, &used, comment_start, trimmed_end)) {
+                        free(formatted);
+                        return false;
+                    }
+                }
             }
         }
 
@@ -7591,6 +7748,7 @@ int main(int argc, char **argv) {
         instance,
         &app
     );
+    app_apply_window_icons(hwnd);
     if (hwnd == NULL) {
         fprintf(stderr, "CreateWindowEx failed.\n");
         app_show_error("CreateWindowEx failed.");
