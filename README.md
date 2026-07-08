@@ -83,6 +83,7 @@ With no arguments, the emulator looks for `128.rom` in `.\src` first and starts 
 - `Machine -> 48K` / `Machine -> 128K` rebuilds the emulator for that model and remembers the choice between runs
 - `Tools -> Assembler...` opens a small RAM patching assembler with support for common Z80 instructions plus `ORG`, `DB`, `DW`, `DS`/`DEFS`, `INCBIN`, `INCLUDE`, and TAP export
 - `Tools -> Debugger...` opens a separate debugger window with pause, run, single-step, register state, and memory/disassembly views
+- `Tools -> Poke...` opens a small RAM poke tool for writing one or more byte values directly to memory
 
 ## Assembler Notes
 

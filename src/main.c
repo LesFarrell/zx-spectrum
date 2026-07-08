@@ -46,6 +46,7 @@ enum {
     APP_MENU_FILE_AUTOLOAD_TAPES = 1006,
     APP_MENU_TOOLS_ASSEMBLER = 1301,
     APP_MENU_TOOLS_DEBUGGER = 1302,
+    APP_MENU_TOOLS_POKE = 1303,
     APP_MENU_MACHINE_48K = 1201,
     APP_MENU_MACHINE_128K = 1202,
     APP_CTRL_DEBUG_TEXT = 2001,
@@ -73,6 +74,10 @@ enum {
     APP_CTRL_ASM_LOAD = 2106,
     APP_CTRL_ASM_SAVE = 2107,
     APP_CTRL_ASM_LINES = 2108,
+    APP_CTRL_POKE_ADDRESS = 2110,
+    APP_CTRL_POKE_VALUES = 2111,
+    APP_CTRL_POKE_APPLY = 2112,
+    APP_CTRL_POKE_STATUS = 2113,
     APP_MENU_ASM_FILE_NEW = 2200,
     APP_MENU_ASM_FILE_LOAD = 2201,
     APP_MENU_ASM_FILE_RELOAD = 2202,
@@ -90,6 +95,7 @@ enum {
     APP_MENU_ASM_EDIT_UPPERCASE = 2218,
     APP_MENU_ASM_BUILD_ASSEMBLE = 2221,
     APP_MENU_ASM_HELP_SHOW = 2231,
+    APP_MENU_DEBUG_HELP_SHOW = 2241,
     APP_TIMER_MODAL_LOOP = 3001,
     APP_TIMER_ASM_FILE_WATCH = 3002,
     APP_MSG_TAPE_LOAD_COMPLETE = WM_APP + 1,
@@ -177,6 +183,9 @@ typedef struct DebugState {
     HWND debugger_page_up_button;
     HWND debugger_page_down_button;
     HWND debugger_points_list;
+    HBRUSH debugger_background_brush;
+    HBRUSH debugger_surface_brush;
+    HBRUSH debugger_input_brush;
     HACCEL debugger_accel;
     WNDPROC debugger_address_edit_wndproc;
     WNDPROC debugger_points_list_wndproc;
@@ -188,6 +197,12 @@ typedef struct DebugState {
     HWND assembler_help_button;
     HWND assembler_load_button;
     HWND assembler_save_button;
+    HWND poke_hwnd;
+    HWND poke_address_edit;
+    HWND poke_values_edit;
+    HWND poke_apply_button;
+    HBRUSH poke_background_brush;
+    HBRUSH poke_input_brush;
     HBRUSH assembler_source_brush;
     HFONT assembler_font;
     WNDPROC assembler_source_wndproc;
@@ -381,6 +396,8 @@ static void app_debug_view_sp(AppState *app);
 static void app_debug_run_to_address(AppState *app, uint16_t address);
 static void app_debug_run_frame(AppState *app);
 static void app_debug_run_from_address(AppState *app, uint16_t address);
+static HMENU app_create_debugger_menu(void);
+static void app_show_debugger_help(HWND hwnd);
 static HMENU app_create_assembler_menu(void);
 static void app_save_model(SpectrumModel model);
 static void app_save_tape_autoload(bool enabled);
@@ -388,11 +405,16 @@ static void app_update_model_menu(HWND hwnd, SpectrumModel model);
 static void app_audio_callback(const float *samples, int num_samples, void *user_data);
 static void app_debug_refresh_window(AppState *app);
 static void app_assembler_refresh_window(AppState *app);
+static void app_poke_refresh_window(AppState *app);
 static void app_debug_machine_changed(AppState *app);
 static bool app_register_tool_window_classes(HINSTANCE instance);
 static void app_open_debugger_window(AppState *app);
 static void app_open_assembler_window(AppState *app);
+static void app_open_poke_window(AppState *app);
 static void app_show_assembler_help(HWND hwnd);
+static void app_poke_set_status(AppState *app, const char *text);
+static void app_poke_layout_controls(AppState *app, HWND hwnd);
+static void app_poke_apply_values(HWND hwnd, AppState *app);
 static void app_assembler_set_status(AppState *app, const char *text);
 static void app_assembler_update_title(AppState *app);
 static void app_assembler_set_current_path(AppState *app, const char *path);
@@ -470,6 +492,7 @@ static void app_assembler_sync_error_from_status(AppState *app, const char *stat
 static void app_assembler_update_line_numbers(AppState *app);
 static LRESULT CALLBACK app_debugger_address_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
 static LRESULT CALLBACK app_debugger_points_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
+static LRESULT CALLBACK app_poke_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
 static LRESULT CALLBACK app_assembler_gutter_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
 static LRESULT CALLBACK app_assembler_source_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
 static HICON app_get_window_icon(bool small);
@@ -516,6 +539,7 @@ static HMENU app_create_menu(void) {
     AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_128K, "&128K\tCtrl+2");
     AppendMenuA(tools_menu, MF_STRING, APP_MENU_TOOLS_ASSEMBLER, "&Assembler...\tCtrl+Shift+A");
     AppendMenuA(tools_menu, MF_STRING, APP_MENU_TOOLS_DEBUGGER, "&Debugger...\tCtrl+Shift+D");
+    AppendMenuA(tools_menu, MF_STRING, APP_MENU_TOOLS_POKE, "&Poke...\tCtrl+Shift+P");
     AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)file_menu, "&File");
     AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)tape_menu, "&Tape");
     AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)machine_menu, "&Machine");
@@ -552,6 +576,27 @@ static const char *app_model_settings_value(SpectrumModel model) {
 
 static const char *app_tape_autoload_settings_value(bool enabled) {
     return enabled ? "1" : "0";
+}
+
+/* Creates a minimal menu for the debugger window so its help text stays
+   discoverable without relying on memorized shortcuts. */
+static HMENU app_create_debugger_menu(void) {
+    HMENU menu_bar = CreateMenu();
+    HMENU help_menu = CreatePopupMenu();
+
+    if (menu_bar == NULL || help_menu == NULL) {
+        if (help_menu != NULL) {
+            DestroyMenu(help_menu);
+        }
+        if (menu_bar != NULL) {
+            DestroyMenu(menu_bar);
+        }
+        return NULL;
+    }
+
+    AppendMenuA(help_menu, MF_STRING, APP_MENU_DEBUG_HELP_SHOW, "Debugger &Help\tF1");
+    AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)help_menu, "&Help");
+    return menu_bar;
 }
 
 static void app_default_assembler_logfont(LOGFONTA *font) {
@@ -1638,7 +1683,7 @@ static void app_debug_refresh_window(AppState *app) {
         buffer,
         buffer_size,
         &used,
-        "Shortcuts: F5 Run/Pause  F9 Toggle BP  F10 Step Over  F11 Step  Ctrl+W Toggle WP  Ctrl+T Run To\r\n"
+        "Shortcuts: F1 Help  F5 Run/Pause  F9 Toggle BP  F10 Step Over  F11 Step  Ctrl+W Toggle WP  Ctrl+T Run To\r\n"
     );
     app_append_textf(
         buffer,
@@ -2037,6 +2082,7 @@ static void app_debug_machine_changed(AppState *app) {
     app_debug_sync_view_controls(app);
     app_debug_refresh_window(app);
     app_assembler_refresh_window(app);
+    app_poke_refresh_window(app);
 }
 
 /* Strict operand reader for assembly syntax checks. Returns 1 when an operand
@@ -4445,6 +4491,183 @@ static LRESULT CALLBACK app_debugger_points_wndproc(HWND hwnd, UINT msg, WPARAM 
     return CallWindowProcA(old_proc, hwnd, msg, wparam, lparam);
 }
 
+/* Hosts the compact poke tool used for direct RAM writes without writing
+   assembler source. */
+static LRESULT CALLBACK app_poke_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    AppState *app = (AppState *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
+
+    switch (msg) {
+        case WM_NCCREATE: {
+            CREATESTRUCTA *create = (CREATESTRUCTA *)lparam;
+            SetWindowLongPtrA(hwnd, GWLP_USERDATA, (LONG_PTR)create->lpCreateParams);
+            return TRUE;
+        }
+        case WM_CREATE: {
+            HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+            app->debug.poke_background_brush = CreateSolidBrush(RGB(223, 229, 238));
+            app->debug.poke_input_brush = CreateSolidBrush(RGB(248, 250, 252));
+
+            CreateWindowExA(0, "STATIC", "Address:", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)1, NULL, NULL);
+            app->debug.poke_address_edit = CreateWindowExA(
+                WS_EX_CLIENTEDGE,
+                "EDIT",
+                "",
+                WS_CHILD | WS_VISIBLE | WS_GROUP | WS_TABSTOP | ES_LEFT | ES_AUTOHSCROLL | ES_UPPERCASE,
+                0,
+                0,
+                0,
+                0,
+                hwnd,
+                (HMENU)(INT_PTR)APP_CTRL_POKE_ADDRESS,
+                NULL,
+                NULL
+            );
+            CreateWindowExA(0, "STATIC", "Values:", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)2, NULL, NULL);
+            app->debug.poke_values_edit = CreateWindowExA(
+                WS_EX_CLIENTEDGE,
+                "EDIT",
+                "",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_LEFT | ES_AUTOHSCROLL | ES_WANTRETURN,
+                0,
+                0,
+                0,
+                0,
+                hwnd,
+                (HMENU)(INT_PTR)APP_CTRL_POKE_VALUES,
+                NULL,
+                NULL
+            );
+            app->debug.poke_apply_button = CreateWindowExA(
+                0,
+                "BUTTON",
+                "Apply",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                0,
+                0,
+                0,
+                0,
+                hwnd,
+                (HMENU)(INT_PTR)APP_CTRL_POKE_APPLY,
+                NULL,
+                NULL
+            );
+
+            SendMessageA(app->debug.poke_address_edit, EM_SETLIMITTEXT, 15, 0);
+            SendMessageA(app->debug.poke_values_edit, EM_SETLIMITTEXT, 2047, 0);
+            SendMessageA(app->debug.poke_address_edit, WM_SETFONT, (WPARAM)font, TRUE);
+            SendMessageA(app->debug.poke_values_edit, WM_SETFONT, (WPARAM)font, TRUE);
+            SendMessageA(app->debug.poke_apply_button, WM_SETFONT, (WPARAM)font, TRUE);
+            app_poke_layout_controls(app, hwnd);
+            app_poke_refresh_window(app);
+            return 0;
+        }
+        case WM_SIZE:
+            if (app != NULL) {
+                app_poke_layout_controls(app, hwnd);
+            }
+            return 0;
+        case WM_ENTERSIZEMOVE:
+            app_set_modal_loop_timer(app, hwnd, true);
+            return 0;
+        case WM_EXITSIZEMOVE:
+            app_set_modal_loop_timer(app, hwnd, false);
+            return 0;
+        case WM_TIMER:
+            if (app != NULL && wparam == APP_TIMER_MODAL_LOOP) {
+                app_tick_emulator(app);
+                return 0;
+            }
+            break;
+        case WM_ERASEBKGND:
+            if (app != NULL && app->debug.poke_background_brush != NULL) {
+                RECT rect;
+                GetClientRect(hwnd, &rect);
+                FillRect((HDC)wparam, &rect, app->debug.poke_background_brush);
+                return 1;
+            }
+            break;
+        case WM_CTLCOLOREDIT:
+            if (app != NULL &&
+                (((HWND)lparam == app->debug.poke_address_edit) ||
+                 ((HWND)lparam == app->debug.poke_values_edit))) {
+                HDC hdc = (HDC)wparam;
+                SetTextColor(hdc, RGB(25, 38, 52));
+                SetBkColor(hdc, RGB(248, 250, 252));
+                return (LRESULT)(app->debug.poke_input_brush != NULL
+                    ? app->debug.poke_input_brush
+                    : GetSysColorBrush(COLOR_WINDOW));
+            }
+            break;
+        case WM_CTLCOLORSTATIC:
+            if (app != NULL) {
+                HDC hdc = (HDC)wparam;
+                SetTextColor(hdc, RGB(37, 52, 70));
+                SetBkColor(hdc, RGB(223, 229, 238));
+                SetBkMode(hdc, TRANSPARENT);
+                return (LRESULT)(app->debug.poke_background_brush != NULL
+                    ? app->debug.poke_background_brush
+                    : GetSysColorBrush(COLOR_WINDOW));
+            }
+            break;
+        case WM_CTLCOLORBTN:
+            if (app != NULL) {
+                HDC hdc = (HDC)wparam;
+                SetTextColor(hdc, RGB(25, 38, 52));
+                SetBkColor(hdc, RGB(223, 229, 238));
+                return (LRESULT)(app->debug.poke_background_brush != NULL
+                    ? app->debug.poke_background_brush
+                    : GetSysColorBrush(COLOR_BTNFACE));
+            }
+            break;
+        case WM_COMMAND:
+            if (app == NULL) {
+                break;
+            }
+            if (LOWORD(wparam) == APP_CTRL_POKE_APPLY) {
+                app_poke_apply_values(hwnd, app);
+                return 0;
+            }
+            if ((LOWORD(wparam) == APP_CTRL_POKE_ADDRESS || LOWORD(wparam) == APP_CTRL_POKE_VALUES) &&
+                HIWORD(wparam) == EN_UPDATE) {
+                app_poke_set_status(app, "");
+                return 0;
+            }
+            break;
+        case WM_CLOSE:
+            DestroyWindow(hwnd);
+            return 0;
+        case WM_DESTROY:
+            if (app != NULL) {
+                app_set_modal_loop_timer(app, hwnd, false);
+                if (app->debug.poke_background_brush != NULL) {
+                    DeleteObject(app->debug.poke_background_brush);
+                    app->debug.poke_background_brush = NULL;
+                }
+                if (app->debug.poke_input_brush != NULL) {
+                    DeleteObject(app->debug.poke_input_brush);
+                    app->debug.poke_input_brush = NULL;
+                }
+                app->debug.poke_hwnd = NULL;
+                app->debug.poke_address_edit = NULL;
+                app->debug.poke_values_edit = NULL;
+                app->debug.poke_apply_button = NULL;
+            }
+            return 0;
+        default:
+            break;
+    }
+
+    if (msg == WM_KEYDOWN && (UINT)wparam == VK_RETURN && app != NULL) {
+        HWND focus = GetFocus();
+        if (focus == app->debug.poke_address_edit || focus == app->debug.poke_values_edit) {
+            app_poke_apply_values(hwnd, app);
+            return 0;
+        }
+    }
+
+    return DefWindowProcA(hwnd, msg, wparam, lparam);
+}
+
 /* Hosts the modeless debugger window with pause/run/step controls and a live
    register plus memory snapshot view. */
 static LRESULT CALLBACK app_debugger_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
@@ -4458,6 +4681,7 @@ static LRESULT CALLBACK app_debugger_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
         }
         case WM_CREATE: {
             static const ACCEL debugger_accels[] = {
+                {FVIRTKEY, VK_F1, APP_MENU_DEBUG_HELP_SHOW},
                 {FVIRTKEY, VK_F5, APP_CTRL_DEBUG_PAUSE},
                 {FVIRTKEY, VK_F9, APP_CTRL_DEBUG_BREAKPOINT_TOGGLE},
                 {FVIRTKEY, VK_F10, APP_CTRL_DEBUG_STEP_OVER},
@@ -4472,6 +4696,14 @@ static LRESULT CALLBACK app_debugger_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
                 {FVIRTKEY, VK_NEXT, APP_CTRL_DEBUG_PAGE_DOWN}
             };
             HFONT font = (HFONT)GetStockObject(ANSI_FIXED_FONT);
+            HMENU menu = app_create_debugger_menu();
+            app->debug.debugger_background_brush = CreateSolidBrush(RGB(223, 229, 238));
+            app->debug.debugger_surface_brush = CreateSolidBrush(RGB(239, 243, 248));
+            app->debug.debugger_input_brush = CreateSolidBrush(RGB(248, 250, 252));
+            if (menu != NULL) {
+                SetMenu(hwnd, menu);
+                DrawMenuBar(hwnd);
+            }
             app->debug.debugger_pause_button = CreateWindowExA(0, "BUTTON", "Pause", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)APP_CTRL_DEBUG_PAUSE, NULL, NULL);
             app->debug.debugger_step_button = CreateWindowExA(0, "BUTTON", "Step", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)APP_CTRL_DEBUG_STEP, NULL, NULL);
             app->debug.debugger_step_over_button = CreateWindowExA(0, "BUTTON", "Step Over", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)APP_CTRL_DEBUG_STEP_OVER, NULL, NULL);
@@ -4683,11 +4915,80 @@ static LRESULT CALLBACK app_debugger_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
                 return 0;
             }
             break;
+        case WM_ERASEBKGND:
+            if (app != NULL && app->debug.debugger_background_brush != NULL) {
+                RECT rect;
+                GetClientRect(hwnd, &rect);
+                FillRect((HDC)wparam, &rect, app->debug.debugger_background_brush);
+                return 1;
+            }
+            break;
+        case WM_CTLCOLOREDIT:
+            if (app != NULL) {
+                HDC hdc = (HDC)wparam;
+                HWND control = (HWND)lparam;
+
+                if (control == app->debug.debugger_address_edit) {
+                    SetTextColor(hdc, RGB(25, 38, 52));
+                    SetBkColor(hdc, RGB(248, 250, 252));
+                    return (LRESULT)(app->debug.debugger_input_brush != NULL
+                        ? app->debug.debugger_input_brush
+                        : GetSysColorBrush(COLOR_WINDOW));
+                }
+            }
+            break;
+        case WM_CTLCOLORLISTBOX:
+            if (app != NULL) {
+                HDC hdc = (HDC)wparam;
+                HWND control = (HWND)lparam;
+
+                if (control == app->debug.debugger_points_list) {
+                    SetTextColor(hdc, RGB(25, 38, 52));
+                    SetBkColor(hdc, RGB(248, 250, 252));
+                    return (LRESULT)(app->debug.debugger_input_brush != NULL
+                        ? app->debug.debugger_input_brush
+                        : GetSysColorBrush(COLOR_WINDOW));
+                }
+            }
+            break;
+        case WM_CTLCOLORSTATIC:
+            if (app != NULL) {
+                HDC hdc = (HDC)wparam;
+                HWND control = (HWND)lparam;
+
+                if (control == app->debug.debugger_text) {
+                    SetTextColor(hdc, RGB(25, 38, 52));
+                    SetBkColor(hdc, RGB(239, 243, 248));
+                    return (LRESULT)(app->debug.debugger_surface_brush != NULL
+                        ? app->debug.debugger_surface_brush
+                        : GetSysColorBrush(COLOR_WINDOW));
+                }
+                SetTextColor(hdc, RGB(37, 52, 70));
+                SetBkColor(hdc, RGB(223, 229, 238));
+                SetBkMode(hdc, TRANSPARENT);
+                return (LRESULT)(app->debug.debugger_background_brush != NULL
+                    ? app->debug.debugger_background_brush
+                    : GetSysColorBrush(COLOR_WINDOW));
+            }
+            break;
+        case WM_CTLCOLORBTN:
+            if (app != NULL) {
+                HDC hdc = (HDC)wparam;
+                SetTextColor(hdc, RGB(25, 38, 52));
+                SetBkColor(hdc, RGB(223, 229, 238));
+                return (LRESULT)(app->debug.debugger_background_brush != NULL
+                    ? app->debug.debugger_background_brush
+                    : GetSysColorBrush(COLOR_BTNFACE));
+            }
+            break;
         case WM_COMMAND:
             if (app == NULL) {
                 break;
             }
             switch (LOWORD(wparam)) {
+                case APP_MENU_DEBUG_HELP_SHOW:
+                    app_show_debugger_help(hwnd);
+                    return 0;
                 case APP_CTRL_DEBUG_PAUSE:
                     if (!app->spec.machine_ready) {
                         return 0;
@@ -4878,6 +5179,18 @@ static LRESULT CALLBACK app_debugger_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
         case WM_DESTROY:
             if (app != NULL) {
                 app_set_modal_loop_timer(app, hwnd, false);
+                if (app->debug.debugger_background_brush != NULL) {
+                    DeleteObject(app->debug.debugger_background_brush);
+                    app->debug.debugger_background_brush = NULL;
+                }
+                if (app->debug.debugger_surface_brush != NULL) {
+                    DeleteObject(app->debug.debugger_surface_brush);
+                    app->debug.debugger_surface_brush = NULL;
+                }
+                if (app->debug.debugger_input_brush != NULL) {
+                    DeleteObject(app->debug.debugger_input_brush);
+                    app->debug.debugger_input_brush = NULL;
+                }
                 app->debug.paused = false;
                 app->debug.stepping = false;
                 app->debug.stop_requested = false;
@@ -5167,6 +5480,16 @@ static bool app_register_tool_window_classes(HINSTANCE instance) {
     }
 
     ZeroMemory(&wc, sizeof(wc));
+    wc.lpfnWndProc = app_poke_wndproc;
+    wc.hInstance = instance;
+    wc.lpszClassName = "ZXSpecPokeWindow";
+    wc.hCursor = LoadCursorA(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    if (RegisterClassA(&wc) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        return false;
+    }
+
+    ZeroMemory(&wc, sizeof(wc));
     wc.lpfnWndProc = app_assembler_wndproc;
     wc.hInstance = instance;
     wc.lpszClassName = "ZXSpecAssemblerWindow";
@@ -5258,6 +5581,32 @@ static void app_open_debugger_window(AppState *app) {
     app_apply_window_icons(app->debug.debugger_hwnd);
 }
 
+/* Creates or focuses the simple memory poke tool used for direct RAM edits. */
+static void app_open_poke_window(AppState *app) {
+    if (app->debug.poke_hwnd != NULL) {
+        ShowWindow(app->debug.poke_hwnd, SW_SHOWNORMAL);
+        SetForegroundWindow(app->debug.poke_hwnd);
+        app_poke_refresh_window(app);
+        return;
+    }
+
+    app->debug.poke_hwnd = CreateWindowExA(
+        WS_EX_CONTROLPARENT,
+        "ZXSpecPokeWindow",
+        "Spectrum Poke",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        230,
+        135,
+        app->main_hwnd,
+        NULL,
+        GetModuleHandleA(NULL),
+        app
+    );
+    app_apply_window_icons(app->debug.poke_hwnd);
+}
+
 /* Creates or focuses the assembler tool window from the Tools menu. */
 static void app_open_assembler_window(AppState *app) {
     char path[MAX_PATH];
@@ -5293,6 +5642,235 @@ static void app_open_assembler_window(AppState *app) {
             app_assembler_set_status(app, status);
         }
     }
+}
+
+/* Summarizes the debugger controls, shortcuts, and common workflows in one
+   modal dialog so the tool can be used without reading the source. */
+static void app_show_debugger_help(HWND hwnd) {
+    MessageBoxA(
+        hwnd,
+        "Spectrum Debugger\r\n"
+        "\r\n"
+        "Execution:\r\n"
+        "  F5 Run/Pause\r\n"
+        "  F11 Step one instruction\r\n"
+        "  F10 Step over CALLs\r\n"
+        "  Refresh redraws the current register and memory view.\r\n"
+        "\r\n"
+        "Address field:\r\n"
+        "  - Enter a number then click Go or press Enter to move the view.\r\n"
+        "  - Ctrl+Enter runs until the typed address.\r\n"
+        "  - Shift+Enter starts execution from the typed address.\r\n"
+        "  - Numbers use the assembler syntax: decimal, $hex, 0xhex, H suffix, or %binary.\r\n"
+        "\r\n"
+        "Navigation:\r\n"
+        "  Ctrl+P jumps the view to PC.\r\n"
+        "  Ctrl+S jumps the view to SP.\r\n"
+        "  PgUp/PgDn pages the disassembly and memory view by 256 bytes.\r\n"
+        "  Ctrl+Home and Ctrl+End jump directly to PC and SP from the address box.\r\n"
+        "\r\n"
+        "Breakpoints and watchpoints:\r\n"
+        "  F9 toggles a breakpoint at the typed address.\r\n"
+        "  Ctrl+W toggles a write watchpoint at the typed address.\r\n"
+        "  The list on the right shows all active breakpoints and watchpoints.\r\n"
+        "  Double-click a list entry to remove it, or use Remove Sel.\r\n"
+        "\r\n"
+        "View markers:\r\n"
+        "  > marks the current PC in disassembly.\r\n"
+        "  * marks an active breakpoint.\r\n"
+        "  Recent breakpoint, run-to, and watch hits are shown at the top.\r\n"
+        "\r\n"
+        "Tips:\r\n"
+        "  - Sync PC keeps the debugger view following the live program counter.\r\n"
+        "  - Run To stops when execution reaches the typed address.\r\n"
+        "  - Run @ changes PC first, then resumes execution.\r\n",
+        "Debugger Help",
+        MB_OK | MB_ICONINFORMATION
+    );
+}
+
+/* Routes poke feedback into the window title so the tool can stay compact
+   without losing validation and success messages. */
+static void app_poke_set_status(AppState *app, const char *text) {
+    if (app == NULL || app->debug.poke_hwnd == NULL) {
+        return;
+    }
+
+    if (text == NULL || text[0] == '\0') {
+        SetWindowTextA(app->debug.poke_hwnd, "Spectrum Poke");
+        return;
+    }
+
+    SetWindowTextA(app->debug.poke_hwnd, text);
+}
+
+/* Lays out the compact poke controls inside their tool window. */
+static void app_poke_layout_controls(AppState *app, HWND hwnd) {
+    RECT rect;
+    int width;
+    const int edge = 10;
+    const int label_h = 16;
+    const int edit_h = 22;
+    const int row_gap = 28;
+    const int button_y = 64;
+    const int button_h = 24;
+    const int button_w = 96;
+
+    if (app == NULL || hwnd == NULL || app->debug.poke_address_edit == NULL || app->debug.poke_values_edit == NULL) {
+        return;
+    }
+
+    GetClientRect(hwnd, &rect);
+    width = rect.right - rect.left;
+
+    MoveWindow(GetDlgItem(hwnd, 1), edge, edge, 80, label_h, TRUE);
+    MoveWindow(app->debug.poke_address_edit, edge + 80, edge - 2, width - (edge * 2) - 80, edit_h, TRUE);
+    MoveWindow(GetDlgItem(hwnd, 2), edge, edge + row_gap, 80, label_h, TRUE);
+    MoveWindow(app->debug.poke_values_edit, edge + 80, edge + row_gap - 2, width - (edge * 2) - 80, edit_h, TRUE);
+    MoveWindow(app->debug.poke_apply_button, width - edge - button_w, button_y, button_w, button_h, TRUE);
+}
+
+/* Refreshes enabled state and default status text for the poke tool. */
+static void app_poke_refresh_window(AppState *app) {
+    BOOL ready;
+    char address_text[16];
+
+    if (app == NULL || app->debug.poke_hwnd == NULL) {
+        return;
+    }
+
+    ready = app->spec.machine_ready ? TRUE : FALSE;
+    if (app->debug.poke_address_edit != NULL) {
+        EnableWindow(app->debug.poke_address_edit, ready);
+        if (ready && GetWindowTextLengthA(app->debug.poke_address_edit) == 0) {
+            snprintf(address_text, sizeof(address_text), "%04Xh", app->spec.machine.cpu.pc);
+            SetWindowTextA(app->debug.poke_address_edit, address_text);
+        }
+    }
+    if (app->debug.poke_values_edit != NULL) {
+        EnableWindow(app->debug.poke_values_edit, ready);
+    }
+    if (app->debug.poke_apply_button != NULL) {
+        EnableWindow(app->debug.poke_apply_button, ready);
+    }
+    app_poke_set_status(app, ready
+        ? "Enter a RAM address and one or more comma-separated byte values."
+        : "Poke is unavailable until a machine is ready.");
+}
+
+/* Parses the poke fields and writes one or more bytes into Spectrum RAM. */
+static void app_poke_apply_values(HWND hwnd, AppState *app) {
+    char address_text[64];
+    int values_length;
+    char *values_text;
+    char *cursor;
+    char operand[128];
+    uint8_t *bytes = NULL;
+    size_t count = 0;
+    size_t capacity = 0;
+    int address_value;
+    int operand_result;
+    uint16_t address;
+    char status[512];
+
+    if (app == NULL || !app->spec.machine_ready) {
+        app_poke_set_status(app, "Poke is unavailable until a machine is ready.");
+        return;
+    }
+    if (app->debug.poke_address_edit == NULL || app->debug.poke_values_edit == NULL) {
+        app_poke_set_status(app, "Poke controls are not ready.");
+        return;
+    }
+
+    GetWindowTextA(app->debug.poke_address_edit, address_text, (int)sizeof(address_text));
+    if (!app_parse_number(address_text, &address_value) || address_value < 0x4000 || address_value > 0xFFFF) {
+        snprintf(status, sizeof(status), "Invalid RAM address: %s", address_text);
+        app_poke_set_status(app, status);
+        SetFocus(app->debug.poke_address_edit);
+        return;
+    }
+    address = (uint16_t)address_value;
+
+    values_length = GetWindowTextLengthA(app->debug.poke_values_edit);
+    if (values_length <= 0) {
+        app_poke_set_status(app, "Enter one or more byte values first.");
+        SetFocus(app->debug.poke_values_edit);
+        return;
+    }
+
+    values_text = (char *)malloc((size_t)values_length + 1);
+    if (values_text == NULL) {
+        app_poke_set_status(app, "Out of memory.");
+        return;
+    }
+    GetWindowTextA(app->debug.poke_values_edit, values_text, values_length + 1);
+    cursor = values_text;
+
+    while ((operand_result = app_read_operand_strict(&cursor, operand, sizeof(operand), status, sizeof(status))) > 0) {
+        int byte_value;
+        uint8_t *new_bytes;
+
+        if (!app_parse_number(operand, &byte_value) || byte_value < 0 || byte_value > 0xFF) {
+            snprintf(status, sizeof(status), "Invalid byte value: %s", operand);
+            free(bytes);
+            free(values_text);
+            app_poke_set_status(app, status);
+            SetFocus(app->debug.poke_values_edit);
+            return;
+        }
+        if (count + 1 > capacity) {
+            size_t new_capacity = capacity == 0 ? 16 : capacity * 2;
+            new_bytes = (uint8_t *)realloc(bytes, new_capacity);
+            if (new_bytes == NULL) {
+                free(bytes);
+                free(values_text);
+                app_poke_set_status(app, "Out of memory.");
+                return;
+            }
+            bytes = new_bytes;
+            capacity = new_capacity;
+        }
+        bytes[count++] = (uint8_t)byte_value;
+    }
+
+    if (operand_result < 0) {
+        free(bytes);
+        free(values_text);
+        app_poke_set_status(app, status);
+        SetFocus(app->debug.poke_values_edit);
+        return;
+    }
+    if (count == 0) {
+        free(values_text);
+        app_poke_set_status(app, "Enter one or more byte values first.");
+        SetFocus(app->debug.poke_values_edit);
+        return;
+    }
+    if ((size_t)address + count > 0x10000u) {
+        free(bytes);
+        free(values_text);
+        app_poke_set_status(app, "Poke values run past FFFFh.");
+        SetFocus(app->debug.poke_values_edit);
+        return;
+    }
+
+    mem_write_range(&app->spec.machine.mem, address, bytes, (uint32_t)count);
+    InvalidateRect(app->main_hwnd, NULL, FALSE);
+    app_debug_refresh_window(app);
+    snprintf(
+        status,
+        sizeof(status),
+        "Poked %zu byte%s at %04Xh.",
+        count,
+        count == 1 ? "" : "s",
+        address
+    );
+    app_poke_set_status(app, status);
+    SetFocus(app->debug.poke_values_edit);
+
+    free(bytes);
+    free(values_text);
+    (void)hwnd;
 }
 
 /* Shows a concise summary of the built-in assembler's supported directives,
@@ -6649,6 +7227,9 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                         case 'D':
                             app_open_debugger_window(app);
                             return 0;
+                        case 'P':
+                            app_open_poke_window(app);
+                            return 0;
                         default:
                             break;
                     }
@@ -6825,6 +7406,9 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                         return 0;
                     case APP_MENU_TOOLS_DEBUGGER:
                         app_open_debugger_window(app);
+                        return 0;
+                    case APP_MENU_TOOLS_POKE:
+                        app_open_poke_window(app);
                         return 0;
                     case APP_MENU_FILE_EXIT:
                         SendMessageA(hwnd, WM_CLOSE, 0, 0);
@@ -8583,6 +9167,13 @@ int main(int argc, char **argv) {
                 app.debug.debugger_accel != NULL &&
                 (msg.hwnd == app.debug.debugger_hwnd || IsChild(app.debug.debugger_hwnd, msg.hwnd)) &&
                 TranslateAcceleratorA(app.debug.debugger_hwnd, app.debug.debugger_accel, &msg)) {
+                continue;
+            }
+            if (app.debug.poke_hwnd != NULL &&
+                (msg.hwnd == app.debug.poke_hwnd || IsChild(app.debug.poke_hwnd, msg.hwnd)) &&
+                msg.message == WM_KEYDOWN &&
+                msg.wParam == VK_TAB &&
+                IsDialogMessageA(app.debug.poke_hwnd, &msg)) {
                 continue;
             }
             TranslateMessage(&msg);
