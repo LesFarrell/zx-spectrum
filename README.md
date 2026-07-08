@@ -81,13 +81,20 @@ With no arguments, the emulator looks for `128.rom` in `.\src` first and starts 
 - `File -> Reset` resets the active machine
 - `File -> Exit` closes the emulator
 - `Machine -> 48K` / `Machine -> 128K` rebuilds the emulator for that model and remembers the choice between runs
-- `Tools -> Assembler...` opens a small RAM patching assembler with support for common Z80 instructions plus `ORG`, `DB`, `DW`, and `INCLUDE`
+- `Tools -> Assembler...` opens a small RAM patching assembler with support for common Z80 instructions plus `ORG`, `DB`, `DW`, `DS`/`DEFS`, `INCBIN`, `INCLUDE`, and TAP export
 - `Tools -> Debugger...` opens a separate debugger window with pause, run, single-step, register state, and memory/disassembly views
 
 ## Assembler Notes
 
 - The built-in assembler is intentionally small: it supports labels, `EQU` constants, and a practical subset of Z80 mnemonics, not a full macro assembler
 - `File -> New` clears the current source after prompting to save when needed
+- The current assembler file is watched for external edits and prompts to reload automatically
+- `File -> Reload`, `Ctrl+R`, or `F5` reloads the current assembler file manually; dirty in-editor changes must be discarded first
+- `DS count[, fill]` is an alias for `DEFS`
+- `DEFS count[, fill]` emits repeated bytes into RAM and advances the assembly address; omitted `fill` defaults to `0`
+- `INCBIN "file.bin"` copies raw binary data into RAM at the current assembly address
+- `Export TAP...` writes the assembled output as one standard Spectrum `CODE` block in a `.tap` file
+- TAP export requires one contiguous assembled output range; sources that jump around with `ORG` cannot be written as a single block
 - `INCLUDE "file.asm"` expands another source file in place during assembly, so it can appear in the middle of a source file; relative paths are resolved from the current source file
 - `Ctrl+B` assembles the current source
 - `Ctrl+A`, `Ctrl+Z`, `Ctrl+X`, `Ctrl+C`, and `Ctrl+V` work like a normal text editor inside the assembler source box

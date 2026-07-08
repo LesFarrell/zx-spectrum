@@ -4,7 +4,7 @@ setlocal
 pushd "%~dp0"
 if errorlevel 1 exit /b 1
 
-zig rc /:output-format coff /fo zxspecemu-res.o resources.rc
+zig rc /:output-format coff /fo zxspectrum-res.o resources.rc
 if errorlevel 1 (
     popd
     exit /b 1
@@ -20,14 +20,14 @@ zig cc ^
     main.c ^
     spectrum.c ^
     tape.c ^
-    zxspecemu-res.o ^
+    zxspectrum-res.o ^
     -lgdi32 ^
     -lcomdlg32 ^
     -lcomctl32 ^
     -luser32 ^
     -lwinmm ^
     -Wl,/subsystem:windows ^
-    -o zxspecemu.exe
+    -o zx-spectrum.exe
 
 set "BUILD_RESULT=%errorlevel%"
 popd
