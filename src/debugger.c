@@ -1,5 +1,9 @@
 /* Split from main.c: debugger implementation. Included by main.c. */
 
+enum {
+    APP_DEBUG_DISASSEMBLY_LINE_COUNT = 64
+};
+
 static HMENU app_create_debugger_menu(void) {
     HMENU menu_bar = CreateMenu();
     HMENU help_menu = CreatePopupMenu();
@@ -882,7 +886,7 @@ static void app_debug_refresh_window(AppState *app) {
     char ascii[17];
     size_t used = 0;
     uint16_t addr;
-    uint16_t disassembly_addresses[14];
+    uint16_t disassembly_addresses[APP_DEBUG_DISASSEMBLY_LINE_COUNT];
     uint16_t memory_addresses[6];
     uint16_t stack_addresses[4];
     z80_t *cpu;
@@ -1007,7 +1011,7 @@ static void app_debug_refresh_window(AppState *app) {
     buffer[0] = '\0';
 
     addr = app->debug.debugger_view_address;
-    for (int i = 0; i < 14; ++i) {
+    for (int i = 0; i < APP_DEBUG_DISASSEMBLY_LINE_COUNT; ++i) {
         char mnemonic[128];
         char bytes[32];
         uint8_t len;
@@ -1039,7 +1043,12 @@ static void app_debug_refresh_window(AppState *app) {
         addr = (uint16_t)(addr + len);
     }
 
-    app_debug_set_disassembly(app, buffer, disassembly_addresses, 14);
+    app_debug_set_disassembly(
+        app,
+        buffer,
+        disassembly_addresses,
+        APP_DEBUG_DISASSEMBLY_LINE_COUNT
+    );
     used = 0;
     buffer[0] = '\0';
 
@@ -1426,6 +1435,9 @@ static void app_debugger_layout_controls(AppState *app, HWND hwnd) {
     GetClientRect(hwnd, &rect);
     width = rect.right - rect.left;
     height = rect.bottom - rect.top;
+    if (width < 736 || height < 320) {
+        return;
+    }
     content_width = width - 16;
     content_height = height - content_y - 8;
     top_height = content_height - memory_height - gap;
@@ -1605,10 +1617,16 @@ static LRESULT CALLBACK app_debugger_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
             return 0;
         }
         case WM_SIZE:
-            if (app != NULL && app->debug.debugger_panel != NULL) {
+            if (wparam != SIZE_MINIMIZED && app != NULL && app->debug.debugger_panel != NULL) {
                 MoveWindow(app->debug.debugger_panel, 0, 0, LOWORD(lparam), HIWORD(lparam), TRUE);
             }
             return 0;
+        case WM_GETMINMAXINFO: {
+            MINMAXINFO *limits = (MINMAXINFO *)lparam;
+            limits->ptMinTrackSize.x = 760;
+            limits->ptMinTrackSize.y = 420;
+            return 0;
+        }
         case WM_ENTERSIZEMOVE:
             app_set_modal_loop_timer(app, hwnd, true);
             return 0;
@@ -2104,9 +2122,9 @@ static void app_show_debugger_help(HWND hwnd) {
         "  Double-click a list entry to remove it, or use Remove Sel.\r\n"
         "\r\n"
         "View markers:\r\n"
-        "  > marks the current PC in disassembly.\r\n"
-        "  * marks an active breakpoint.\r\n"
-        "  Recent breakpoint, run-to, and watch hits are shown at the top.\r\n"
+        "  A blue highlighted line and arrow mark the current PC.\r\n"
+        "  A red circle marks an active breakpoint.\r\n"
+        "  Recent breakpoint, run-to, and watch hits are shown in Registers.\r\n"
         "\r\n"
         "Tips:\r\n"
         "  - Sync PC keeps the debugger view following the live program counter.\r\n"
