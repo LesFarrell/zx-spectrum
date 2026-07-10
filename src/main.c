@@ -15,6 +15,7 @@
 
 #include "spectrum.h"
 #include "tape.h"
+#include <Scintilla.h>
 
 typedef struct KeyMap {
     UINT vk;
@@ -25,6 +26,9 @@ typedef struct AppState AppState;
 typedef struct RomSet RomSet;
 typedef struct RomSelection RomSelection;
 typedef struct AssemblerBinaryOutput AssemblerBinaryOutput;
+
+/* Shared because both the debugger and assembler host Scintilla controls. */
+static HMODULE app_scintilla_module;
 
 enum {
     ZX_KEY_CAPS_SHIFT = 1,
@@ -67,17 +71,26 @@ enum {
     APP_CTRL_DEBUG_VIEW_SP = 2016,
     APP_CTRL_DEBUG_PAGE_UP = 2017,
     APP_CTRL_DEBUG_PAGE_DOWN = 2018,
+    APP_CTRL_DEBUG_REGISTERS = 2019,
+    APP_CTRL_DEBUG_MEMORY = 2020,
+    APP_CTRL_DEBUG_DISASSEMBLY_GROUP = 2021,
+    APP_CTRL_DEBUG_REGISTERS_GROUP = 2022,
+    APP_CTRL_DEBUG_MEMORY_GROUP = 2023,
+    APP_CTRL_DEBUG_POINTS_GROUP = 2024,
+    APP_CTRL_DEBUG_STACK = 2025,
+    APP_CTRL_DEBUG_STACK_GROUP = 2026,
     APP_CTRL_ASM_SOURCE = 2102,
     APP_CTRL_ASM_APPLY = 2103,
     APP_CTRL_ASM_STATUS = 2104,
     APP_CTRL_ASM_HELP = 2105,
     APP_CTRL_ASM_LOAD = 2106,
     APP_CTRL_ASM_SAVE = 2107,
-    APP_CTRL_ASM_LINES = 2108,
     APP_CTRL_POKE_ADDRESS = 2110,
     APP_CTRL_POKE_VALUES = 2111,
     APP_CTRL_POKE_APPLY = 2112,
     APP_CTRL_POKE_STATUS = 2113,
+    APP_CTRL_POKE_ADDRESS_LABEL = 2114,
+    APP_CTRL_POKE_VALUES_LABEL = 2115,
     APP_MENU_ASM_FILE_NEW = 2200,
     APP_MENU_ASM_FILE_LOAD = 2201,
     APP_MENU_ASM_FILE_RELOAD = 2202,
@@ -98,6 +111,9 @@ enum {
     APP_MENU_DEBUG_HELP_SHOW = 2241,
     APP_TIMER_MODAL_LOOP = 3001,
     APP_TIMER_ASM_FILE_WATCH = 3002,
+    APP_DIALOG_DEBUGGER = 4001,
+    APP_DIALOG_ASSEMBLER = 4002,
+    APP_DIALOG_POKE = 4003,
     APP_MSG_TAPE_LOAD_COMPLETE = WM_APP + 1,
     APP_MSG_SNAPSHOT_LOAD_COMPLETE = WM_APP + 2
 };
@@ -165,7 +181,11 @@ typedef struct ControllerState {
 
 typedef struct DebugState {
     HWND debugger_hwnd;
+    HWND debugger_panel;
     HWND debugger_text;
+    HWND debugger_registers_text;
+    HWND debugger_memory_text;
+    HWND debugger_stack_text;
     HWND debugger_pause_button;
     HWND debugger_step_button;
     HWND debugger_step_over_button;
@@ -190,14 +210,11 @@ typedef struct DebugState {
     WNDPROC debugger_address_edit_wndproc;
     WNDPROC debugger_points_list_wndproc;
     HWND assembler_hwnd;
-    HWND assembler_line_numbers;
+    HWND assembler_panel;
     HWND assembler_source;
     HWND assembler_status;
-    HWND assembler_apply_button;
-    HWND assembler_help_button;
-    HWND assembler_load_button;
-    HWND assembler_save_button;
     HWND poke_hwnd;
+    HWND poke_panel;
     HWND poke_address_edit;
     HWND poke_values_edit;
     HWND poke_apply_button;
@@ -208,6 +225,7 @@ typedef struct DebugState {
     WNDPROC assembler_source_wndproc;
     bool assembler_dirty;
     bool assembler_ignore_change;
+    bool assembler_suppress_next_char;
     bool assembler_has_file_write_time;
     bool assembler_file_change_prompt_active;
     size_t assembler_error_line;
@@ -498,7 +516,6 @@ static void app_assembler_format_location_error(
 );
 static bool app_assembler_find_source_org(const char *source, uint16_t *out_address);
 static bool app_parse_value(const AssemblerContext *ctx, const char *text, AssemblerValue *out_value);
-static HFONT app_create_monospace_font(void);
 static bool app_assembler_handle_edit_command(AppState *app, UINT command_id);
 static bool app_assembler_format_source_text(const char *source, char **formatted_output);
 static void app_assembler_format_source(HWND hwnd, AppState *app);
@@ -511,8 +528,12 @@ static void app_assembler_update_line_numbers(AppState *app);
 static LRESULT CALLBACK app_debugger_address_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
 static LRESULT CALLBACK app_debugger_points_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
 static LRESULT CALLBACK app_poke_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
-static LRESULT CALLBACK app_assembler_gutter_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
+static INT_PTR CALLBACK app_poke_dlgproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
 static LRESULT CALLBACK app_assembler_source_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
+static LRESULT CALLBACK app_debugger_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
+static INT_PTR CALLBACK app_debugger_dlgproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
+static INT_PTR CALLBACK app_assembler_dlgproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
+static LRESULT CALLBACK app_assembler_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
 static HICON app_get_window_icon(bool small);
 static void app_apply_window_icons(HWND hwnd);
 static bool app_settings_path(char *out_path, size_t out_size);
@@ -2265,24 +2286,29 @@ int main(int argc, char **argv) {
                 TranslateAcceleratorA(app.debug.debugger_hwnd, app.debug.debugger_accel, &msg)) {
                 continue;
             }
-            if (app.debug.poke_hwnd != NULL &&
-                (msg.hwnd == app.debug.poke_hwnd || IsChild(app.debug.poke_hwnd, msg.hwnd)) &&
+            if (app.debug.debugger_hwnd != NULL &&
+                app.debug.debugger_panel != NULL &&
+                (msg.hwnd == app.debug.debugger_panel || IsChild(app.debug.debugger_panel, msg.hwnd)) &&
                 msg.message == WM_KEYDOWN &&
                 msg.wParam == VK_TAB &&
-                IsDialogMessageA(app.debug.poke_hwnd, &msg)) {
+                IsDialogMessageA(app.debug.debugger_panel, &msg)) {
+                continue;
+            }
+            if (app.debug.poke_hwnd != NULL &&
+                app.debug.poke_panel != NULL &&
+                (msg.hwnd == app.debug.poke_panel || IsChild(app.debug.poke_panel, msg.hwnd)) &&
+                msg.message == WM_KEYDOWN &&
+                msg.wParam == VK_TAB &&
+                IsDialogMessageA(app.debug.poke_panel, &msg)) {
                 continue;
             }
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }
         app_tick_emulator(&app);
-        {
-            LARGE_INTEGER now;
-            QueryPerformanceCounter(&now);
-            if (((double)(now.QuadPart - app.last_tick.QuadPart) * 1000.0 / (double)app.perf_freq.QuadPart) < 20.0) {
-                Sleep(1);
-            }
-        }
+        /* Yield to Windows between timing slices, but wake immediately when
+           input or window work arrives instead of polling at full speed. */
+        MsgWaitForMultipleObjectsEx(0, NULL, 2, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
     }
 
     app_controller_shutdown(&app);

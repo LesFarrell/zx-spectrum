@@ -54,6 +54,108 @@ static uint16_t app_debug_mem_rd16(const Spectrum *spec, uint16_t addr) {
     return mem_rd16((mem_t *)&spec->machine.mem, addr);
 }
 
+/* Configures the read-only disassembly editor. Margin 0 carries real Z80
+   addresses; margin 1 carries independent PC and breakpoint markers. */
+static void app_debug_configure_disassembly(HWND editor) {
+    const COLORREF background = GetSysColor(COLOR_WINDOW);
+    const COLORREF foreground = GetSysColor(COLOR_WINDOWTEXT);
+
+    if (editor == NULL) {
+        return;
+    }
+    SendMessageA(editor, SCI_SETCODEPAGE, SC_CP_UTF8, 0);
+    SendMessageA(editor, SCI_SETEOLMODE, SC_EOL_CRLF, 0);
+    SendMessageA(editor, SCI_SETWRAPMODE, SC_WRAP_NONE, 0);
+    SendMessageA(editor, SCI_STYLESETFONT, STYLE_DEFAULT, (LPARAM)"Consolas");
+    SendMessageA(editor, SCI_STYLESETSIZE, STYLE_DEFAULT, 10);
+    SendMessageA(editor, SCI_STYLESETFORE, STYLE_DEFAULT, foreground);
+    SendMessageA(editor, SCI_STYLESETBACK, STYLE_DEFAULT, background);
+    SendMessageA(editor, SCI_STYLECLEARALL, 0, 0);
+    SendMessageA(editor, SCI_STYLESETFORE, STYLE_LINENUMBER, GetSysColor(COLOR_GRAYTEXT));
+    SendMessageA(editor, SCI_STYLESETBACK, STYLE_LINENUMBER, GetSysColor(COLOR_BTNFACE));
+    SendMessageA(editor, SCI_SETMARGINTYPEN, 0, SC_MARGIN_TEXT);
+    SendMessageA(editor, SCI_SETMARGINWIDTHN, 0,
+        SendMessageA(editor, SCI_TEXTWIDTH, STYLE_LINENUMBER, (LPARAM)" FFFF "));
+    SendMessageA(editor, SCI_SETMARGINTYPEN, 1, SC_MARGIN_SYMBOL);
+    SendMessageA(editor, SCI_SETMARGINMASKN, 1, (1u << 0) | (1u << 1));
+    SendMessageA(editor, SCI_SETMARGINWIDTHN, 1, 18);
+    SendMessageA(editor, SCI_SETMARGINWIDTHN, 2, 0);
+    SendMessageA(editor, SCI_MARKERDEFINE, 0, SC_MARK_SHORTARROW);
+    SendMessageA(editor, SCI_MARKERSETFORE, 0, RGB(32, 96, 180));
+    SendMessageA(editor, SCI_MARKERSETBACK, 0, RGB(32, 96, 180));
+    SendMessageA(editor, SCI_MARKERDEFINE, 1, SC_MARK_CIRCLE);
+    SendMessageA(editor, SCI_MARKERSETFORE, 1, RGB(190, 40, 40));
+    SendMessageA(editor, SCI_MARKERSETBACK, 1, RGB(190, 40, 40));
+    SendMessageA(editor, SCI_MARKERDEFINE, 2, SC_MARK_BACKGROUND);
+    SendMessageA(editor, SCI_MARKERSETBACK, 2, RGB(218, 232, 252));
+    SendMessageA(editor, SCI_SETCARETLINEVISIBLE, FALSE, 0);
+    SendMessageA(editor, SCI_SETREADONLY, TRUE, 0);
+}
+
+static void app_debug_set_disassembly(
+    AppState *app,
+    const char *text,
+    const uint16_t *addresses,
+    size_t address_count
+) {
+    HWND editor = app->debug.debugger_text;
+
+    if (editor == NULL) {
+        return;
+    }
+    SendMessageA(editor, SCI_SETREADONLY, FALSE, 0);
+    SendMessageA(editor, SCI_SETTEXT, 0, (LPARAM)(text != NULL ? text : ""));
+    SendMessageA(editor, SCI_SETREADONLY, TRUE, 0);
+    SendMessageA(editor, SCI_MARGINTEXTCLEARALL, 0, 0);
+    SendMessageA(editor, SCI_MARKERDELETEALL, (WPARAM)-1, 0);
+
+    for (size_t line = 0; line < address_count; ++line) {
+        char address_text[8];
+        snprintf(address_text, sizeof(address_text), "%04X", addresses[line]);
+        SendMessageA(editor, SCI_MARGINSETTEXT, (WPARAM)line, (LPARAM)address_text);
+        SendMessageA(editor, SCI_MARGINSETSTYLE, (WPARAM)line, STYLE_LINENUMBER);
+        if (app->spec.machine_ready && addresses[line] == app->spec.machine.cpu.pc) {
+            SendMessageA(editor, SCI_MARKERADD, (WPARAM)line, 0);
+            SendMessageA(editor, SCI_MARKERADD, (WPARAM)line, 2);
+        }
+        if (app_debug_has_breakpoint(app, addresses[line])) {
+            SendMessageA(editor, SCI_MARKERADD, (WPARAM)line, 1);
+        }
+    }
+}
+
+static void app_debug_configure_memory(HWND editor) {
+    app_debug_configure_disassembly(editor);
+    if (editor != NULL) {
+        SendMessageA(editor, SCI_SETMARGINWIDTHN, 1, 0);
+    }
+}
+
+static void app_debug_set_memory(
+    HWND editor,
+    const char *text,
+    const uint16_t *addresses,
+    const bool *has_address,
+    size_t line_count
+) {
+    if (editor == NULL) {
+        return;
+    }
+    SendMessageA(editor, SCI_SETREADONLY, FALSE, 0);
+    SendMessageA(editor, SCI_SETTEXT, 0, (LPARAM)(text != NULL ? text : ""));
+    SendMessageA(editor, SCI_SETREADONLY, TRUE, 0);
+    SendMessageA(editor, SCI_MARGINTEXTCLEARALL, 0, 0);
+
+    for (size_t line = 0; line < line_count; ++line) {
+        if (addresses != NULL && (has_address == NULL || has_address[line])) {
+            char address_text[8];
+            snprintf(address_text, sizeof(address_text), "%04X", addresses[line]);
+            SendMessageA(editor, SCI_MARGINSETTEXT, (WPARAM)line, (LPARAM)address_text);
+            SendMessageA(editor, SCI_MARGINSETSTYLE, (WPARAM)line, STYLE_LINENUMBER);
+        }
+    }
+}
+
 
 static void app_debug_format_flags(uint8_t flags, char *out, size_t out_size) {
     snprintf(
@@ -780,6 +882,9 @@ static void app_debug_refresh_window(AppState *app) {
     char ascii[17];
     size_t used = 0;
     uint16_t addr;
+    uint16_t disassembly_addresses[14];
+    uint16_t memory_addresses[6];
+    uint16_t stack_addresses[4];
     z80_t *cpu;
     const size_t total_points = app->debug.breakpoint_count + app->debug.watchpoint_count;
 
@@ -793,7 +898,10 @@ static void app_debug_refresh_window(AppState *app) {
     }
     buffer[0] = '\0';
 
-    if (app->debug.debugger_text == NULL) {
+    if (app->debug.debugger_text == NULL ||
+        app->debug.debugger_registers_text == NULL ||
+        app->debug.debugger_memory_text == NULL ||
+        app->debug.debugger_stack_text == NULL) {
         if (buffer != stack_buffer) {
             free(buffer);
         }
@@ -807,7 +915,10 @@ static void app_debug_refresh_window(AppState *app) {
             "Machine not ready.\r\nDebugger actions are disabled until the machine is initialized.\r\n\r\n"
         );
         app_debug_append_point_summary(buffer, buffer_size, &used, app);
-        SetWindowTextA(app->debug.debugger_text, buffer);
+        app_debug_set_disassembly(app, buffer, NULL, 0);
+        SetWindowTextA(app->debug.debugger_registers_text, buffer);
+        app_debug_set_memory(app->debug.debugger_memory_text, buffer, NULL, NULL, 0);
+        app_debug_set_memory(app->debug.debugger_stack_text, buffer, NULL, NULL, 0);
         app_debug_refresh_points_list(app);
         app_debug_update_controls(app);
         if (buffer != stack_buffer) {
@@ -829,69 +940,17 @@ static void app_debug_refresh_window(AppState *app) {
         buffer,
         buffer_size,
         &used,
-        "State: %s    Model: %s\r\n",
-        app->debug.paused ? "Paused" : "Running",
+        "%-7s  Model:%s\r\n",
+        app->debug.paused ? "PAUSED" : "RUNNING",
         app_model_name(app->spec.model)
     );
-    if (app->debug.debugger_run_to_active) {
-        app_append_textf(
-            buffer,
-            buffer_size,
-            &used,
-            "Run-to target: %04X\r\n",
-            app->debug.debugger_run_to_address
-        );
-    }
-    if (app->debug.breakpoint_hit) {
-        app_append_textf(
-            buffer,
-            buffer_size,
-            &used,
-            "Breakpoint hit at %04X\r\n",
-            app->debug.last_breakpoint_address
-        );
-    }
-    if (app->debug.debugger_run_to_hit) {
-        app_append_textf(
-            buffer,
-            buffer_size,
-            &used,
-            "Run-to hit at %04X\r\n",
-            app->debug.last_run_to_address
-        );
-    }
-    if (app->debug.watchpoint_hit) {
-        app_append_textf(
-            buffer,
-            buffer_size,
-            &used,
-            "Write watch hit at %04X <= %02X\r\n",
-            app->debug.last_watchpoint_address,
-            app->debug.last_watchpoint_value
-        );
-    }
     app_append_textf(
         buffer,
         buffer_size,
         &used,
-        "PC:%04X  SP:%04X  IR:%02X%02X  IM:%u  IFF1:%u  IFF2:%u\r\n",
+        "PC:%04X  SP:%04X  IX:%04X  IY:%04X\r\n",
         cpu->pc,
         cpu->sp,
-        cpu->i,
-        cpu->r,
-        (unsigned)cpu->im,
-        cpu->iff1 ? 1u : 0u,
-        cpu->iff2 ? 1u : 0u
-    );
-    app_append_textf(
-        buffer,
-        buffer_size,
-        &used,
-        "AF:%04X  BC:%04X  DE:%04X  HL:%04X  IX:%04X  IY:%04X\r\n",
-        cpu->af,
-        cpu->bc,
-        cpu->de,
-        cpu->hl,
         cpu->ix,
         cpu->iy
     );
@@ -899,53 +958,61 @@ static void app_debug_refresh_window(AppState *app) {
         buffer,
         buffer_size,
         &used,
-        "AF':%04X BC':%04X DE':%04X HL':%04X  Flags:%s\r\n",
+        "AF:%04X  BC:%04X  DE:%04X  HL:%04X\r\n",
+        cpu->af,
+        cpu->bc,
+        cpu->de,
+        cpu->hl
+    );
+    app_append_textf(
+        buffer,
+        buffer_size,
+        &used,
+        "AF':%04X BC':%04X DE':%04X HL':%04X\r\n",
         cpu->af2,
         cpu->bc2,
         cpu->de2,
-        cpu->hl2,
-        flags
+        cpu->hl2
     );
     app_append_textf(
         buffer,
         buffer_size,
         &used,
-        "FE:%02X  7FFD:%02X  DisplayBank:%u  PagingLocked:%u\r\n\r\n",
+        "I:%02X R:%02X  IM:%u  IFF:%u/%u  FE:%02X\r\n"
+        "Flags:%s\r\n"
+        "Page:7FFD:%02X  Bank:%u  Lock:%s\r\n",
+        cpu->i,
+        cpu->r,
+        (unsigned)cpu->im,
+        cpu->iff1 ? 1u : 0u,
+        cpu->iff2 ? 1u : 0u,
         app->spec.machine.last_fe_out,
+        flags,
         app->spec.machine.last_mem_config,
         (unsigned)app->spec.machine.display_ram_bank,
-        app->spec.machine.memory_paging_disabled ? 1u : 0u
+        app->spec.machine.memory_paging_disabled ? "Yes" : "No"
     );
-    app_append_textf(
-        buffer,
-        buffer_size,
-        &used,
-        "Shortcuts: F1 Help  F5 Run/Pause  F9 Toggle BP  F10 Step Over  F11 Step  Ctrl+W Toggle WP  Ctrl+T Run To\r\n"
-    );
-    app_append_textf(
-        buffer,
-        buffer_size,
-        &used,
-        "View: Ctrl+P PC  Ctrl+S SP  PgUp/PgDn page  Address Up/Down +/-10h  Ctrl+Home PC  Ctrl+End SP\r\n"
-    );
-    app_append_textf(
-        buffer,
-        buffer_size,
-        &used,
-        "Address: Enter Go  Ctrl+Enter Run To  Shift+Enter Run @  Markers: > PC  * BP\r\n\r\n"
-    );
-    app_debug_append_point_summary(buffer, buffer_size, &used, app);
-    app_append_textf(buffer, buffer_size, &used, "\r\n\r\n");
+    if (app->debug.watchpoint_hit) {
+        app_append_textf(buffer, buffer_size, &used, "Watch:%04X <= %02X\r\n",
+            app->debug.last_watchpoint_address, app->debug.last_watchpoint_value);
+    } else if (app->debug.breakpoint_hit) {
+        app_append_textf(buffer, buffer_size, &used, "Breakpoint:%04X\r\n", app->debug.last_breakpoint_address);
+    } else if (app->debug.debugger_run_to_hit) {
+        app_append_textf(buffer, buffer_size, &used, "Run-to hit:%04X\r\n", app->debug.last_run_to_address);
+    } else if (app->debug.debugger_run_to_active) {
+        app_append_textf(buffer, buffer_size, &used, "Run-to:%04X\r\n", app->debug.debugger_run_to_address);
+    }
+    SetWindowTextA(app->debug.debugger_registers_text, buffer);
+    used = 0;
+    buffer[0] = '\0';
 
-    app_append_textf(buffer, buffer_size, &used, "Disassembly @ %04X\r\n", app->debug.debugger_view_address);
     addr = app->debug.debugger_view_address;
     for (int i = 0; i < 14; ++i) {
         char mnemonic[128];
         char bytes[32];
         uint8_t len;
         size_t byte_used = 0;
-        const char pc_marker = (addr == cpu->pc) ? '>' : ' ';
-        const char bp_marker = app_debug_has_breakpoint(app, addr) ? '*' : ' ';
+        disassembly_addresses[i] = addr;
 
         app_debug_decode_instruction(&app->spec, addr, mnemonic, sizeof(mnemonic), &len);
         for (uint8_t byte_index = 0; byte_index < len; ++byte_index) {
@@ -965,20 +1032,20 @@ static void app_debug_refresh_window(AppState *app) {
             buffer,
             buffer_size,
             &used,
-            "%c%c %04X: %-12s %s\r\n",
-            pc_marker,
-            bp_marker,
-            addr,
+            "%-12s %s\r\n",
             bytes,
             mnemonic
         );
         addr = (uint16_t)(addr + len);
     }
 
-    app_append_textf(buffer, buffer_size, &used, "\r\nStack @ %04X\r\n", cpu->sp);
+    app_debug_set_disassembly(app, buffer, disassembly_addresses, 14);
+    used = 0;
+    buffer[0] = '\0';
+
     for (int row = 0; row < 4; ++row) {
         uint16_t row_addr = (uint16_t)(cpu->sp + (uint16_t)(row * 8));
-        app_append_textf(buffer, buffer_size, &used, "%04X:", row_addr);
+        stack_addresses[row] = row_addr;
         for (int col = 0; col < 8; ++col) {
             app_append_textf(
                 buffer,
@@ -991,10 +1058,13 @@ static void app_debug_refresh_window(AppState *app) {
         app_append_textf(buffer, buffer_size, &used, "\r\n");
     }
 
-    app_append_textf(buffer, buffer_size, &used, "\r\nMemory @ %04X\r\n", app->debug.debugger_view_address);
+    app_debug_set_memory(app->debug.debugger_stack_text, buffer, stack_addresses, NULL, 4);
+    used = 0;
+    buffer[0] = '\0';
+
     for (int row = 0; row < 6; ++row) {
         uint16_t row_addr = (uint16_t)(app->debug.debugger_view_address + (uint16_t)(row * 16));
-        app_append_textf(buffer, buffer_size, &used, "%04X:", row_addr);
+        memory_addresses[row] = row_addr;
         for (int col = 0; col < 16; ++col) {
             const uint8_t value = app_debug_mem_rd(&app->spec, (uint16_t)(row_addr + col));
             app_append_textf(
@@ -1010,7 +1080,13 @@ static void app_debug_refresh_window(AppState *app) {
         app_append_textf(buffer, buffer_size, &used, "  |%s|\r\n", ascii);
     }
 
-    SetWindowTextA(app->debug.debugger_text, buffer);
+    app_debug_set_memory(
+        app->debug.debugger_memory_text,
+        buffer,
+        memory_addresses,
+        NULL,
+        6
+    );
     app_debug_refresh_points_list(app);
     app_debug_update_controls(app);
     if (buffer != stack_buffer) {
@@ -1282,7 +1358,7 @@ static void app_debug_run_from_address(AppState *app, uint16_t address) {
         return;
     }
 
-    app->spec.machine.cpu.pc = address;
+    app->spec.machine.pins = z80_prefetch(&app->spec.machine.cpu, address);
     app_debug_resume(app);
     app->debug.debugger_run_to_active = false;
     app->debug.debugger_skip_breakpoint_once = true;
@@ -1327,10 +1403,22 @@ static void app_debugger_layout_controls(AppState *app, HWND hwnd) {
     RECT rect;
     int width;
     int height;
-    const int side_panel_width = 180;
+    int content_width;
+    int content_height;
+    int top_height;
+    int disassembly_width;
+    int right_x;
+    int registers_height;
+    HWND disassembly_group;
+    HWND registers_group;
+    HWND memory_group;
+    HWND stack_group;
+    HWND points_group;
     const int top_row_y = 8;
     const int second_row_y = 38;
     const int content_y = 72;
+    const int gap = 8;
+    const int memory_height = 152;
 
     if (app->debug.debugger_text == NULL) {
         return;
@@ -1338,6 +1426,20 @@ static void app_debugger_layout_controls(AppState *app, HWND hwnd) {
     GetClientRect(hwnd, &rect);
     width = rect.right - rect.left;
     height = rect.bottom - rect.top;
+    content_width = width - 16;
+    content_height = height - content_y - 8;
+    top_height = content_height - memory_height - gap;
+    if (top_height < 120) {
+        top_height = content_height / 2;
+    }
+    disassembly_width = (content_width * 3) / 5;
+    right_x = 8 + disassembly_width + gap;
+    registers_height = (top_height * 3) / 5;
+    disassembly_group = GetDlgItem(hwnd, APP_CTRL_DEBUG_DISASSEMBLY_GROUP);
+    registers_group = GetDlgItem(hwnd, APP_CTRL_DEBUG_REGISTERS_GROUP);
+    memory_group = GetDlgItem(hwnd, APP_CTRL_DEBUG_MEMORY_GROUP);
+    stack_group = GetDlgItem(hwnd, APP_CTRL_DEBUG_STACK_GROUP);
+    points_group = GetDlgItem(hwnd, APP_CTRL_DEBUG_POINTS_GROUP);
 
     MoveWindow(app->debug.debugger_pause_button, 8, top_row_y, 72, 24, TRUE);
     MoveWindow(app->debug.debugger_step_button, 88, top_row_y, 72, 24, TRUE);
@@ -1355,22 +1457,28 @@ static void app_debugger_layout_controls(AppState *app, HWND hwnd) {
     MoveWindow(app->debug.debugger_view_sp_button, 384, second_row_y, 44, 24, TRUE);
     MoveWindow(app->debug.debugger_page_up_button, 436, second_row_y, 64, 24, TRUE);
     MoveWindow(app->debug.debugger_page_down_button, 508, second_row_y, 64, 24, TRUE);
-    MoveWindow(
-        app->debug.debugger_text,
-        8,
-        content_y,
-        width - side_panel_width - 24,
-        height - content_y - 8,
-        TRUE
-    );
-    MoveWindow(
-        app->debug.debugger_points_list,
-        width - side_panel_width - 8,
-        content_y,
-        side_panel_width,
-        height - content_y - 8,
-        TRUE
-    );
+    MoveWindow(disassembly_group, 8, content_y, disassembly_width, top_height, TRUE);
+    MoveWindow(app->debug.debugger_text, 16, content_y + 20, disassembly_width - 16, top_height - 28, TRUE);
+    MoveWindow(registers_group, right_x, content_y, content_width - disassembly_width - gap, registers_height, TRUE);
+    MoveWindow(app->debug.debugger_registers_text, right_x + 8, content_y + 20,
+        content_width - disassembly_width - gap - 16, registers_height - 28, TRUE);
+    MoveWindow(points_group, right_x, content_y + registers_height + gap,
+        content_width - disassembly_width - gap, top_height - registers_height - gap, TRUE);
+    MoveWindow(app->debug.debugger_points_list, right_x + 8, content_y + registers_height + gap + 20,
+        content_width - disassembly_width - gap - 16, top_height - registers_height - gap - 28, TRUE);
+    {
+        const int memory_width = (content_width * 2) / 3;
+        const int stack_x = 8 + memory_width + gap;
+        const int bottom_height = content_height - top_height - gap;
+
+        MoveWindow(memory_group, 8, content_y + top_height + gap, memory_width, bottom_height, TRUE);
+        MoveWindow(app->debug.debugger_memory_text, 16, content_y + top_height + gap + 20,
+            memory_width - 16, bottom_height - 28, TRUE);
+        MoveWindow(stack_group, stack_x, content_y + top_height + gap,
+            content_width - memory_width - gap, bottom_height, TRUE);
+        MoveWindow(app->debug.debugger_stack_text, stack_x + 8, content_y + top_height + gap + 20,
+            content_width - memory_width - gap - 16, bottom_height - 28, TRUE);
+    }
 }
 
 
@@ -1450,17 +1558,90 @@ static LRESULT CALLBACK app_debugger_points_wndproc(HWND hwnd, UINT msg, WPARAM 
     return CallWindowProcA(old_proc, hwnd, msg, wparam, lparam);
 }
 
-
 static LRESULT CALLBACK app_debugger_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     AppState *app = (AppState *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
 
     switch (msg) {
         case WM_NCCREATE: {
             CREATESTRUCTA *create = (CREATESTRUCTA *)lparam;
-            SetWindowLongPtrA(hwnd, GWLP_USERDATA, (LONG_PTR)create->lpCreateParams);
+            app = (AppState *)create->lpCreateParams;
+            SetWindowLongPtrA(hwnd, GWLP_USERDATA, (LONG_PTR)app);
+            if (app != NULL) {
+                app->debug.debugger_hwnd = hwnd;
+            }
             return TRUE;
         }
         case WM_CREATE: {
+            HMENU menu;
+            RECT rect;
+
+            if (app == NULL) {
+                return -1;
+            }
+            menu = app_create_debugger_menu();
+            if (menu != NULL) {
+                SetMenu(hwnd, menu);
+                DrawMenuBar(hwnd);
+            }
+            app->debug.debugger_panel = CreateDialogParamA(
+                GetModuleHandleA(NULL),
+                MAKEINTRESOURCEA(APP_DIALOG_DEBUGGER),
+                hwnd,
+                app_debugger_dlgproc,
+                (LPARAM)app
+            );
+            if (app->debug.debugger_panel == NULL) {
+                return -1;
+            }
+            GetClientRect(hwnd, &rect);
+            MoveWindow(
+                app->debug.debugger_panel,
+                0,
+                0,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                TRUE
+            );
+            return 0;
+        }
+        case WM_SIZE:
+            if (app != NULL && app->debug.debugger_panel != NULL) {
+                MoveWindow(app->debug.debugger_panel, 0, 0, LOWORD(lparam), HIWORD(lparam), TRUE);
+            }
+            return 0;
+        case WM_ENTERSIZEMOVE:
+            app_set_modal_loop_timer(app, hwnd, true);
+            return 0;
+        case WM_EXITSIZEMOVE:
+            app_set_modal_loop_timer(app, hwnd, false);
+            return 0;
+        case WM_TIMER:
+            if (app != NULL && wparam == APP_TIMER_MODAL_LOOP) {
+                app_tick_emulator(app);
+                return 0;
+            }
+            break;
+        case WM_CLOSE:
+            DestroyWindow(hwnd);
+            return 0;
+        case WM_DESTROY:
+            if (app != NULL) {
+                app_set_modal_loop_timer(app, hwnd, false);
+                app->debug.debugger_hwnd = NULL;
+                app->debug.debugger_panel = NULL;
+            }
+            return 0;
+        default:
+            break;
+    }
+    return DefWindowProcA(hwnd, msg, wparam, lparam);
+}
+
+static INT_PTR CALLBACK app_debugger_dlgproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    AppState *app = (AppState *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
+
+    switch (msg) {
+        case WM_INITDIALOG: {
             static const ACCEL debugger_accels[] = {
                 {FVIRTKEY, VK_F1, APP_MENU_DEBUG_HELP_SHOW},
                 {FVIRTKEY, VK_F5, APP_CTRL_DEBUG_PAUSE},
@@ -1477,192 +1658,42 @@ static LRESULT CALLBACK app_debugger_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
                 {FVIRTKEY, VK_NEXT, APP_CTRL_DEBUG_PAGE_DOWN}
             };
             HFONT font = (HFONT)GetStockObject(ANSI_FIXED_FONT);
-            HMENU menu = app_create_debugger_menu();
-            app->debug.debugger_background_brush = CreateSolidBrush(RGB(223, 229, 238));
-            app->debug.debugger_surface_brush = CreateSolidBrush(RGB(239, 243, 248));
-            app->debug.debugger_input_brush = CreateSolidBrush(RGB(248, 250, 252));
-            if (menu != NULL) {
-                SetMenu(hwnd, menu);
-                DrawMenuBar(hwnd);
+            app = (AppState *)lparam;
+            SetWindowLongPtrA(hwnd, GWLP_USERDATA, (LONG_PTR)app);
+            if (app == NULL) {
+                return FALSE;
             }
-            app->debug.debugger_pause_button = CreateWindowExA(0, "BUTTON", "Pause", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)APP_CTRL_DEBUG_PAUSE, NULL, NULL);
-            app->debug.debugger_step_button = CreateWindowExA(0, "BUTTON", "Step", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)APP_CTRL_DEBUG_STEP, NULL, NULL);
-            app->debug.debugger_step_over_button = CreateWindowExA(0, "BUTTON", "Step Over", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)APP_CTRL_DEBUG_STEP_OVER, NULL, NULL);
-            app->debug.debugger_refresh_button = CreateWindowExA(0, "BUTTON", "Refresh", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)APP_CTRL_DEBUG_REFRESH, NULL, NULL);
-            app->debug.debugger_address_edit = CreateWindowExA(
-                WS_EX_CLIENTEDGE,
-                "EDIT",
-                "",
-                WS_CHILD | WS_VISIBLE | ES_LEFT | ES_AUTOHSCROLL | ES_UPPERCASE,
-                0,
-                0,
-                0,
-                0,
-                hwnd,
-                (HMENU)(INT_PTR)APP_CTRL_DEBUG_ADDRESS,
-                NULL,
-                NULL
-            );
-            app->debug.debugger_go_button = CreateWindowExA(0, "BUTTON", "Go", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)APP_CTRL_DEBUG_GO, NULL, NULL);
-            app->debug.debugger_sync_checkbox = CreateWindowExA(0, "BUTTON", "Sync PC", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)APP_CTRL_DEBUG_SYNC, NULL, NULL);
-            app->debug.debugger_breakpoint_toggle_button = CreateWindowExA(
-                0,
-                "BUTTON",
-                "Toggle BP",
-                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                0,
-                0,
-                0,
-                0,
-                hwnd,
-                (HMENU)(INT_PTR)APP_CTRL_DEBUG_BREAKPOINT_TOGGLE,
-                NULL,
-                NULL
-            );
-            app->debug.debugger_watchpoint_toggle_button = CreateWindowExA(
-                0,
-                "BUTTON",
-                "Toggle WP",
-                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                0,
-                0,
-                0,
-                0,
-                hwnd,
-                (HMENU)(INT_PTR)APP_CTRL_DEBUG_WATCHPOINT_TOGGLE,
-                NULL,
-                NULL
-            );
-            app->debug.debugger_remove_selected_button = CreateWindowExA(
-                0,
-                "BUTTON",
-                "Remove Sel",
-                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                0,
-                0,
-                0,
-                0,
-                hwnd,
-                (HMENU)(INT_PTR)APP_CTRL_DEBUG_REMOVE_SELECTED,
-                NULL,
-                NULL
-            );
-            app->debug.debugger_view_pc_button = CreateWindowExA(
-                0,
-                "BUTTON",
-                "PC",
-                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                0,
-                0,
-                0,
-                0,
-                hwnd,
-                (HMENU)(INT_PTR)APP_CTRL_DEBUG_VIEW_PC,
-                NULL,
-                NULL
-            );
-            app->debug.debugger_view_sp_button = CreateWindowExA(
-                0,
-                "BUTTON",
-                "SP",
-                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                0,
-                0,
-                0,
-                0,
-                hwnd,
-                (HMENU)(INT_PTR)APP_CTRL_DEBUG_VIEW_SP,
-                NULL,
-                NULL
-            );
-            app->debug.debugger_page_up_button = CreateWindowExA(
-                0,
-                "BUTTON",
-                "Page -",
-                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                0,
-                0,
-                0,
-                0,
-                hwnd,
-                (HMENU)(INT_PTR)APP_CTRL_DEBUG_PAGE_UP,
-                NULL,
-                NULL
-            );
-            app->debug.debugger_page_down_button = CreateWindowExA(
-                0,
-                "BUTTON",
-                "Page +",
-                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                0,
-                0,
-                0,
-                0,
-                hwnd,
-                (HMENU)(INT_PTR)APP_CTRL_DEBUG_PAGE_DOWN,
-                NULL,
-                NULL
-            );
-            app->debug.debugger_run_to_button = CreateWindowExA(
-                0,
-                "BUTTON",
-                "Run To",
-                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                0,
-                0,
-                0,
-                0,
-                hwnd,
-                (HMENU)(INT_PTR)APP_CTRL_DEBUG_RUN_TO,
-                NULL,
-                NULL
-            );
-            app->debug.debugger_run_at_button = CreateWindowExA(
-                0,
-                "BUTTON",
-                "Run @",
-                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                0,
-                0,
-                0,
-                0,
-                hwnd,
-                (HMENU)(INT_PTR)APP_CTRL_DEBUG_RUN_AT,
-                NULL,
-                NULL
-            );
-            app->debug.debugger_text = CreateWindowExA(
-                WS_EX_CLIENTEDGE,
-                "EDIT",
-                "",
-                WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
-                0,
-                0,
-                0,
-                0,
-                hwnd,
-                (HMENU)(INT_PTR)APP_CTRL_DEBUG_TEXT,
-                NULL,
-                NULL
-            );
-            app->debug.debugger_points_list = CreateWindowExA(
-                WS_EX_CLIENTEDGE,
-                "LISTBOX",
-                "",
-                WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
-                0,
-                0,
-                0,
-                0,
-                hwnd,
-                (HMENU)(INT_PTR)APP_CTRL_DEBUG_POINTS_LIST,
-                NULL,
-                NULL
-            );
+            app->debug.debugger_background_brush = CreateSolidBrush(GetSysColor(COLOR_BTNFACE));
+            app->debug.debugger_surface_brush = CreateSolidBrush(GetSysColor(COLOR_WINDOW));
+            app->debug.debugger_input_brush = CreateSolidBrush(GetSysColor(COLOR_WINDOW));
+            app->debug.debugger_pause_button = GetDlgItem(hwnd, APP_CTRL_DEBUG_PAUSE);
+            app->debug.debugger_step_button = GetDlgItem(hwnd, APP_CTRL_DEBUG_STEP);
+            app->debug.debugger_step_over_button = GetDlgItem(hwnd, APP_CTRL_DEBUG_STEP_OVER);
+            app->debug.debugger_refresh_button = GetDlgItem(hwnd, APP_CTRL_DEBUG_REFRESH);
+            app->debug.debugger_address_edit = GetDlgItem(hwnd, APP_CTRL_DEBUG_ADDRESS);
+            app->debug.debugger_go_button = GetDlgItem(hwnd, APP_CTRL_DEBUG_GO);
+            app->debug.debugger_sync_checkbox = GetDlgItem(hwnd, APP_CTRL_DEBUG_SYNC);
+            app->debug.debugger_breakpoint_toggle_button = GetDlgItem(hwnd, APP_CTRL_DEBUG_BREAKPOINT_TOGGLE);
+            app->debug.debugger_watchpoint_toggle_button = GetDlgItem(hwnd, APP_CTRL_DEBUG_WATCHPOINT_TOGGLE);
+            app->debug.debugger_remove_selected_button = GetDlgItem(hwnd, APP_CTRL_DEBUG_REMOVE_SELECTED);
+            app->debug.debugger_view_pc_button = GetDlgItem(hwnd, APP_CTRL_DEBUG_VIEW_PC);
+            app->debug.debugger_view_sp_button = GetDlgItem(hwnd, APP_CTRL_DEBUG_VIEW_SP);
+            app->debug.debugger_page_up_button = GetDlgItem(hwnd, APP_CTRL_DEBUG_PAGE_UP);
+            app->debug.debugger_page_down_button = GetDlgItem(hwnd, APP_CTRL_DEBUG_PAGE_DOWN);
+            app->debug.debugger_run_to_button = GetDlgItem(hwnd, APP_CTRL_DEBUG_RUN_TO);
+            app->debug.debugger_run_at_button = GetDlgItem(hwnd, APP_CTRL_DEBUG_RUN_AT);
+            app->debug.debugger_text = GetDlgItem(hwnd, APP_CTRL_DEBUG_TEXT);
+            app->debug.debugger_registers_text = GetDlgItem(hwnd, APP_CTRL_DEBUG_REGISTERS);
+            app->debug.debugger_memory_text = GetDlgItem(hwnd, APP_CTRL_DEBUG_MEMORY);
+            app->debug.debugger_stack_text = GetDlgItem(hwnd, APP_CTRL_DEBUG_STACK);
+            app->debug.debugger_points_list = GetDlgItem(hwnd, APP_CTRL_DEBUG_POINTS_LIST);
             app->debug.debugger_accel = CreateAcceleratorTableA((LPACCEL)debugger_accels, (int)(sizeof(debugger_accels) / sizeof(debugger_accels[0])));
             SendMessageA(app->debug.debugger_address_edit, EM_SETLIMITTEXT, 15, 0);
             SendMessageA(app->debug.debugger_address_edit, WM_SETFONT, (WPARAM)font, TRUE);
-            SendMessageA(app->debug.debugger_text, WM_SETFONT, (WPARAM)font, TRUE);
+            app_debug_configure_disassembly(app->debug.debugger_text);
+            SendMessageA(app->debug.debugger_registers_text, WM_SETFONT, (WPARAM)font, TRUE);
+            app_debug_configure_memory(app->debug.debugger_memory_text);
+            app_debug_configure_memory(app->debug.debugger_stack_text);
             SendMessageA(app->debug.debugger_points_list, WM_SETFONT, (WPARAM)font, TRUE);
             app->debug.debugger_address_edit_wndproc = (WNDPROC)SetWindowLongPtrA(
                 app->debug.debugger_address_edit,
@@ -1677,31 +1708,24 @@ static LRESULT CALLBACK app_debugger_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
             app_debugger_layout_controls(app, hwnd);
             app_debug_sync_view_controls(app);
             app_debug_refresh_window(app);
-            return 0;
+            return FALSE;
         }
         case WM_SIZE:
             if (app != NULL) {
                 app_debugger_layout_controls(app, hwnd);
             }
-            return 0;
+            return TRUE;
         case WM_ENTERSIZEMOVE:
-            app_set_modal_loop_timer(app, hwnd, true);
-            return 0;
         case WM_EXITSIZEMOVE:
-            app_set_modal_loop_timer(app, hwnd, false);
-            return 0;
         case WM_TIMER:
-            if (app != NULL && wparam == APP_TIMER_MODAL_LOOP) {
-                app_tick_emulator(app);
-                return 0;
-            }
             break;
         case WM_ERASEBKGND:
             if (app != NULL && app->debug.debugger_background_brush != NULL) {
                 RECT rect;
                 GetClientRect(hwnd, &rect);
                 FillRect((HDC)wparam, &rect, app->debug.debugger_background_brush);
-                return 1;
+                SetWindowLongPtrA(hwnd, DWLP_MSGRESULT, 1);
+                return TRUE;
             }
             break;
         case WM_CTLCOLOREDIT:
@@ -1710,11 +1734,12 @@ static LRESULT CALLBACK app_debugger_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
                 HWND control = (HWND)lparam;
 
                 if (control == app->debug.debugger_address_edit) {
-                    SetTextColor(hdc, RGB(25, 38, 52));
-                    SetBkColor(hdc, RGB(248, 250, 252));
-                    return (LRESULT)(app->debug.debugger_input_brush != NULL
+                    SetTextColor(hdc, GetSysColor(COLOR_WINDOWTEXT));
+                    SetBkColor(hdc, GetSysColor(COLOR_WINDOW));
+                    SetWindowLongPtrA(hwnd, DWLP_MSGRESULT, (LONG_PTR)(app->debug.debugger_input_brush != NULL
                         ? app->debug.debugger_input_brush
-                        : GetSysColorBrush(COLOR_WINDOW));
+                        : GetSysColorBrush(COLOR_WINDOW)));
+                    return TRUE;
                 }
             }
             break;
@@ -1724,11 +1749,12 @@ static LRESULT CALLBACK app_debugger_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
                 HWND control = (HWND)lparam;
 
                 if (control == app->debug.debugger_points_list) {
-                    SetTextColor(hdc, RGB(25, 38, 52));
-                    SetBkColor(hdc, RGB(248, 250, 252));
-                    return (LRESULT)(app->debug.debugger_input_brush != NULL
+                    SetTextColor(hdc, GetSysColor(COLOR_WINDOWTEXT));
+                    SetBkColor(hdc, GetSysColor(COLOR_WINDOW));
+                    SetWindowLongPtrA(hwnd, DWLP_MSGRESULT, (LONG_PTR)(app->debug.debugger_input_brush != NULL
                         ? app->debug.debugger_input_brush
-                        : GetSysColorBrush(COLOR_WINDOW));
+                        : GetSysColorBrush(COLOR_WINDOW)));
+                    return TRUE;
                 }
             }
             break;
@@ -1737,29 +1763,24 @@ static LRESULT CALLBACK app_debugger_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
                 HDC hdc = (HDC)wparam;
                 HWND control = (HWND)lparam;
 
-                if (control == app->debug.debugger_text) {
-                    SetTextColor(hdc, RGB(25, 38, 52));
-                    SetBkColor(hdc, RGB(239, 243, 248));
-                    return (LRESULT)(app->debug.debugger_surface_brush != NULL
+                if (control == app->debug.debugger_text ||
+                    control == app->debug.debugger_registers_text ||
+                    control == app->debug.debugger_memory_text ||
+                    control == app->debug.debugger_stack_text) {
+                    SetTextColor(hdc, GetSysColor(COLOR_WINDOWTEXT));
+                    SetBkColor(hdc, GetSysColor(COLOR_WINDOW));
+                    SetWindowLongPtrA(hwnd, DWLP_MSGRESULT, (LONG_PTR)(app->debug.debugger_surface_brush != NULL
                         ? app->debug.debugger_surface_brush
-                        : GetSysColorBrush(COLOR_WINDOW));
+                        : GetSysColorBrush(COLOR_WINDOW)));
+                    return TRUE;
                 }
-                SetTextColor(hdc, RGB(37, 52, 70));
-                SetBkColor(hdc, RGB(223, 229, 238));
+                SetTextColor(hdc, GetSysColor(COLOR_BTNTEXT));
+                SetBkColor(hdc, GetSysColor(COLOR_BTNFACE));
                 SetBkMode(hdc, TRANSPARENT);
-                return (LRESULT)(app->debug.debugger_background_brush != NULL
+                SetWindowLongPtrA(hwnd, DWLP_MSGRESULT, (LONG_PTR)(app->debug.debugger_background_brush != NULL
                     ? app->debug.debugger_background_brush
-                    : GetSysColorBrush(COLOR_WINDOW));
-            }
-            break;
-        case WM_CTLCOLORBTN:
-            if (app != NULL) {
-                HDC hdc = (HDC)wparam;
-                SetTextColor(hdc, RGB(25, 38, 52));
-                SetBkColor(hdc, RGB(223, 229, 238));
-                return (LRESULT)(app->debug.debugger_background_brush != NULL
-                    ? app->debug.debugger_background_brush
-                    : GetSysColorBrush(COLOR_BTNFACE));
+                    : GetSysColorBrush(COLOR_BTNFACE)));
+                return TRUE;
             }
             break;
         case WM_COMMAND:
@@ -1769,10 +1790,10 @@ static LRESULT CALLBACK app_debugger_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
             switch (LOWORD(wparam)) {
                 case APP_MENU_DEBUG_HELP_SHOW:
                     app_show_debugger_help(hwnd);
-                    return 0;
+                    return TRUE;
                 case APP_CTRL_DEBUG_PAUSE:
                     if (!app->spec.machine_ready) {
-                        return 0;
+                        return TRUE;
                     }
                     if (app->debug.paused) {
                         app_debug_resume(app);
@@ -1784,133 +1805,133 @@ static LRESULT CALLBACK app_debugger_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
                         app->debug.watchpoint_hit = false;
                     }
                     app_debug_refresh_window(app);
-                    return 0;
+                    return TRUE;
                 case APP_CTRL_DEBUG_STEP:
                     if (!app->spec.machine_ready) {
-                        return 0;
+                        return TRUE;
                     }
                     app_debug_step_instruction(app);
-                    return 0;
+                    return TRUE;
                 case APP_CTRL_DEBUG_STEP_OVER:
                     if (!app->spec.machine_ready) {
-                        return 0;
+                        return TRUE;
                     }
                     app_debug_step_over_instruction(app);
-                    return 0;
+                    return TRUE;
                 case APP_CTRL_DEBUG_REFRESH:
                     if (!app->spec.machine_ready) {
                         app_debug_refresh_window(app);
-                        return 0;
+                        return TRUE;
                     }
                     app_debug_refresh_window(app);
-                    return 0;
+                    return TRUE;
                 case APP_CTRL_DEBUG_GO: {
                     char error[128];
                     if (!app->spec.machine_ready) {
-                        return 0;
+                        return TRUE;
                     }
                     if (!app_debug_apply_address_input(app, error, sizeof(error))) {
                         MessageBoxA(hwnd, error, "Debugger", MB_OK | MB_ICONERROR);
-                        return 0;
+                        return TRUE;
                     }
                     app_debug_refresh_window(app);
-                    return 0;
+                    return TRUE;
                 }
                 case APP_CTRL_DEBUG_VIEW_PC:
                     if (!app->spec.machine_ready) {
-                        return 0;
+                        return TRUE;
                     }
                     app_debug_view_pc(app);
-                    return 0;
+                    return TRUE;
                 case APP_CTRL_DEBUG_VIEW_SP:
                     if (!app->spec.machine_ready) {
-                        return 0;
+                        return TRUE;
                     }
                     app_debug_view_sp(app);
-                    return 0;
+                    return TRUE;
                 case APP_CTRL_DEBUG_PAGE_UP:
                     if (!app->spec.machine_ready) {
-                        return 0;
+                        return TRUE;
                     }
                     app_debug_navigate_view(app, -256);
-                    return 0;
+                    return TRUE;
                 case APP_CTRL_DEBUG_PAGE_DOWN:
                     if (!app->spec.machine_ready) {
-                        return 0;
+                        return TRUE;
                     }
                     app_debug_navigate_view(app, 256);
-                    return 0;
+                    return TRUE;
                 case APP_CTRL_DEBUG_RUN_TO: {
                     char error[128];
                     uint16_t address;
                     if (!app->spec.machine_ready) {
-                        return 0;
+                        return TRUE;
                     }
                     if (!app_debug_parse_address_input(app, &address, error, sizeof(error))) {
                         MessageBoxA(hwnd, error, "Debugger", MB_OK | MB_ICONERROR);
-                        return 0;
+                        return TRUE;
                     }
                     app_debug_run_to_address(app, address);
-                    return 0;
+                    return TRUE;
                 }
                 case APP_CTRL_DEBUG_BREAKPOINT_TOGGLE: {
                     char error[128];
                     uint16_t address;
                     bool enabled;
                     if (!app->spec.machine_ready) {
-                        return 0;
+                        return TRUE;
                     }
                     if (!app_debug_parse_address_input(app, &address, error, sizeof(error))) {
                         MessageBoxA(hwnd, error, "Debugger", MB_OK | MB_ICONERROR);
-                        return 0;
+                        return TRUE;
                     }
                     if (!app_debug_toggle_breakpoint(app, address, &enabled)) {
                         MessageBoxA(hwnd, "Could not update the breakpoint list.", "Debugger", MB_OK | MB_ICONERROR);
-                        return 0;
+                        return TRUE;
                     }
                     app_debug_refresh_window(app);
-                    return 0;
+                    return TRUE;
                 }
                 case APP_CTRL_DEBUG_WATCHPOINT_TOGGLE: {
                     char error[128];
                     uint16_t address;
                     bool enabled;
                     if (!app->spec.machine_ready) {
-                        return 0;
+                        return TRUE;
                     }
                     if (!app_debug_parse_address_input(app, &address, error, sizeof(error))) {
                         MessageBoxA(hwnd, error, "Debugger", MB_OK | MB_ICONERROR);
-                        return 0;
+                        return TRUE;
                     }
                     if (!app_debug_toggle_watchpoint(app, address, &enabled)) {
                         MessageBoxA(hwnd, "Could not update the watchpoint list.", "Debugger", MB_OK | MB_ICONERROR);
-                        return 0;
+                        return TRUE;
                     }
                     app_debug_refresh_window(app);
-                    return 0;
+                    return TRUE;
                 }
                 case APP_CTRL_DEBUG_REMOVE_SELECTED:
                     if (!app->spec.machine_ready) {
-                        return 0;
+                        return TRUE;
                     }
                     if (!app_debug_remove_selected_point(app)) {
                         MessageBoxA(hwnd, "Select a breakpoint or watchpoint first.", "Debugger", MB_OK | MB_ICONERROR);
-                        return 0;
+                        return TRUE;
                     }
                     app_debug_refresh_window(app);
-                    return 0;
+                    return TRUE;
                 case APP_CTRL_DEBUG_RUN_AT: {
                     char error[128];
                     uint16_t address;
                     if (!app->spec.machine_ready) {
-                        return 0;
+                        return TRUE;
                     }
                     if (!app_debug_parse_address_input(app, &address, error, sizeof(error))) {
                         MessageBoxA(hwnd, error, "Debugger", MB_OK | MB_ICONERROR);
-                        return 0;
+                        return TRUE;
                     }
                     app_debug_run_from_address(app, address);
-                    return 0;
+                    return TRUE;
                 }
                 case APP_CTRL_DEBUG_SYNC:
                     if (HIWORD(wparam) == BN_CLICKED) {
@@ -1922,14 +1943,14 @@ static LRESULT CALLBACK app_debugger_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
                             app_debug_sync_view_controls(app);
                         }
                         app_debug_refresh_window(app);
-                        return 0;
+                        return TRUE;
                     }
                     break;
                 case APP_CTRL_DEBUG_POINTS_LIST:
                     if (HIWORD(wparam) == LBN_SELCHANGE) {
                         if (!app->spec.machine_ready) {
                             app_debug_update_controls(app);
-                            return 0;
+                            return TRUE;
                         }
                         uint16_t address = 0;
                         if (app_debug_get_selected_point(app, NULL, &address)) {
@@ -1938,16 +1959,16 @@ static LRESULT CALLBACK app_debugger_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
                         } else {
                             app_debug_update_controls(app);
                         }
-                        return 0;
+                        return TRUE;
                     }
                     if (HIWORD(wparam) == LBN_DBLCLK) {
                         if (!app->spec.machine_ready) {
-                            return 0;
+                            return TRUE;
                         }
                         if (app_debug_remove_selected_point(app)) {
                             app_debug_refresh_window(app);
                         }
-                        return 0;
+                        return TRUE;
                     }
                     break;
                 default:
@@ -1955,11 +1976,9 @@ static LRESULT CALLBACK app_debugger_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
             }
             break;
         case WM_CLOSE:
-            DestroyWindow(hwnd);
-            return 0;
+            return TRUE;
         case WM_DESTROY:
             if (app != NULL) {
-                app_set_modal_loop_timer(app, hwnd, false);
                 if (app->debug.debugger_background_brush != NULL) {
                     DeleteObject(app->debug.debugger_background_brush);
                     app->debug.debugger_background_brush = NULL;
@@ -1977,8 +1996,11 @@ static LRESULT CALLBACK app_debugger_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
                 app->debug.stop_requested = false;
                 app->debug.debugger_run_to_active = false;
                 app->debug.debugger_run_to_hit = false;
-                app->debug.debugger_hwnd = NULL;
+                app->debug.debugger_panel = NULL;
                 app->debug.debugger_text = NULL;
+                app->debug.debugger_registers_text = NULL;
+                app->debug.debugger_memory_text = NULL;
+                app->debug.debugger_stack_text = NULL;
                 app->debug.debugger_pause_button = NULL;
                 app->debug.debugger_step_button = NULL;
                 app->debug.debugger_step_over_button = NULL;
@@ -2003,11 +2025,11 @@ static LRESULT CALLBACK app_debugger_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
                 app->debug.debugger_address_edit_wndproc = NULL;
                 app->debug.debugger_points_list_wndproc = NULL;
             }
-            return 0;
+            return TRUE;
         default:
             break;
     }
-    return DefWindowProcA(hwnd, msg, wparam, lparam);
+    return FALSE;
 }
 
 
@@ -2016,6 +2038,19 @@ static void app_open_debugger_window(AppState *app) {
         ShowWindow(app->debug.debugger_hwnd, SW_SHOWNORMAL);
         SetForegroundWindow(app->debug.debugger_hwnd);
         app_debug_refresh_window(app);
+        return;
+    }
+
+    if (app_scintilla_module == NULL) {
+        app_scintilla_module = LoadLibraryA("Scintilla.dll");
+    }
+    if (app_scintilla_module == NULL) {
+        MessageBoxA(
+            app->main_hwnd,
+            "Scintilla.dll could not be loaded. Rebuild the application or place the DLL beside zx-spectrum.exe.",
+            "Spectrum Debugger",
+            MB_OK | MB_ICONERROR
+        );
         return;
     }
 
@@ -2033,7 +2068,9 @@ static void app_open_debugger_window(AppState *app) {
         GetModuleHandleA(NULL),
         app
     );
-    app_apply_window_icons(app->debug.debugger_hwnd);
+    if (app->debug.debugger_hwnd != NULL) {
+        app_apply_window_icons(app->debug.debugger_hwnd);
+    }
 }
 
 

@@ -1,5 +1,79 @@
 /* Split from main.c: assembler UI implementation. Included by main.c. */
 
+static LRESULT app_scintilla_send(HWND editor, UINT message, WPARAM wparam, LPARAM lparam) {
+    return SendMessageA(editor, message, wparam, lparam);
+}
+
+static int app_assembler_editor_text_length(HWND editor) {
+    return (int)app_scintilla_send(editor, SCI_GETTEXTLENGTH, 0, 0);
+}
+
+static void app_assembler_editor_get_text(HWND editor, char *text, int capacity) {
+    if (editor == NULL || text == NULL || capacity <= 0) {
+        return;
+    }
+    app_scintilla_send(editor, SCI_GETTEXT, (WPARAM)capacity, (LPARAM)text);
+}
+
+static void app_assembler_editor_set_text(HWND editor, const char *text) {
+    if (editor != NULL) {
+        app_scintilla_send(editor, SCI_SETTEXT, 0, (LPARAM)(text != NULL ? text : ""));
+    }
+}
+
+static void app_assembler_apply_scintilla_font(HWND editor, const LOGFONTA *font) {
+    HDC hdc;
+    int dpi;
+    int point_size_hundredths;
+
+    if (editor == NULL || font == NULL) {
+        return;
+    }
+    hdc = GetDC(editor);
+    dpi = hdc != NULL ? GetDeviceCaps(hdc, LOGPIXELSY) : 96;
+    if (hdc != NULL) {
+        ReleaseDC(editor, hdc);
+    }
+    if (dpi <= 0) {
+        dpi = 96;
+    }
+    point_size_hundredths = MulDiv(font->lfHeight < 0 ? -font->lfHeight : font->lfHeight, 7200, dpi);
+    if (point_size_hundredths <= 0) {
+        point_size_hundredths = 1000;
+    }
+    app_scintilla_send(editor, SCI_STYLESETFONT, STYLE_DEFAULT, (LPARAM)font->lfFaceName);
+    app_scintilla_send(editor, SCI_STYLESETSIZEFRACTIONAL, STYLE_DEFAULT, point_size_hundredths);
+    app_scintilla_send(editor, SCI_STYLESETBOLD, STYLE_DEFAULT, font->lfWeight >= FW_BOLD);
+    app_scintilla_send(editor, SCI_STYLESETITALIC, STYLE_DEFAULT, font->lfItalic != 0);
+    app_scintilla_send(editor, SCI_STYLESETUNDERLINE, STYLE_DEFAULT, font->lfUnderline != 0);
+    app_scintilla_send(editor, SCI_STYLECLEARALL, 0, 0);
+}
+
+static void app_assembler_configure_scintilla(HWND editor, const LOGFONTA *font) {
+    if (editor == NULL) {
+        return;
+    }
+    app_scintilla_send(editor, SCI_SETCODEPAGE, SC_CP_UTF8, 0);
+    app_scintilla_send(editor, SCI_SETEOLMODE, SC_EOL_CRLF, 0);
+    app_scintilla_send(editor, SCI_SETWRAPMODE, SC_WRAP_NONE, 0);
+    app_scintilla_send(editor, SCI_SETSCROLLWIDTHTRACKING, TRUE, 0);
+    app_scintilla_send(editor, SCI_SETMARGINTYPEN, 0, SC_MARGIN_NUMBER);
+    app_scintilla_send(editor, SCI_SETMARGINTYPEN, 1, SC_MARGIN_SYMBOL);
+    app_scintilla_send(editor, SCI_SETMARGINMASKN, 1, 1u << 0);
+    app_scintilla_send(editor, SCI_SETMARGINWIDTHN, 1, 14);
+    app_scintilla_send(editor, SCI_SETMARGINWIDTHN, 2, 0);
+    app_scintilla_send(editor, SCI_STYLESETFORE, STYLE_DEFAULT, RGB(32, 32, 32));
+    app_scintilla_send(editor, SCI_STYLESETBACK, STYLE_DEFAULT, RGB(244, 240, 228));
+    app_assembler_apply_scintilla_font(editor, font);
+    app_scintilla_send(editor, SCI_STYLESETFORE, STYLE_LINENUMBER, RGB(96, 96, 96));
+    app_scintilla_send(editor, SCI_STYLESETBACK, STYLE_LINENUMBER, RGB(235, 230, 214));
+    app_scintilla_send(editor, SCI_SETCARETLINEBACK, RGB(232, 226, 204), 0);
+    app_scintilla_send(editor, SCI_SETCARETLINEVISIBLE, TRUE, 0);
+    app_scintilla_send(editor, SCI_MARKERDEFINE, 0, SC_MARK_CIRCLE);
+    app_scintilla_send(editor, SCI_MARKERSETFORE, 0, RGB(220, 40, 40));
+    app_scintilla_send(editor, SCI_MARKERSETBACK, 0, RGB(220, 40, 40));
+}
+
 static void app_default_assembler_logfont(LOGFONTA *font) {
     ZeroMemory(font, sizeof(*font));
     font->lfHeight = -16;
@@ -60,9 +134,9 @@ static HMENU app_create_assembler_menu(void) {
     AppendMenuA(edit_menu, MF_STRING, APP_MENU_ASM_EDIT_UPPERCASE, "Uppercase Source\tCtrl+Shift+U");
     AppendMenuA(build_menu, MF_STRING, APP_MENU_ASM_BUILD_ASSEMBLE, "&Assemble\tCtrl+B");
     AppendMenuA(help_menu, MF_STRING, APP_MENU_ASM_HELP_SHOW, "Assembler &Help\tF1");
-    AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)file_menu, "File");
-    AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)edit_menu, "Edit");
-    AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)build_menu, "Build");
+    AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)file_menu, "&File");
+    AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)edit_menu, "&Edit");
+    AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)build_menu, "&Build");
     AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)help_menu, "&Help");
     return menu_bar;
 }
@@ -107,14 +181,6 @@ static void app_update_tape_menu(HWND hwnd, bool enabled) {
         APP_MENU_FILE_AUTOLOAD_TAPES,
         MF_BYCOMMAND | (enabled ? MF_CHECKED : MF_UNCHECKED)
     );
-}
-
-/* Creates the default assembler editor font used when the user has not chosen
-   a persisted replacement yet. */
-static HFONT app_create_monospace_font(void) {
-    LOGFONTA font;
-    app_default_assembler_logfont(&font);
-    return CreateFontIndirectA(&font);
 }
 
 /* Appends formatted text into a caller-owned buffer while preserving a valid
@@ -206,15 +272,14 @@ static void app_assembler_poll_external_change(HWND hwnd, AppState *app) {
     app_assembler_set_status(app, "Assembler file changed on disk. Use File -> Reload when ready.");
 }
 
-/* Clears the current assembler error marker and repaints the gutter when
-   stale diagnostics should no longer be shown to the user. */
+/* Clears the current assembler error marker. */
 static void app_assembler_clear_error_marker(AppState *app) {
     if (app == NULL) {
         return;
     }
     app->debug.assembler_error_line = 0;
-    if (app->debug.assembler_line_numbers != NULL) {
-        InvalidateRect(app->debug.assembler_line_numbers, NULL, TRUE);
+    if (app->debug.assembler_source != NULL) {
+        app_scintilla_send(app->debug.assembler_source, SCI_MARKERDELETEALL, 0, 0);
     }
 }
 
@@ -226,12 +291,12 @@ static void app_assembler_focus_line(AppState *app, size_t line_number) {
     if (app == NULL || app->debug.assembler_source == NULL || line_number == 0) {
         return;
     }
-    start_index = SendMessageA(app->debug.assembler_source, EM_LINEINDEX, (WPARAM)(line_number - 1), 0);
+    start_index = app_scintilla_send(app->debug.assembler_source, SCI_POSITIONFROMLINE, (WPARAM)(line_number - 1), 0);
     if (start_index < 0) {
         return;
     }
-    SendMessageA(app->debug.assembler_source, EM_SETSEL, (WPARAM)start_index, (LPARAM)start_index);
-    SendMessageA(app->debug.assembler_source, EM_SCROLLCARET, 0, 0);
+    app_scintilla_send(app->debug.assembler_source, SCI_SETSEL, (WPARAM)start_index, (LPARAM)start_index);
+    app_scintilla_send(app->debug.assembler_source, SCI_SCROLLCARET, 0, 0);
     SetFocus(app->debug.assembler_source);
 }
 
@@ -262,114 +327,38 @@ static void app_assembler_sync_error_from_status(AppState *app, const char *stat
         return;
     }
     app->debug.assembler_error_line = (size_t)parsed_line;
-    if (app->debug.assembler_line_numbers != NULL) {
-        InvalidateRect(app->debug.assembler_line_numbers, NULL, TRUE);
+    if (app->debug.assembler_source != NULL) {
+        app_scintilla_send(app->debug.assembler_source, SCI_MARKERDELETEALL, 0, 0);
+        app_scintilla_send(app->debug.assembler_source, SCI_MARKERADD, (WPARAM)(parsed_line - 1), 0);
     }
     app_assembler_focus_line(app, app->debug.assembler_error_line);
 }
 
-/* Repaints the assembler gutter after source edits or scroll activity so line
-   numbers and the current error marker stay visually synchronized. */
+/* Keeps Scintilla's line-number margin wide enough for the current document. */
 static void app_assembler_update_line_numbers(AppState *app) {
-    if (app == NULL || app->debug.assembler_line_numbers == NULL) {
+    int line_count;
+    int digits = 1;
+    char sample[32] = "_9";
+
+    if (app == NULL || app->debug.assembler_source == NULL) {
         return;
     }
-    InvalidateRect(app->debug.assembler_line_numbers, NULL, TRUE);
-}
-
-/* Paints the assembler gutter with right-aligned line numbers plus one red
-   dot beside the active error line when the last compile failed locally. */
-static LRESULT CALLBACK app_assembler_gutter_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
-    AppState *app = (AppState *)GetWindowLongPtrA(GetParent(hwnd), GWLP_USERDATA);
-
-    switch (msg) {
-        case WM_PAINT: {
-            PAINTSTRUCT ps;
-            RECT rect;
-            RECT source_rect;
-            HDC hdc;
-            HGDIOBJ old_font;
-            HBRUSH background_brush;
-            HBRUSH error_brush;
-            HPEN error_pen;
-            HGDIOBJ old_brush;
-            HGDIOBJ old_pen;
-            TEXTMETRICA metrics;
-            int first_line;
-            int line_count;
-            int char_height;
-            int visible_lines;
-
-            BeginPaint(hwnd, &ps);
-            GetClientRect(hwnd, &rect);
-            hdc = ps.hdc;
-            background_brush = CreateSolidBrush(RGB(244, 240, 228));
-            FillRect(hdc, &rect, background_brush);
-            DeleteObject(background_brush);
-            if (app == NULL || app->debug.assembler_source == NULL) {
-                EndPaint(hwnd, &ps);
-                return 0;
-            }
-
-            old_font = SelectObject(hdc, app->debug.assembler_font != NULL ? app->debug.assembler_font : GetStockObject(ANSI_FIXED_FONT));
-            SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, RGB(96, 96, 96));
-            GetTextMetricsA(hdc, &metrics);
-            char_height = metrics.tmHeight + metrics.tmExternalLeading;
-            if (char_height <= 0) {
-                char_height = 16;
-            }
-
-            first_line = (int)SendMessageA(app->debug.assembler_source, EM_GETFIRSTVISIBLELINE, 0, 0);
-            line_count = (int)SendMessageA(app->debug.assembler_source, EM_GETLINECOUNT, 0, 0);
-            if (line_count < 1) {
-                line_count = 1;
-            }
-            GetClientRect(app->debug.assembler_source, &source_rect);
-            visible_lines = (source_rect.bottom - source_rect.top) / char_height + 2;
-            if (visible_lines < 1) {
-                visible_lines = 1;
-            }
-
-            error_brush = CreateSolidBrush(RGB(220, 40, 40));
-            error_pen = CreatePen(PS_SOLID, 1, RGB(220, 40, 40));
-            old_brush = SelectObject(hdc, error_brush);
-            old_pen = SelectObject(hdc, error_pen);
-
-            for (int i = 0; i < visible_lines; ++i) {
-                char number_buffer[16];
-                RECT line_rect = {18, i * char_height, rect.right - 6, (i + 1) * char_height};
-                int line_number = first_line + i + 1;
-
-                if (line_number > line_count) {
-                    break;
-                }
-                snprintf(number_buffer, sizeof(number_buffer), "%d", line_number);
-                DrawTextA(hdc, number_buffer, -1, &line_rect, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-
-                if (app->debug.assembler_error_line == (size_t)line_number) {
-                    int dot_center_y = i * char_height + char_height / 2;
-                    Ellipse(hdc, 5, dot_center_y - 4, 13, dot_center_y + 4);
-                }
-            }
-
-            SelectObject(hdc, old_pen);
-            SelectObject(hdc, old_brush);
-            DeleteObject(error_pen);
-            DeleteObject(error_brush);
-            SelectObject(hdc, old_font);
-            EndPaint(hwnd, &ps);
-            return 0;
-        }
-        case WM_LBUTTONDOWN:
-            if (app != NULL && app->debug.assembler_source != NULL) {
-                SetFocus(app->debug.assembler_source);
-            }
-            return 0;
-        default:
-            break;
+    line_count = (int)app_scintilla_send(app->debug.assembler_source, SCI_GETLINECOUNT, 0, 0);
+    while (line_count >= 10 && digits < 20) {
+        line_count /= 10;
+        ++digits;
     }
-    return DefWindowProcA(hwnd, msg, wparam, lparam);
+    sample[0] = '_';
+    for (int i = 0; i < digits; ++i) {
+        sample[i + 1] = '9';
+    }
+    sample[digits + 1] = '\0';
+    app_scintilla_send(
+        app->debug.assembler_source,
+        SCI_SETMARGINWIDTHN,
+        0,
+        app_scintilla_send(app->debug.assembler_source, SCI_TEXTWIDTH, STYLE_LINENUMBER, (LPARAM)sample)
+    );
 }
 
 /* Sizes the debugger controls to the current client area of the tool window. */
@@ -377,9 +366,11 @@ static LRESULT CALLBACK app_assembler_gutter_wndproc(HWND hwnd, UINT msg, WPARAM
 static void app_assembler_layout_controls(AppState *app, HWND hwnd) {
     RECT rect;
     RECT status_rect;
+    HDWP positions;
     int width;
     int height;
-    const int gutter_width = 56;
+    int source_height;
+    int source_width;
     const int edge_padding = 0;
     int status_height = 0;
 
@@ -391,27 +382,171 @@ static void app_assembler_layout_controls(AppState *app, HWND hwnd) {
     height = rect.bottom - rect.top;
 
     if (app->debug.assembler_status != NULL) {
-        SendMessageA(app->debug.assembler_status, WM_SIZE, 0, 0);
         GetWindowRect(app->debug.assembler_status, &status_rect);
         status_height = status_rect.bottom - status_rect.top;
     }
-    MoveWindow(
-        app->debug.assembler_line_numbers,
-        edge_padding,
-        edge_padding,
-        gutter_width,
-        height - status_height - (edge_padding * 2),
-        TRUE
-    );
-    MoveWindow(
-        app->debug.assembler_source,
-        edge_padding + gutter_width,
-        edge_padding,
-        width - gutter_width - (edge_padding * 2),
-        height - status_height - (edge_padding * 2),
-        TRUE
-    );
+    source_width = width - (edge_padding * 2);
+    if (source_width < 0) {
+        source_width = 0;
+    }
+    source_height = height - status_height - (edge_padding * 2);
+    if (source_height < 0) {
+        source_height = 0;
+    }
+    positions = BeginDeferWindowPos(app->debug.assembler_status != NULL ? 2 : 1);
+    if (positions != NULL) {
+        positions = DeferWindowPos(
+            positions,
+            app->debug.assembler_source,
+            NULL,
+            edge_padding,
+            edge_padding,
+            source_width,
+            source_height,
+            SWP_NOACTIVATE | SWP_NOZORDER
+        );
+    }
+    if (positions != NULL && app->debug.assembler_status != NULL) {
+        positions = DeferWindowPos(
+            positions,
+            app->debug.assembler_status,
+            NULL,
+            0,
+            height - status_height,
+            width,
+            status_height,
+            SWP_NOACTIVATE | SWP_NOZORDER
+        );
+    }
+    if (positions != NULL) {
+        EndDeferWindowPos(positions);
+    } else {
+        MoveWindow(
+            app->debug.assembler_source,
+            edge_padding,
+            edge_padding,
+            source_width,
+            source_height,
+            TRUE
+        );
+        if (app->debug.assembler_status != NULL) {
+            MoveWindow(
+                app->debug.assembler_status,
+                0,
+                height - status_height,
+                width,
+                status_height,
+                TRUE
+            );
+        }
+    }
     app_assembler_update_line_numbers(app);
+}
+
+static bool app_assembler_create_controls_from_resource(AppState *app, HWND hwnd) {
+    if (app_scintilla_module == NULL) {
+        app_scintilla_module = LoadLibraryA("Scintilla.dll");
+    }
+    if (app_scintilla_module == NULL) {
+        MessageBoxA(
+            hwnd,
+            "Scintilla.dll could not be loaded. Rebuild the application or place the DLL beside zx-spectrum.exe.",
+            "Spectrum Assembler",
+            MB_OK | MB_ICONERROR
+        );
+        return false;
+    }
+    app->debug.assembler_panel = CreateDialogParamA(
+        GetModuleHandleA(NULL),
+        MAKEINTRESOURCEA(APP_DIALOG_ASSEMBLER),
+        hwnd,
+        app_assembler_dlgproc,
+        (LPARAM)app
+    );
+    return app->debug.assembler_panel != NULL;
+}
+
+static LRESULT CALLBACK app_assembler_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    AppState *app = (AppState *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
+
+    switch (msg) {
+        case WM_NCCREATE: {
+            CREATESTRUCTA *create = (CREATESTRUCTA *)lparam;
+            app = (AppState *)create->lpCreateParams;
+            SetWindowLongPtrA(hwnd, GWLP_USERDATA, (LONG_PTR)app);
+            if (app != NULL) {
+                app->debug.assembler_hwnd = hwnd;
+            }
+            return TRUE;
+        }
+        case WM_CREATE: {
+            HMENU menu;
+            RECT rect;
+
+            if (app == NULL) {
+                return -1;
+            }
+            menu = app_create_assembler_menu();
+            if (menu != NULL) {
+                SetMenu(hwnd, menu);
+                DrawMenuBar(hwnd);
+            }
+            if (!app_assembler_create_controls_from_resource(app, hwnd)) {
+                return -1;
+            }
+            GetClientRect(hwnd, &rect);
+            MoveWindow(
+                app->debug.assembler_panel,
+                0,
+                0,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                TRUE
+            );
+            return 0;
+        }
+        case WM_SIZE:
+            if (app != NULL && app->debug.assembler_panel != NULL) {
+                MoveWindow(app->debug.assembler_panel, 0, 0, LOWORD(lparam), HIWORD(lparam), TRUE);
+                app_assembler_layout_controls(app, app->debug.assembler_panel);
+            }
+            return 0;
+        case WM_ENTERSIZEMOVE:
+            app_set_modal_loop_timer(app, hwnd, true);
+            return 0;
+        case WM_EXITSIZEMOVE:
+            app_set_modal_loop_timer(app, hwnd, false);
+            return 0;
+        case WM_TIMER:
+            if (app != NULL && wparam == APP_TIMER_MODAL_LOOP) {
+                app_tick_emulator(app);
+                return 0;
+            }
+            break;
+        case WM_COMMAND:
+            if (app != NULL &&
+                app->debug.assembler_panel != NULL &&
+                SendMessageA(app->debug.assembler_panel, WM_COMMAND, wparam, lparam)) {
+                return 0;
+            }
+            break;
+        case WM_CLOSE:
+            if (!app_assembler_confirm_close(hwnd, app)) {
+                return 0;
+            }
+            DestroyWindow(hwnd);
+            return 0;
+        case WM_DESTROY:
+            if (app != NULL) {
+                app_set_modal_loop_timer(app, hwnd, false);
+                app->debug.assembler_hwnd = NULL;
+                app->debug.assembler_panel = NULL;
+            }
+            return 0;
+        default:
+            break;
+    }
+    return DefWindowProcA(hwnd, msg, wparam, lparam);
 }
 
 /* Routes standard edit commands to the assembler source box so menu actions
@@ -426,90 +561,79 @@ static bool app_assembler_handle_edit_command(AppState *app, UINT command_id) {
 
     switch (command_id) {
         case APP_MENU_ASM_EDIT_UNDO:
-            if ((BOOL)SendMessageA(source, EM_CANUNDO, 0, 0)) {
-                SendMessageA(source, WM_UNDO, 0, 0);
+            if (app_scintilla_send(source, SCI_CANUNDO, 0, 0)) {
+                app_scintilla_send(source, SCI_UNDO, 0, 0);
             }
             return true;
         case APP_MENU_ASM_EDIT_CUT:
-            SendMessageA(source, WM_CUT, 0, 0);
+            app_scintilla_send(source, SCI_CUT, 0, 0);
             return true;
         case APP_MENU_ASM_EDIT_COPY:
-            SendMessageA(source, WM_COPY, 0, 0);
+            app_scintilla_send(source, SCI_COPY, 0, 0);
             return true;
         case APP_MENU_ASM_EDIT_PASTE:
-            SendMessageA(source, WM_PASTE, 0, 0);
+            app_scintilla_send(source, SCI_PASTE, 0, 0);
             return true;
         case APP_MENU_ASM_EDIT_DELETE:
-            SendMessageA(source, WM_CLEAR, 0, 0);
+            app_scintilla_send(source, SCI_REPLACESEL, 0, (LPARAM)"");
             return true;
         case APP_MENU_ASM_EDIT_SELECT_ALL:
-            SendMessageA(source, EM_SETSEL, 0, -1);
+            app_scintilla_send(source, SCI_SELECTALL, 0, 0);
             return true;
         default:
             return false;
     }
 }
 
-/* Keeps the assembler line-number gutter synchronized after scroll and text
-   navigation messages handled by the source edit control. */
+/* Adds assembler-specific shortcuts to the Scintilla editor. */
 static LRESULT CALLBACK app_assembler_source_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     HWND parent = GetParent(hwnd);
     AppState *app = parent != NULL ? (AppState *)GetWindowLongPtrA(parent, GWLP_USERDATA) : NULL;
+    HWND command_target = (app != NULL && app->debug.assembler_hwnd != NULL) ? app->debug.assembler_hwnd : parent;
     WNDPROC old_proc = (app != NULL) ? app->debug.assembler_source_wndproc : DefWindowProcA;
     LRESULT result;
+
+    if (app != NULL && msg == WM_CHAR && app->debug.assembler_suppress_next_char) {
+        app->debug.assembler_suppress_next_char = false;
+        if (wparam > 0 && wparam < 32) {
+            return 0;
+        }
+    }
 
     if (app != NULL && msg == WM_KEYDOWN) {
         const bool ctrl_down = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         const bool shift_down = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
 
         if ((UINT)wparam == VK_F1) {
-            SendMessageA(parent, WM_COMMAND, APP_MENU_ASM_HELP_SHOW, 0);
+            SendMessageA(command_target, WM_COMMAND, APP_MENU_ASM_HELP_SHOW, 0);
             return 0;
         }
         if ((UINT)wparam == VK_F5) {
-            SendMessageA(parent, WM_COMMAND, APP_MENU_ASM_FILE_RELOAD, 0);
+            SendMessageA(command_target, WM_COMMAND, APP_MENU_ASM_FILE_RELOAD, 0);
             return 0;
         }
 
         if (ctrl_down && !shift_down) {
             switch ((UINT)wparam) {
-                case 'A':
-                    app_assembler_handle_edit_command(app, APP_MENU_ASM_EDIT_SELECT_ALL);
-                    app_assembler_update_line_numbers(app);
-                    return 0;
-                case 'Z':
-                    app_assembler_handle_edit_command(app, APP_MENU_ASM_EDIT_UNDO);
-                    app_assembler_update_line_numbers(app);
-                    return 0;
-                case 'X':
-                    app_assembler_handle_edit_command(app, APP_MENU_ASM_EDIT_CUT);
-                    app_assembler_update_line_numbers(app);
-                    return 0;
-                case 'C':
-                    app_assembler_handle_edit_command(app, APP_MENU_ASM_EDIT_COPY);
-                    app_assembler_update_line_numbers(app);
-                    return 0;
-                case 'V':
-                    app_assembler_handle_edit_command(app, APP_MENU_ASM_EDIT_PASTE);
-                    app_assembler_update_line_numbers(app);
-                    return 0;
                 case 'N':
-                    SendMessageA(parent, WM_COMMAND, APP_MENU_ASM_FILE_NEW, 0);
+                    app->debug.assembler_suppress_next_char = true;
+                    SendMessageA(command_target, WM_COMMAND, APP_MENU_ASM_FILE_NEW, 0);
                     return 0;
                 case 'O':
-                    SendMessageA(parent, WM_COMMAND, APP_MENU_ASM_FILE_LOAD, 0);
+                    app->debug.assembler_suppress_next_char = true;
+                    SendMessageA(command_target, WM_COMMAND, APP_MENU_ASM_FILE_LOAD, 0);
                     return 0;
                 case 'S':
-                    SendMessageA(parent, WM_COMMAND, APP_MENU_ASM_FILE_SAVE, 0);
+                    app->debug.assembler_suppress_next_char = true;
+                    SendMessageA(command_target, WM_COMMAND, APP_MENU_ASM_FILE_SAVE, 0);
                     return 0;
                 case 'R':
-                    SendMessageA(parent, WM_COMMAND, APP_MENU_ASM_FILE_RELOAD, 0);
+                    app->debug.assembler_suppress_next_char = true;
+                    SendMessageA(command_target, WM_COMMAND, APP_MENU_ASM_FILE_RELOAD, 0);
                     return 0;
                 case 'B':
-                    SendMessageA(parent, WM_COMMAND, APP_MENU_ASM_BUILD_ASSEMBLE, 0);
-                    return 0;
-                case VK_INSERT:
-                    app_assembler_handle_edit_command(app, APP_MENU_ASM_EDIT_COPY);
+                    app->debug.assembler_suppress_next_char = true;
+                    SendMessageA(command_target, WM_COMMAND, APP_MENU_ASM_BUILD_ASSEMBLE, 0);
                     return 0;
                 default:
                     break;
@@ -518,33 +642,24 @@ static LRESULT CALLBACK app_assembler_source_wndproc(HWND hwnd, UINT msg, WPARAM
         if (ctrl_down && shift_down) {
             switch ((UINT)wparam) {
                 case 'S':
-                    SendMessageA(parent, WM_COMMAND, APP_MENU_ASM_FILE_SAVE_AS, 0);
+                    app->debug.assembler_suppress_next_char = true;
+                    SendMessageA(command_target, WM_COMMAND, APP_MENU_ASM_FILE_SAVE_AS, 0);
                     return 0;
                 case 'F':
-                    SendMessageA(parent, WM_COMMAND, APP_MENU_ASM_EDIT_FONT, 0);
+                    app->debug.assembler_suppress_next_char = true;
+                    SendMessageA(command_target, WM_COMMAND, APP_MENU_ASM_EDIT_FONT, 0);
                     return 0;
                 case 'L':
-                    SendMessageA(parent, WM_COMMAND, APP_MENU_ASM_EDIT_FORMAT, 0);
+                    app->debug.assembler_suppress_next_char = true;
+                    SendMessageA(command_target, WM_COMMAND, APP_MENU_ASM_EDIT_FORMAT, 0);
                     return 0;
                 case 'U':
-                    SendMessageA(parent, WM_COMMAND, APP_MENU_ASM_EDIT_UPPERCASE, 0);
+                    app->debug.assembler_suppress_next_char = true;
+                    SendMessageA(command_target, WM_COMMAND, APP_MENU_ASM_EDIT_UPPERCASE, 0);
                     return 0;
                 case 'T':
-                    SendMessageA(parent, WM_COMMAND, APP_MENU_ASM_FILE_EXPORT_TAP, 0);
-                    return 0;
-                default:
-                    break;
-            }
-        }
-        if (shift_down && !ctrl_down) {
-            switch ((UINT)wparam) {
-                case VK_DELETE:
-                    app_assembler_handle_edit_command(app, APP_MENU_ASM_EDIT_CUT);
-                    app_assembler_update_line_numbers(app);
-                    return 0;
-                case VK_INSERT:
-                    app_assembler_handle_edit_command(app, APP_MENU_ASM_EDIT_PASTE);
-                    app_assembler_update_line_numbers(app);
+                    app->debug.assembler_suppress_next_char = true;
+                    SendMessageA(command_target, WM_COMMAND, APP_MENU_ASM_FILE_EXPORT_TAP, 0);
                     return 0;
                 default:
                     break;
@@ -554,101 +669,33 @@ static LRESULT CALLBACK app_assembler_source_wndproc(HWND hwnd, UINT msg, WPARAM
 
     result = CallWindowProcA(old_proc, hwnd, msg, wparam, lparam);
 
-    if (app != NULL) {
-        switch (msg) {
-            case WM_VSCROLL:
-            case WM_MOUSEWHEEL:
-            case WM_KEYDOWN:
-            case WM_KEYUP:
-            case WM_CHAR:
-            case WM_LBUTTONUP:
-            case WM_SIZE:
-            case EM_SCROLL:
-            case EM_LINESCROLL:
-            case EM_SCROLLCARET:
-                app_assembler_update_line_numbers(app);
-                break;
-            default:
-                break;
-        }
-    }
     return result;
 }
 
 
-static LRESULT CALLBACK app_assembler_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+static INT_PTR CALLBACK app_assembler_dlgproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     AppState *app = (AppState *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
 
     switch (msg) {
-        case WM_NCCREATE: {
-            CREATESTRUCTA *create = (CREATESTRUCTA *)lparam;
-            SetWindowLongPtrA(hwnd, GWLP_USERDATA, (LONG_PTR)create->lpCreateParams);
-            return TRUE;
-        }
-        case WM_CREATE: {
-            HFONT font;
-            HMENU menu;
+        case WM_INITDIALOG: {
             LOGFONTA assembler_font;
+
+            app = (AppState *)lparam;
+            SetWindowLongPtrA(hwnd, GWLP_USERDATA, (LONG_PTR)app);
+            if (app == NULL) {
+                return FALSE;
+            }
             app->debug.assembler_source_brush = CreateSolidBrush(RGB(244, 240, 228));
             if (app_assembler_load_saved_font(&assembler_font)) {
                 app->debug.assembler_font = app_create_assembler_font_from_logfont(&assembler_font);
             } else {
-                app->debug.assembler_font = app_create_monospace_font();
-            }
-            font = app->debug.assembler_font != NULL
-                ? app->debug.assembler_font
-                : (HFONT)GetStockObject(ANSI_FIXED_FONT);
-            menu = app_create_assembler_menu();
-            if (menu != NULL) {
-                SetMenu(hwnd, menu);
-                DrawMenuBar(hwnd);
+                app_default_assembler_logfont(&assembler_font);
+                app->debug.assembler_font = app_create_assembler_font_from_logfont(&assembler_font);
             }
             SetTimer(hwnd, APP_TIMER_ASM_FILE_WATCH, 1000, NULL);
-            app->debug.assembler_status = CreateWindowExA(
-                0,
-                STATUSCLASSNAMEA,
-                "",
-                WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
-                0,
-                0,
-                0,
-                0,
-                hwnd,
-                (HMENU)(INT_PTR)APP_CTRL_ASM_STATUS,
-                NULL,
-                NULL
-            );
-            app->debug.assembler_line_numbers = CreateWindowExA(
-                0,
-                "ZXSpecAssemblerGutter",
-                "",
-                WS_CHILD | WS_VISIBLE | WS_BORDER,
-                0,
-                0,
-                0,
-                0,
-                hwnd,
-                (HMENU)(INT_PTR)APP_CTRL_ASM_LINES,
-                NULL,
-                NULL
-            );
-            app->debug.assembler_source = CreateWindowExA(
-                0,
-                "EDIT",
-                "",
-                WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | WS_HSCROLL |
-                    ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_WANTRETURN,
-                0,
-                0,
-                0,
-                0,
-                hwnd,
-                (HMENU)(INT_PTR)APP_CTRL_ASM_SOURCE,
-                NULL,
-                NULL
-            );
-            SendMessageA(app->debug.assembler_line_numbers, WM_SETFONT, (WPARAM)font, TRUE);
-            SendMessageA(app->debug.assembler_source, WM_SETFONT, (WPARAM)font, TRUE);
+            app->debug.assembler_status = GetDlgItem(hwnd, APP_CTRL_ASM_STATUS);
+            app->debug.assembler_source = GetDlgItem(hwnd, APP_CTRL_ASM_SOURCE);
+            app_assembler_configure_scintilla(app->debug.assembler_source, &assembler_font);
             app->debug.assembler_source_wndproc = (WNDPROC)SetWindowLongPtrA(
                 app->debug.assembler_source,
                 GWLP_WNDPROC,
@@ -660,123 +707,132 @@ static LRESULT CALLBACK app_assembler_wndproc(HWND hwnd, UINT msg, WPARAM wparam
                 "Mini assembler with labels, EQU constants, DEFS/DS, INCBIN, TAP export, and Load/Save. ORG in the source sets the assembly address; otherwise the current PC is used."
             );
             app_assembler_refresh_window(app);
-            return 0;
+            return FALSE;
         }
-        case WM_CTLCOLOREDIT:
-            if (app != NULL && (HWND)lparam == app->debug.assembler_source) {
+        case WM_CTLCOLORDLG:
+            if (app != NULL && app->debug.assembler_source_brush != NULL) {
+                SetWindowLongPtrA(hwnd, DWLP_MSGRESULT, (LONG_PTR)app->debug.assembler_source_brush);
+                return TRUE;
+            }
+            break;
+        case WM_CTLCOLORSTATIC:
+            if (app != NULL && app->debug.assembler_source_brush != NULL) {
                 HDC hdc = (HDC)wparam;
-                SetTextColor(hdc, RGB(32, 32, 32));
                 SetBkColor(hdc, RGB(244, 240, 228));
-                return (LRESULT)(app->debug.assembler_source_brush != NULL
-                    ? app->debug.assembler_source_brush
-                    : GetSysColorBrush(COLOR_WINDOW));
+                SetWindowLongPtrA(hwnd, DWLP_MSGRESULT, (LONG_PTR)app->debug.assembler_source_brush);
+                return TRUE;
+            }
+            break;
+        case WM_CTLCOLORSCROLLBAR:
+            if (app != NULL && app->debug.assembler_source_brush != NULL) {
+                SetWindowLongPtrA(hwnd, DWLP_MSGRESULT, (LONG_PTR)app->debug.assembler_source_brush);
+                return TRUE;
+            }
+            break;
+        case WM_ERASEBKGND:
+            if (app != NULL && app->debug.assembler_source_brush != NULL) {
+                RECT background_rect;
+                HDC hdc = (HDC)wparam;
+                GetClientRect(hwnd, &background_rect);
+                FillRect(hdc, &background_rect, app->debug.assembler_source_brush);
+                return TRUE;
             }
             break;
         case WM_SIZE:
             if (app != NULL) {
                 app_assembler_layout_controls(app, hwnd);
             }
-            return 0;
-        case WM_ENTERSIZEMOVE:
-            app_set_modal_loop_timer(app, hwnd, true);
-            return 0;
-        case WM_EXITSIZEMOVE:
-            app_set_modal_loop_timer(app, hwnd, false);
-            return 0;
+            return TRUE;
         case WM_TIMER:
-            if (app != NULL && wparam == APP_TIMER_MODAL_LOOP) {
-                app_tick_emulator(app);
-                return 0;
-            }
             if (app != NULL && wparam == APP_TIMER_ASM_FILE_WATCH) {
                 app_assembler_poll_external_change(hwnd, app);
-                return 0;
+                return TRUE;
+            }
+            break;
+        case WM_NOTIFY:
+            if (app != NULL && lparam != 0) {
+                SCNotification *notification = (SCNotification *)lparam;
+                if (notification->nmhdr.idFrom == APP_CTRL_ASM_SOURCE &&
+                    notification->nmhdr.code == SCN_MODIFIED &&
+                    (notification->modificationType & (SC_MOD_INSERTTEXT | SC_MOD_DELETETEXT)) != 0) {
+                    if (!app->debug.assembler_ignore_change) {
+                        app->debug.assembler_dirty = true;
+                        app_assembler_clear_error_marker(app);
+                        app_assembler_set_status(app, "");
+                    }
+                    app_assembler_update_line_numbers(app);
+                    return TRUE;
+                }
             }
             break;
         case WM_COMMAND:
             if (app == NULL) {
                 break;
             }
-            if (LOWORD(wparam) == APP_CTRL_ASM_SOURCE && HIWORD(wparam) == EN_CHANGE) {
-                if (!app->debug.assembler_ignore_change) {
-                    app->debug.assembler_dirty = true;
-                    app_assembler_clear_error_marker(app);
-                    app_assembler_set_status(app, "");
-                }
-                app_assembler_update_line_numbers(app);
-                return 0;
-            }
             if (LOWORD(wparam) == APP_CTRL_ASM_HELP || LOWORD(wparam) == APP_MENU_ASM_HELP_SHOW) {
-                app_show_assembler_help(hwnd);
-                return 0;
+                app_show_assembler_help(app->debug.assembler_hwnd != NULL ? app->debug.assembler_hwnd : hwnd);
+                return TRUE;
             }
             if (LOWORD(wparam) == APP_MENU_ASM_EDIT_FONT) {
-                app_assembler_choose_font(hwnd, app);
-                return 0;
+                app_assembler_choose_font(app->debug.assembler_hwnd != NULL ? app->debug.assembler_hwnd : hwnd, app);
+                return TRUE;
             }
             if (LOWORD(wparam) == APP_MENU_ASM_EDIT_FORMAT) {
-                app_assembler_format_source(hwnd, app);
-                return 0;
+                app_assembler_format_source(app->debug.assembler_hwnd != NULL ? app->debug.assembler_hwnd : hwnd, app);
+                return TRUE;
             }
             if (LOWORD(wparam) == APP_MENU_ASM_EDIT_UPPERCASE) {
-                app_assembler_uppercase_source(hwnd, app);
-                return 0;
+                app_assembler_uppercase_source(app->debug.assembler_hwnd != NULL ? app->debug.assembler_hwnd : hwnd, app);
+                return TRUE;
             }
             if (LOWORD(wparam) == APP_MENU_ASM_FILE_NEW) {
                 char status[512];
-                app_assembler_new_source(hwnd, app, status, sizeof(status));
+                app_assembler_new_source(app->debug.assembler_hwnd != NULL ? app->debug.assembler_hwnd : hwnd, app, status, sizeof(status));
                 app_assembler_set_status(app, status);
-                return 0;
+                return TRUE;
             }
             if (LOWORD(wparam) == APP_CTRL_ASM_LOAD || LOWORD(wparam) == APP_MENU_ASM_FILE_LOAD) {
                 char status[512];
-                app_assembler_load_source(hwnd, app, status, sizeof(status));
+                app_assembler_load_source(app->debug.assembler_hwnd != NULL ? app->debug.assembler_hwnd : hwnd, app, status, sizeof(status));
                 app_assembler_set_status(app, status);
-                return 0;
+                return TRUE;
             }
             if (LOWORD(wparam) == APP_MENU_ASM_FILE_RELOAD) {
                 char status[512];
-                app_assembler_reload_source(hwnd, app, status, sizeof(status));
+                app_assembler_reload_source(app->debug.assembler_hwnd != NULL ? app->debug.assembler_hwnd : hwnd, app, status, sizeof(status));
                 app_assembler_set_status(app, status);
-                return 0;
+                return TRUE;
             }
             if (LOWORD(wparam) == APP_CTRL_ASM_SAVE || LOWORD(wparam) == APP_MENU_ASM_FILE_SAVE) {
                 char status[512];
-                app_assembler_save_source(hwnd, app, status, sizeof(status));
+                app_assembler_save_source(app->debug.assembler_hwnd != NULL ? app->debug.assembler_hwnd : hwnd, app, status, sizeof(status));
                 app_assembler_set_status(app, status);
-                return 0;
+                return TRUE;
             }
             if (LOWORD(wparam) == APP_MENU_ASM_FILE_SAVE_AS) {
                 char status[512];
-                app_assembler_save_source_as(hwnd, app, status, sizeof(status));
+                app_assembler_save_source_as(app->debug.assembler_hwnd != NULL ? app->debug.assembler_hwnd : hwnd, app, status, sizeof(status));
                 app_assembler_set_status(app, status);
-                return 0;
+                return TRUE;
             }
             if (LOWORD(wparam) == APP_MENU_ASM_FILE_EXPORT_TAP) {
                 char status[512];
-                if (!app_assembler_export_tap(hwnd, app, status, sizeof(status))) {
+                if (!app_assembler_export_tap(app->debug.assembler_hwnd != NULL ? app->debug.assembler_hwnd : hwnd, app, status, sizeof(status))) {
                     app_assembler_sync_error_from_status(app, status);
                 }
                 app_assembler_set_status(app, status);
-                return 0;
+                return TRUE;
             }
             if (LOWORD(wparam) == APP_CTRL_ASM_APPLY || LOWORD(wparam) == APP_MENU_ASM_BUILD_ASSEMBLE) {
-                app_assembler_apply_source(hwnd, app);
-                return 0;
+                app_assembler_apply_source(app->debug.assembler_hwnd != NULL ? app->debug.assembler_hwnd : hwnd, app);
+                return TRUE;
             }
             if (app_assembler_handle_edit_command(app, LOWORD(wparam))) {
-                return 0;
+                return TRUE;
             }
             break;
-        case WM_CLOSE:
-            if (!app_assembler_confirm_close(hwnd, app)) {
-                return 0;
-            }
-            DestroyWindow(hwnd);
-            return 0;
         case WM_DESTROY:
             if (app != NULL) {
-                app_set_modal_loop_timer(app, hwnd, false);
                 KillTimer(hwnd, APP_TIMER_ASM_FILE_WATCH);
                 if (app->debug.assembler_source_brush != NULL) {
                     DeleteObject(app->debug.assembler_source_brush);
@@ -786,31 +842,26 @@ static LRESULT CALLBACK app_assembler_wndproc(HWND hwnd, UINT msg, WPARAM wparam
                     DeleteObject(app->debug.assembler_font);
                     app->debug.assembler_font = NULL;
                 }
-                app->debug.assembler_hwnd = NULL;
-                app->debug.assembler_line_numbers = NULL;
+                app->debug.assembler_panel = NULL;
                 app->debug.assembler_source = NULL;
                 app->debug.assembler_status = NULL;
-                app->debug.assembler_apply_button = NULL;
-                app->debug.assembler_help_button = NULL;
-                app->debug.assembler_load_button = NULL;
-                app->debug.assembler_save_button = NULL;
                 app->debug.assembler_source_wndproc = NULL;
                 app->debug.assembler_dirty = false;
                 app->debug.assembler_ignore_change = false;
+                app->debug.assembler_suppress_next_char = false;
                 app->debug.assembler_has_file_write_time = false;
                 app->debug.assembler_file_change_prompt_active = false;
                 app->debug.assembler_error_line = 0;
                 ZeroMemory(&app->debug.assembler_file_write_time, sizeof(app->debug.assembler_file_write_time));
             }
-            return 0;
+            return TRUE;
         default:
             break;
     }
-    return DefWindowProcA(hwnd, msg, wparam, lparam);
+    return FALSE;
 }
 
-/* Registers the small debugger and assembler tool window classes once during
-   startup so they can be created on demand from the Tools menu. */
+/* Registers the custom assembler frame and line-number gutter classes. */
 static bool app_register_tool_window_classes(HINSTANCE instance) {
     WNDCLASSA wc;
 
@@ -838,16 +889,6 @@ static bool app_register_tool_window_classes(HINSTANCE instance) {
     wc.lpfnWndProc = app_assembler_wndproc;
     wc.hInstance = instance;
     wc.lpszClassName = "ZXSpecAssemblerWindow";
-    wc.hCursor = LoadCursorA(NULL, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-    if (RegisterClassA(&wc) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
-        return false;
-    }
-
-    ZeroMemory(&wc, sizeof(wc));
-    wc.lpfnWndProc = app_assembler_gutter_wndproc;
-    wc.hInstance = instance;
-    wc.lpszClassName = "ZXSpecAssemblerGutter";
     wc.hCursor = LoadCursorA(NULL, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     if (RegisterClassA(&wc) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
@@ -917,7 +958,7 @@ static void app_open_assembler_window(AppState *app) {
         0,
         "ZXSpecAssemblerWindow",
         "Spectrum Assembler",
-        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
         700,
@@ -927,6 +968,9 @@ static void app_open_assembler_window(AppState *app) {
         GetModuleHandleA(NULL),
         app
     );
+    if (app->debug.assembler_hwnd == NULL) {
+        return;
+    }
     app_apply_window_icons(app->debug.assembler_hwnd);
     app_assembler_update_title(app);
     if (app_assembler_load_last_path(path, sizeof(path))) {
@@ -1154,7 +1198,7 @@ static bool app_assembler_load_source_path(
     normalized[normalized_index] = '\0';
 
     app->debug.assembler_ignore_change = true;
-    SetWindowTextA(app->debug.assembler_source, normalized);
+    app_assembler_editor_set_text(app->debug.assembler_source, normalized);
     app->debug.assembler_ignore_change = false;
     app->debug.assembler_dirty = false;
     app_assembler_clear_error_marker(app);
@@ -1265,7 +1309,7 @@ static bool app_assembler_write_source_to_path(
     char *status_buffer,
     size_t status_buffer_size
 ) {
-    int source_length = GetWindowTextLengthA(app->debug.assembler_source);
+    int source_length = app_assembler_editor_text_length(app->debug.assembler_source);
     char *source;
     FILE *file;
 
@@ -1274,7 +1318,7 @@ static bool app_assembler_write_source_to_path(
         snprintf(status_buffer, status_buffer_size, "Out of memory.");
         return false;
     }
-    GetWindowTextA(app->debug.assembler_source, source, source_length + 1);
+    app_assembler_editor_get_text(app->debug.assembler_source, source, source_length + 1);
 
     file = fopen(path, "wb");
     if (file == NULL) {
@@ -1359,7 +1403,7 @@ static bool app_assembler_export_tap(HWND hwnd, AppState *app, char *status_buff
         return false;
     }
 
-    source_length = GetWindowTextLengthA(app->debug.assembler_source);
+    source_length = app_assembler_editor_text_length(app->debug.assembler_source);
     if (source_length <= 0) {
         snprintf(status_buffer, status_buffer_size, "Enter one or more assembler lines first.");
         return false;
@@ -1371,7 +1415,7 @@ static bool app_assembler_export_tap(HWND hwnd, AppState *app, char *status_buff
         return false;
     }
     memset(&output, 0, sizeof(output));
-    GetWindowTextA(app->debug.assembler_source, source, source_length + 1);
+    app_assembler_editor_get_text(app->debug.assembler_source, source, source_length + 1);
     if (!app_assembler_prepare_source(app, source, &prepared_source, status_buffer, status_buffer_size)) {
         free(source);
         return false;
@@ -1475,7 +1519,7 @@ static bool app_assembler_new_source(HWND hwnd, AppState *app, char *status_buff
     }
 
     app->debug.assembler_ignore_change = true;
-    SetWindowTextA(app->debug.assembler_source, "");
+    app_assembler_editor_set_text(app->debug.assembler_source, "");
     app->debug.assembler_ignore_change = false;
     app->debug.assembler_dirty = false;
     app_assembler_clear_error_marker(app);
@@ -1491,7 +1535,7 @@ static void app_assembler_apply_source(HWND hwnd, AppState *app) {
     char status[512];
     uint16_t effective_address;
     uint16_t org_address;
-    int source_length = GetWindowTextLengthA(app->debug.assembler_source);
+    int source_length = app_assembler_editor_text_length(app->debug.assembler_source);
     AssemblerPreparedSource prepared_source;
     char *source;
     (void)hwnd;
@@ -1507,7 +1551,7 @@ static void app_assembler_apply_source(HWND hwnd, AppState *app) {
         app_assembler_set_status(app, "Out of memory.");
         return;
     }
-    GetWindowTextA(app->debug.assembler_source, source, source_length + 1);
+    app_assembler_editor_get_text(app->debug.assembler_source, source, source_length + 1);
     if (!app_assembler_prepare_source(app, source, &prepared_source, status, sizeof(status))) {
         app_assembler_sync_error_from_status(app, status);
         app_assembler_set_status(app, status);
@@ -1635,12 +1679,8 @@ static void app_assembler_apply_font(AppState *app, const LOGFONTA *font) {
     }
     app->debug.assembler_font = new_font;
 
-    if (app->debug.assembler_line_numbers != NULL) {
-        SendMessageA(app->debug.assembler_line_numbers, WM_SETFONT, (WPARAM)new_font, TRUE);
-        InvalidateRect(app->debug.assembler_line_numbers, NULL, TRUE);
-    }
     if (app->debug.assembler_source != NULL) {
-        SendMessageA(app->debug.assembler_source, WM_SETFONT, (WPARAM)new_font, TRUE);
+        app_assembler_apply_scintilla_font(app->debug.assembler_source, font);
         InvalidateRect(app->debug.assembler_source, NULL, TRUE);
     }
     app_assembler_update_line_numbers(app);
@@ -1753,13 +1793,13 @@ static void app_assembler_format_source(HWND hwnd, AppState *app) {
         return;
     }
 
-    source_length = GetWindowTextLengthA(app->debug.assembler_source);
+    source_length = app_assembler_editor_text_length(app->debug.assembler_source);
     source = (char *)malloc((size_t)source_length + 1);
     if (source == NULL) {
         app_assembler_set_status(app, "Out of memory.");
         return;
     }
-    GetWindowTextA(app->debug.assembler_source, source, source_length + 1);
+    app_assembler_editor_get_text(app->debug.assembler_source, source, source_length + 1);
 
     if (!app_assembler_format_source_text(source, &formatted)) {
         free(source);
@@ -1768,7 +1808,7 @@ static void app_assembler_format_source(HWND hwnd, AppState *app) {
     }
 
     app->debug.assembler_ignore_change = true;
-    SetWindowTextA(app->debug.assembler_source, formatted);
+    app_assembler_editor_set_text(app->debug.assembler_source, formatted);
     app->debug.assembler_ignore_change = false;
     app->debug.assembler_dirty = true;
     app_assembler_clear_error_marker(app);
@@ -1791,13 +1831,13 @@ static void app_assembler_uppercase_source(HWND hwnd, AppState *app) {
         return;
     }
 
-    source_length = GetWindowTextLengthA(app->debug.assembler_source);
+    source_length = app_assembler_editor_text_length(app->debug.assembler_source);
     source = (char *)malloc((size_t)source_length + 1);
     if (source == NULL) {
         app_assembler_set_status(app, "Out of memory.");
         return;
     }
-    GetWindowTextA(app->debug.assembler_source, source, source_length + 1);
+    app_assembler_editor_get_text(app->debug.assembler_source, source, source_length + 1);
 
     if (!app_assembler_uppercase_source_text(source, &uppercase_text)) {
         free(source);
@@ -1806,7 +1846,7 @@ static void app_assembler_uppercase_source(HWND hwnd, AppState *app) {
     }
 
     app->debug.assembler_ignore_change = true;
-    SetWindowTextA(app->debug.assembler_source, uppercase_text);
+    app_assembler_editor_set_text(app->debug.assembler_source, uppercase_text);
     app->debug.assembler_ignore_change = false;
     app->debug.assembler_dirty = true;
     app_assembler_clear_error_marker(app);

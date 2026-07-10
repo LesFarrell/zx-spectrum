@@ -6,71 +6,43 @@ static LRESULT CALLBACK app_poke_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPA
     switch (msg) {
         case WM_NCCREATE: {
             CREATESTRUCTA *create = (CREATESTRUCTA *)lparam;
-            SetWindowLongPtrA(hwnd, GWLP_USERDATA, (LONG_PTR)create->lpCreateParams);
+            app = (AppState *)create->lpCreateParams;
+            SetWindowLongPtrA(hwnd, GWLP_USERDATA, (LONG_PTR)app);
+            if (app != NULL) {
+                app->debug.poke_hwnd = hwnd;
+            }
             return TRUE;
         }
         case WM_CREATE: {
-            HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-            app->debug.poke_background_brush = CreateSolidBrush(RGB(223, 229, 238));
-            app->debug.poke_input_brush = CreateSolidBrush(RGB(248, 250, 252));
+            RECT rect;
 
-            CreateWindowExA(0, "STATIC", "Address:", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)1, NULL, NULL);
-            app->debug.poke_address_edit = CreateWindowExA(
-                WS_EX_CLIENTEDGE,
-                "EDIT",
-                "",
-                WS_CHILD | WS_VISIBLE | WS_GROUP | WS_TABSTOP | ES_LEFT | ES_AUTOHSCROLL | ES_UPPERCASE,
-                0,
-                0,
-                0,
-                0,
+            if (app == NULL) {
+                return -1;
+            }
+            app->debug.poke_panel = CreateDialogParamA(
+                GetModuleHandleA(NULL),
+                MAKEINTRESOURCEA(APP_DIALOG_POKE),
                 hwnd,
-                (HMENU)(INT_PTR)APP_CTRL_POKE_ADDRESS,
-                NULL,
-                NULL
+                app_poke_dlgproc,
+                (LPARAM)app
             );
-            CreateWindowExA(0, "STATIC", "Values:", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)2, NULL, NULL);
-            app->debug.poke_values_edit = CreateWindowExA(
-                WS_EX_CLIENTEDGE,
-                "EDIT",
-                "",
-                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_LEFT | ES_AUTOHSCROLL | ES_WANTRETURN,
+            if (app->debug.poke_panel == NULL) {
+                return -1;
+            }
+            GetClientRect(hwnd, &rect);
+            MoveWindow(
+                app->debug.poke_panel,
                 0,
                 0,
-                0,
-                0,
-                hwnd,
-                (HMENU)(INT_PTR)APP_CTRL_POKE_VALUES,
-                NULL,
-                NULL
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                TRUE
             );
-            app->debug.poke_apply_button = CreateWindowExA(
-                0,
-                "BUTTON",
-                "Apply",
-                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                0,
-                0,
-                0,
-                0,
-                hwnd,
-                (HMENU)(INT_PTR)APP_CTRL_POKE_APPLY,
-                NULL,
-                NULL
-            );
-
-            SendMessageA(app->debug.poke_address_edit, EM_SETLIMITTEXT, 15, 0);
-            SendMessageA(app->debug.poke_values_edit, EM_SETLIMITTEXT, 2047, 0);
-            SendMessageA(app->debug.poke_address_edit, WM_SETFONT, (WPARAM)font, TRUE);
-            SendMessageA(app->debug.poke_values_edit, WM_SETFONT, (WPARAM)font, TRUE);
-            SendMessageA(app->debug.poke_apply_button, WM_SETFONT, (WPARAM)font, TRUE);
-            app_poke_layout_controls(app, hwnd);
-            app_poke_refresh_window(app);
             return 0;
         }
         case WM_SIZE:
-            if (app != NULL) {
-                app_poke_layout_controls(app, hwnd);
+            if (app != NULL && app->debug.poke_panel != NULL) {
+                MoveWindow(app->debug.poke_panel, 0, 0, LOWORD(lparam), HIWORD(lparam), TRUE);
             }
             return 0;
         case WM_ENTERSIZEMOVE:
@@ -85,12 +57,64 @@ static LRESULT CALLBACK app_poke_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPA
                 return 0;
             }
             break;
+        case WM_CLOSE:
+            DestroyWindow(hwnd);
+            return 0;
+        case WM_DESTROY:
+            if (app != NULL) {
+                app_set_modal_loop_timer(app, hwnd, false);
+                app->debug.poke_hwnd = NULL;
+                app->debug.poke_panel = NULL;
+            }
+            return 0;
+        default:
+            break;
+    }
+    return DefWindowProcA(hwnd, msg, wparam, lparam);
+}
+
+static INT_PTR CALLBACK app_poke_dlgproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    AppState *app = (AppState *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
+
+    switch (msg) {
+        case WM_INITDIALOG: {
+            HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+            app = (AppState *)lparam;
+            SetWindowLongPtrA(hwnd, GWLP_USERDATA, (LONG_PTR)app);
+            if (app == NULL) {
+                return FALSE;
+            }
+            app->debug.poke_background_brush = CreateSolidBrush(GetSysColor(COLOR_BTNFACE));
+            app->debug.poke_input_brush = CreateSolidBrush(GetSysColor(COLOR_WINDOW));
+            app->debug.poke_address_edit = GetDlgItem(hwnd, APP_CTRL_POKE_ADDRESS);
+            app->debug.poke_values_edit = GetDlgItem(hwnd, APP_CTRL_POKE_VALUES);
+            app->debug.poke_apply_button = GetDlgItem(hwnd, APP_CTRL_POKE_APPLY);
+
+            SendMessageA(app->debug.poke_address_edit, EM_SETLIMITTEXT, 15, 0);
+            SendMessageA(app->debug.poke_values_edit, EM_SETLIMITTEXT, 2047, 0);
+            SendMessageA(app->debug.poke_address_edit, WM_SETFONT, (WPARAM)font, TRUE);
+            SendMessageA(app->debug.poke_values_edit, WM_SETFONT, (WPARAM)font, TRUE);
+            SendMessageA(app->debug.poke_apply_button, WM_SETFONT, (WPARAM)font, TRUE);
+            app_poke_layout_controls(app, hwnd);
+            app_poke_refresh_window(app);
+            return FALSE;
+        }
+        case WM_SIZE:
+            if (app != NULL) {
+                app_poke_layout_controls(app, hwnd);
+            }
+            return TRUE;
+        case WM_ENTERSIZEMOVE:
+        case WM_EXITSIZEMOVE:
+        case WM_TIMER:
+            break;
         case WM_ERASEBKGND:
             if (app != NULL && app->debug.poke_background_brush != NULL) {
                 RECT rect;
                 GetClientRect(hwnd, &rect);
                 FillRect((HDC)wparam, &rect, app->debug.poke_background_brush);
-                return 1;
+                SetWindowLongPtrA(hwnd, DWLP_MSGRESULT, 1);
+                return TRUE;
             }
             break;
         case WM_CTLCOLOREDIT:
@@ -98,32 +122,24 @@ static LRESULT CALLBACK app_poke_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPA
                 (((HWND)lparam == app->debug.poke_address_edit) ||
                  ((HWND)lparam == app->debug.poke_values_edit))) {
                 HDC hdc = (HDC)wparam;
-                SetTextColor(hdc, RGB(25, 38, 52));
-                SetBkColor(hdc, RGB(248, 250, 252));
-                return (LRESULT)(app->debug.poke_input_brush != NULL
+                SetTextColor(hdc, GetSysColor(COLOR_WINDOWTEXT));
+                SetBkColor(hdc, GetSysColor(COLOR_WINDOW));
+                SetWindowLongPtrA(hwnd, DWLP_MSGRESULT, (LONG_PTR)(app->debug.poke_input_brush != NULL
                     ? app->debug.poke_input_brush
-                    : GetSysColorBrush(COLOR_WINDOW));
+                    : GetSysColorBrush(COLOR_WINDOW)));
+                return TRUE;
             }
             break;
         case WM_CTLCOLORSTATIC:
             if (app != NULL) {
                 HDC hdc = (HDC)wparam;
-                SetTextColor(hdc, RGB(37, 52, 70));
-                SetBkColor(hdc, RGB(223, 229, 238));
+                SetTextColor(hdc, GetSysColor(COLOR_BTNTEXT));
+                SetBkColor(hdc, GetSysColor(COLOR_BTNFACE));
                 SetBkMode(hdc, TRANSPARENT);
-                return (LRESULT)(app->debug.poke_background_brush != NULL
+                SetWindowLongPtrA(hwnd, DWLP_MSGRESULT, (LONG_PTR)(app->debug.poke_background_brush != NULL
                     ? app->debug.poke_background_brush
-                    : GetSysColorBrush(COLOR_WINDOW));
-            }
-            break;
-        case WM_CTLCOLORBTN:
-            if (app != NULL) {
-                HDC hdc = (HDC)wparam;
-                SetTextColor(hdc, RGB(25, 38, 52));
-                SetBkColor(hdc, RGB(223, 229, 238));
-                return (LRESULT)(app->debug.poke_background_brush != NULL
-                    ? app->debug.poke_background_brush
-                    : GetSysColorBrush(COLOR_BTNFACE));
+                    : GetSysColorBrush(COLOR_BTNFACE)));
+                return TRUE;
             }
             break;
         case WM_COMMAND:
@@ -132,20 +148,18 @@ static LRESULT CALLBACK app_poke_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPA
             }
             if (LOWORD(wparam) == APP_CTRL_POKE_APPLY) {
                 app_poke_apply_values(hwnd, app);
-                return 0;
+                return TRUE;
             }
             if ((LOWORD(wparam) == APP_CTRL_POKE_ADDRESS || LOWORD(wparam) == APP_CTRL_POKE_VALUES) &&
                 HIWORD(wparam) == EN_UPDATE) {
                 app_poke_set_status(app, "");
-                return 0;
+                return TRUE;
             }
             break;
         case WM_CLOSE:
-            DestroyWindow(hwnd);
-            return 0;
+            return TRUE;
         case WM_DESTROY:
             if (app != NULL) {
-                app_set_modal_loop_timer(app, hwnd, false);
                 if (app->debug.poke_background_brush != NULL) {
                     DeleteObject(app->debug.poke_background_brush);
                     app->debug.poke_background_brush = NULL;
@@ -154,25 +168,16 @@ static LRESULT CALLBACK app_poke_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPA
                     DeleteObject(app->debug.poke_input_brush);
                     app->debug.poke_input_brush = NULL;
                 }
-                app->debug.poke_hwnd = NULL;
+                app->debug.poke_panel = NULL;
                 app->debug.poke_address_edit = NULL;
                 app->debug.poke_values_edit = NULL;
                 app->debug.poke_apply_button = NULL;
             }
-            return 0;
+            return TRUE;
         default:
             break;
     }
-
-    if (msg == WM_KEYDOWN && (UINT)wparam == VK_RETURN && app != NULL) {
-        HWND focus = GetFocus();
-        if (focus == app->debug.poke_address_edit || focus == app->debug.poke_values_edit) {
-            app_poke_apply_values(hwnd, app);
-            return 0;
-        }
-    }
-
-    return DefWindowProcA(hwnd, msg, wparam, lparam);
+    return FALSE;
 }
 
 
@@ -198,7 +203,9 @@ static void app_open_poke_window(AppState *app) {
         GetModuleHandleA(NULL),
         app
     );
-    app_apply_window_icons(app->debug.poke_hwnd);
+    if (app->debug.poke_hwnd != NULL) {
+        app_apply_window_icons(app->debug.poke_hwnd);
+    }
 }
 
 
@@ -234,9 +241,9 @@ static void app_poke_layout_controls(AppState *app, HWND hwnd) {
     GetClientRect(hwnd, &rect);
     width = rect.right - rect.left;
 
-    MoveWindow(GetDlgItem(hwnd, 1), edge, edge, 80, label_h, TRUE);
+    MoveWindow(GetDlgItem(hwnd, APP_CTRL_POKE_ADDRESS_LABEL), edge, edge, 80, label_h, TRUE);
     MoveWindow(app->debug.poke_address_edit, edge + 80, edge - 2, width - (edge * 2) - 80, edit_h, TRUE);
-    MoveWindow(GetDlgItem(hwnd, 2), edge, edge + row_gap, 80, label_h, TRUE);
+    MoveWindow(GetDlgItem(hwnd, APP_CTRL_POKE_VALUES_LABEL), edge, edge + row_gap, 80, label_h, TRUE);
     MoveWindow(app->debug.poke_values_edit, edge + 80, edge + row_gap - 2, width - (edge * 2) - 80, edit_h, TRUE);
     MoveWindow(app->debug.poke_apply_button, width - edge - button_w, button_y, button_w, button_h, TRUE);
 }

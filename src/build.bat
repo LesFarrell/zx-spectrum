@@ -17,6 +17,7 @@ zig cc ^
     -Wextra ^
     -I. ^
     -I..\third_party\chips ^
+    -I..\third_party\scintilla\include ^
     main.c ^
     spectrum.c ^
     tape.c ^
@@ -28,6 +29,8 @@ zig cc ^
     -lwinmm ^
     -Wl,/subsystem:windows ^
     -o zx-spectrum.exe
+
+if not errorlevel 1 copy /y "..\third_party\scintilla\bin\Scintilla.dll" "Scintilla.dll" >nul
 
 set "BUILD_RESULT=%errorlevel%"
 popd
