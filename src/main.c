@@ -107,6 +107,7 @@ enum {
     APP_MENU_ASM_EDIT_FORMAT = 2217,
     APP_MENU_ASM_EDIT_UPPERCASE = 2218,
     APP_MENU_ASM_BUILD_ASSEMBLE = 2221,
+    APP_MENU_ASM_BUILD_ASSEMBLE_RUN = 2222,
     APP_MENU_ASM_HELP_SHOW = 2231,
     APP_MENU_DEBUG_HELP_SHOW = 2241,
     APP_TIMER_MODAL_LOOP = 3001,
@@ -461,7 +462,7 @@ static bool app_assembler_save_source(HWND hwnd, AppState *app, char *status_buf
 static bool app_assembler_save_source_as(HWND hwnd, AppState *app, char *status_buffer, size_t status_buffer_size);
 static bool app_assembler_export_tap(HWND hwnd, AppState *app, char *status_buffer, size_t status_buffer_size);
 static bool app_assembler_new_source(HWND hwnd, AppState *app, char *status_buffer, size_t status_buffer_size);
-static void app_assembler_apply_source(HWND hwnd, AppState *app);
+static void app_assembler_apply_source(HWND hwnd, AppState *app, bool run_after_assembly);
 static bool app_assembler_confirm_close(HWND hwnd, AppState *app);
 static void app_assembler_poll_external_change(HWND hwnd, AppState *app);
 static void app_assembler_free_prepared_source(AssemblerPreparedSource *prepared);

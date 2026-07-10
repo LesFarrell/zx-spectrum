@@ -133,6 +133,7 @@ static HMENU app_create_assembler_menu(void) {
     AppendMenuA(edit_menu, MF_STRING, APP_MENU_ASM_EDIT_FORMAT, "Format Source\tCtrl+Shift+L");
     AppendMenuA(edit_menu, MF_STRING, APP_MENU_ASM_EDIT_UPPERCASE, "Uppercase Source\tCtrl+Shift+U");
     AppendMenuA(build_menu, MF_STRING, APP_MENU_ASM_BUILD_ASSEMBLE, "&Assemble\tCtrl+B");
+    AppendMenuA(build_menu, MF_STRING, APP_MENU_ASM_BUILD_ASSEMBLE_RUN, "Assemble and &Run\tCtrl+F5");
     AppendMenuA(help_menu, MF_STRING, APP_MENU_ASM_HELP_SHOW, "Assembler &Help\tF1");
     AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)file_menu, "&File");
     AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)edit_menu, "&Edit");
@@ -608,6 +609,11 @@ static LRESULT CALLBACK app_assembler_source_wndproc(HWND hwnd, UINT msg, WPARAM
             SendMessageA(command_target, WM_COMMAND, APP_MENU_ASM_HELP_SHOW, 0);
             return 0;
         }
+        if ((UINT)wparam == VK_F5 && ctrl_down) {
+            app->debug.assembler_suppress_next_char = true;
+            SendMessageA(command_target, WM_COMMAND, APP_MENU_ASM_BUILD_ASSEMBLE_RUN, 0);
+            return 0;
+        }
         if ((UINT)wparam == VK_F5) {
             SendMessageA(command_target, WM_COMMAND, APP_MENU_ASM_FILE_RELOAD, 0);
             return 0;
@@ -824,7 +830,19 @@ static INT_PTR CALLBACK app_assembler_dlgproc(HWND hwnd, UINT msg, WPARAM wparam
                 return TRUE;
             }
             if (LOWORD(wparam) == APP_CTRL_ASM_APPLY || LOWORD(wparam) == APP_MENU_ASM_BUILD_ASSEMBLE) {
-                app_assembler_apply_source(app->debug.assembler_hwnd != NULL ? app->debug.assembler_hwnd : hwnd, app);
+                app_assembler_apply_source(
+                    app->debug.assembler_hwnd != NULL ? app->debug.assembler_hwnd : hwnd,
+                    app,
+                    false
+                );
+                return TRUE;
+            }
+            if (LOWORD(wparam) == APP_MENU_ASM_BUILD_ASSEMBLE_RUN) {
+                app_assembler_apply_source(
+                    app->debug.assembler_hwnd != NULL ? app->debug.assembler_hwnd : hwnd,
+                    app,
+                    true
+                );
                 return TRUE;
             }
             if (app_assembler_handle_edit_command(app, LOWORD(wparam))) {
@@ -1019,6 +1037,7 @@ static void app_show_assembler_help(HWND hwnd) {
         "  Ctrl+Shift+U Uppercase Source\r\n"
         "  Ctrl+A Select All\r\n"
         "  Ctrl+B Assemble\r\n"
+        "  Ctrl+F5 Assemble and run from ORG\r\n"
         "  F1 Assembler Help\r\n"
         "  Ctrl+Z/X/C/V standard edit shortcuts\r\n"
         "\r\n"
@@ -1531,7 +1550,7 @@ static bool app_assembler_new_source(HWND hwnd, AppState *app, char *status_buff
 
 /* Assembles the current source buffer into Spectrum RAM using the source ORG
    when present and otherwise the live program counter as the entry address. */
-static void app_assembler_apply_source(HWND hwnd, AppState *app) {
+static void app_assembler_apply_source(HWND hwnd, AppState *app, bool run_after_assembly) {
     char status[512];
     uint16_t effective_address;
     uint16_t org_address;
@@ -1564,6 +1583,17 @@ static void app_assembler_apply_source(HWND hwnd, AppState *app) {
         effective_address = app->spec.machine.cpu.pc;
     }
     if (app_assemble_source(app, effective_address, &prepared_source, true, NULL, status, sizeof(status))) {
+        if (run_after_assembly) {
+            size_t used = strlen(status);
+            app_debug_set_view_address(app, effective_address, true);
+            app_debug_run_from_address(app, effective_address);
+            snprintf(
+                status + used,
+                sizeof(status) - used,
+                " Running from %04Xh.",
+                effective_address
+            );
+        }
         InvalidateRect(app->main_hwnd, NULL, FALSE);
         app_debug_refresh_window(app);
     } else {
