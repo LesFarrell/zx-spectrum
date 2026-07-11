@@ -106,6 +106,8 @@ enum {
     APP_MENU_ASM_EDIT_FONT = 2216,
     APP_MENU_ASM_EDIT_FORMAT = 2217,
     APP_MENU_ASM_EDIT_UPPERCASE = 2218,
+    APP_MENU_ASM_EDIT_FIND = 2219,
+    APP_MENU_ASM_EDIT_REPLACE = 2220,
     APP_MENU_ASM_BUILD_ASSEMBLE = 2221,
     APP_MENU_ASM_BUILD_ASSEMBLE_RUN = 2222,
     APP_MENU_ASM_HELP_SHOW = 2231,
@@ -224,6 +226,11 @@ typedef struct DebugState {
     HBRUSH assembler_source_brush;
     HFONT assembler_font;
     WNDPROC assembler_source_wndproc;
+    HWND assembler_find_dialog;
+    FINDREPLACEA assembler_find_replace;
+    char assembler_find_text[256];
+    char assembler_replace_text[256];
+    bool assembler_find_dialog_is_replace;
     bool assembler_dirty;
     bool assembler_ignore_change;
     bool assembler_suppress_next_char;
@@ -526,6 +533,7 @@ static void app_assembler_clear_error_marker(AppState *app);
 static void app_assembler_focus_line(AppState *app, size_t line_number);
 static void app_assembler_sync_error_from_status(AppState *app, const char *status_text);
 static void app_assembler_update_line_numbers(AppState *app);
+static LRESULT app_assembler_handle_find_message(AppState *app, FINDREPLACEA *find_replace);
 static LRESULT CALLBACK app_debugger_address_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
 static LRESULT CALLBACK app_debugger_points_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
 static LRESULT CALLBACK app_poke_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
@@ -2281,6 +2289,10 @@ int main(int argc, char **argv) {
     while (app.running) {
         MSG msg;
         while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+            if (app.debug.assembler_find_dialog != NULL &&
+                IsDialogMessageA(app.debug.assembler_find_dialog, &msg)) {
+                continue;
+            }
             if (app.debug.debugger_hwnd != NULL &&
                 app.debug.debugger_accel != NULL &&
                 (msg.hwnd == app.debug.debugger_hwnd || IsChild(app.debug.debugger_hwnd, msg.hwnd)) &&

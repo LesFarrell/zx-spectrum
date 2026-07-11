@@ -4,6 +4,8 @@ static LRESULT app_scintilla_send(HWND editor, UINT message, WPARAM wparam, LPAR
     return SendMessageA(editor, message, wparam, lparam);
 }
 
+static UINT app_assembler_find_message;
+
 static int app_assembler_editor_text_length(HWND editor) {
     return (int)app_scintilla_send(editor, SCI_GETTEXTLENGTH, 0, 0);
 }
@@ -128,6 +130,9 @@ static HMENU app_create_assembler_menu(void) {
     AppendMenuA(edit_menu, MF_STRING, APP_MENU_ASM_EDIT_DELETE, "Delete\tDel");
     AppendMenuA(edit_menu, MF_SEPARATOR, 0, NULL);
     AppendMenuA(edit_menu, MF_STRING, APP_MENU_ASM_EDIT_SELECT_ALL, "Select All\tCtrl+A");
+    AppendMenuA(edit_menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(edit_menu, MF_STRING, APP_MENU_ASM_EDIT_FIND, "&Find...\tCtrl+F");
+    AppendMenuA(edit_menu, MF_STRING, APP_MENU_ASM_EDIT_REPLACE, "&Replace...\tCtrl+H");
     AppendMenuA(edit_menu, MF_SEPARATOR, 0, NULL);
     AppendMenuA(edit_menu, MF_STRING, APP_MENU_ASM_EDIT_FONT, "Font...\tCtrl+Shift+F");
     AppendMenuA(edit_menu, MF_STRING, APP_MENU_ASM_EDIT_FORMAT, "Format Source\tCtrl+Shift+L");
@@ -470,6 +475,10 @@ static bool app_assembler_create_controls_from_resource(AppState *app, HWND hwnd
 static LRESULT CALLBACK app_assembler_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     AppState *app = (AppState *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
 
+    if (app != NULL && app_assembler_find_message != 0 && msg == app_assembler_find_message) {
+        return app_assembler_handle_find_message(app, (FINDREPLACEA *)lparam);
+    }
+
     switch (msg) {
         case WM_NCCREATE: {
             CREATESTRUCTA *create = (CREATESTRUCTA *)lparam;
@@ -540,6 +549,10 @@ static LRESULT CALLBACK app_assembler_wndproc(HWND hwnd, UINT msg, WPARAM wparam
         case WM_DESTROY:
             if (app != NULL) {
                 app_set_modal_loop_timer(app, hwnd, false);
+                if (app->debug.assembler_find_dialog != NULL) {
+                    DestroyWindow(app->debug.assembler_find_dialog);
+                    app->debug.assembler_find_dialog = NULL;
+                }
                 app->debug.assembler_hwnd = NULL;
                 app->debug.assembler_panel = NULL;
             }
@@ -584,6 +597,226 @@ static bool app_assembler_handle_edit_command(AppState *app, UINT command_id) {
         default:
             return false;
     }
+}
+
+static int app_assembler_find_flags(const FINDREPLACEA *find_replace) {
+    int flags = SCFIND_NONE;
+
+    if ((find_replace->Flags & FR_MATCHCASE) != 0) {
+        flags |= SCFIND_MATCHCASE;
+    }
+    if ((find_replace->Flags & FR_WHOLEWORD) != 0) {
+        flags |= SCFIND_WHOLEWORD;
+    }
+    return flags;
+}
+
+/* Selects the next match from the current selection, wrapping once at the
+   end (or start) of the document. */
+static bool app_assembler_find_next(AppState *app, const FINDREPLACEA *find_replace) {
+    HWND source;
+    const char *needle;
+    LRESULT document_length;
+    LRESULT selection_start;
+    LRESULT selection_end;
+    LRESULT match;
+    bool down;
+    bool wrapped = false;
+
+    if (app == NULL || app->debug.assembler_source == NULL || find_replace == NULL) {
+        return false;
+    }
+    source = app->debug.assembler_source;
+    needle = find_replace->lpstrFindWhat;
+    if (needle == NULL || needle[0] == '\0') {
+        app_assembler_set_status(app, "Enter text to find.");
+        return false;
+    }
+
+    document_length = app_scintilla_send(source, SCI_GETLENGTH, 0, 0);
+    selection_start = app_scintilla_send(source, SCI_GETSELECTIONSTART, 0, 0);
+    selection_end = app_scintilla_send(source, SCI_GETSELECTIONEND, 0, 0);
+    down = (find_replace->Flags & FR_DOWN) != 0;
+    app_scintilla_send(source, SCI_SETSEARCHFLAGS, app_assembler_find_flags(find_replace), 0);
+
+    app_scintilla_send(source, SCI_SETTARGETSTART, down ? selection_end : selection_start, 0);
+    app_scintilla_send(source, SCI_SETTARGETEND, down ? document_length : 0, 0);
+    match = app_scintilla_send(source, SCI_SEARCHINTARGET, strlen(needle), (LPARAM)needle);
+    if (match < 0) {
+        app_scintilla_send(source, SCI_SETTARGETSTART, down ? 0 : document_length, 0);
+        app_scintilla_send(source, SCI_SETTARGETEND, down ? selection_end : selection_start, 0);
+        match = app_scintilla_send(source, SCI_SEARCHINTARGET, strlen(needle), (LPARAM)needle);
+        wrapped = match >= 0;
+    }
+    if (match < 0) {
+        char status[320];
+        snprintf(status, sizeof(status), "Cannot find \"%s\".", needle);
+        app_assembler_set_status(app, status);
+        MessageBeep(MB_ICONINFORMATION);
+        return false;
+    }
+
+    app_scintilla_send(
+        source,
+        SCI_SETSEL,
+        app_scintilla_send(source, SCI_GETTARGETSTART, 0, 0),
+        app_scintilla_send(source, SCI_GETTARGETEND, 0, 0)
+    );
+    app_scintilla_send(source, SCI_SCROLLCARET, 0, 0);
+    app_assembler_set_status(app, wrapped ? "Match found (search wrapped)." : "Match found.");
+    return true;
+}
+
+static bool app_assembler_selection_matches(AppState *app, const FINDREPLACEA *find_replace) {
+    HWND source = app->debug.assembler_source;
+    LRESULT selection_start = app_scintilla_send(source, SCI_GETSELECTIONSTART, 0, 0);
+    LRESULT selection_end = app_scintilla_send(source, SCI_GETSELECTIONEND, 0, 0);
+    LRESULT match;
+
+    if (selection_start == selection_end || find_replace->lpstrFindWhat[0] == '\0') {
+        return false;
+    }
+    app_scintilla_send(source, SCI_SETSEARCHFLAGS, app_assembler_find_flags(find_replace), 0);
+    app_scintilla_send(source, SCI_SETTARGETSTART, selection_start, 0);
+    app_scintilla_send(source, SCI_SETTARGETEND, selection_end, 0);
+    match = app_scintilla_send(
+        source,
+        SCI_SEARCHINTARGET,
+        strlen(find_replace->lpstrFindWhat),
+        (LPARAM)find_replace->lpstrFindWhat
+    );
+    return match == selection_start &&
+        app_scintilla_send(source, SCI_GETTARGETEND, 0, 0) == selection_end;
+}
+
+static void app_assembler_replace_selection(AppState *app, FINDREPLACEA *find_replace) {
+    HWND source = app->debug.assembler_source;
+    LRESULT selection_start;
+    size_t replacement_length;
+
+    if (!app_assembler_selection_matches(app, find_replace)) {
+        app_assembler_find_next(app, find_replace);
+        return;
+    }
+    selection_start = app_scintilla_send(source, SCI_GETSELECTIONSTART, 0, 0);
+    replacement_length = strlen(find_replace->lpstrReplaceWith);
+    app_scintilla_send(source, SCI_REPLACETARGET, replacement_length, (LPARAM)find_replace->lpstrReplaceWith);
+    app_scintilla_send(source, SCI_SETSEL, selection_start, selection_start + (LRESULT)replacement_length);
+    app_assembler_find_next(app, find_replace);
+}
+
+static void app_assembler_replace_all(AppState *app, FINDREPLACEA *find_replace) {
+    HWND source = app->debug.assembler_source;
+    const char *needle = find_replace->lpstrFindWhat;
+    const char *replacement = find_replace->lpstrReplaceWith;
+    LRESULT document_length;
+    LRESULT search_start = 0;
+    LRESULT match;
+    size_t needle_length;
+    size_t replacement_length;
+    unsigned int replacements = 0;
+    char status[128];
+
+    if (needle == NULL || needle[0] == '\0') {
+        app_assembler_set_status(app, "Enter text to find.");
+        return;
+    }
+    needle_length = strlen(needle);
+    replacement_length = strlen(replacement);
+    document_length = app_scintilla_send(source, SCI_GETLENGTH, 0, 0);
+    app_scintilla_send(source, SCI_SETSEARCHFLAGS, app_assembler_find_flags(find_replace), 0);
+    app_scintilla_send(source, SCI_BEGINUNDOACTION, 0, 0);
+    while (search_start <= document_length) {
+        LRESULT match_end;
+
+        app_scintilla_send(source, SCI_SETTARGETSTART, search_start, 0);
+        app_scintilla_send(source, SCI_SETTARGETEND, document_length, 0);
+        match = app_scintilla_send(source, SCI_SEARCHINTARGET, needle_length, (LPARAM)needle);
+        if (match < 0) {
+            break;
+        }
+        match_end = app_scintilla_send(source, SCI_GETTARGETEND, 0, 0);
+        app_scintilla_send(source, SCI_REPLACETARGET, replacement_length, (LPARAM)replacement);
+        document_length += (LRESULT)replacement_length - (match_end - match);
+        search_start = match + (LRESULT)replacement_length;
+        ++replacements;
+    }
+    app_scintilla_send(source, SCI_ENDUNDOACTION, 0, 0);
+    snprintf(status, sizeof(status), "%u replacement%s made.", replacements, replacements == 1 ? "" : "s");
+    app_assembler_set_status(app, status);
+    if (replacements == 0) {
+        MessageBeep(MB_ICONINFORMATION);
+    }
+}
+
+static void app_assembler_seed_find_text(AppState *app) {
+    HWND source = app->debug.assembler_source;
+    LRESULT selection_start = app_scintilla_send(source, SCI_GETSELECTIONSTART, 0, 0);
+    LRESULT selection_end = app_scintilla_send(source, SCI_GETSELECTIONEND, 0, 0);
+    LRESULT selection_length = selection_end - selection_start;
+
+    if (selection_length > 0 && selection_length < (LRESULT)sizeof(app->debug.assembler_find_text)) {
+        app_scintilla_send(source, SCI_GETSELTEXT, 0, (LPARAM)app->debug.assembler_find_text);
+        if (strchr(app->debug.assembler_find_text, '\r') != NULL ||
+            strchr(app->debug.assembler_find_text, '\n') != NULL) {
+            app->debug.assembler_find_text[0] = '\0';
+        }
+    }
+}
+
+static void app_assembler_show_find_dialog(HWND owner, AppState *app, bool replace) {
+    FINDREPLACEA *find_replace;
+    HWND dialog;
+
+    if (app == NULL || app->debug.assembler_source == NULL) {
+        return;
+    }
+    if (app_assembler_find_message == 0) {
+        app_assembler_find_message = RegisterWindowMessageA(FINDMSGSTRINGA);
+        if (app_assembler_find_message == 0) {
+            app_assembler_set_status(app, "Could not initialise the search dialog.");
+            return;
+        }
+    }
+    if (app->debug.assembler_find_dialog != NULL) {
+        if (app->debug.assembler_find_dialog_is_replace == replace) {
+            SetForegroundWindow(app->debug.assembler_find_dialog);
+            return;
+        }
+        DestroyWindow(app->debug.assembler_find_dialog);
+        app->debug.assembler_find_dialog = NULL;
+    }
+    app_assembler_seed_find_text(app);
+    ZeroMemory(&app->debug.assembler_find_replace, sizeof(app->debug.assembler_find_replace));
+    find_replace = &app->debug.assembler_find_replace;
+    find_replace->lStructSize = sizeof(*find_replace);
+    find_replace->hwndOwner = owner;
+    find_replace->Flags = FR_DOWN;
+    find_replace->lpstrFindWhat = app->debug.assembler_find_text;
+    find_replace->wFindWhatLen = sizeof(app->debug.assembler_find_text);
+    find_replace->lpstrReplaceWith = app->debug.assembler_replace_text;
+    find_replace->wReplaceWithLen = sizeof(app->debug.assembler_replace_text);
+    dialog = replace ? ReplaceTextA(find_replace) : FindTextA(find_replace);
+    if (dialog == NULL) {
+        app_assembler_set_status(app, "Could not open the search dialog.");
+        return;
+    }
+    app->debug.assembler_find_dialog = dialog;
+    app->debug.assembler_find_dialog_is_replace = replace;
+}
+
+static LRESULT app_assembler_handle_find_message(AppState *app, FINDREPLACEA *find_replace) {
+    if ((find_replace->Flags & FR_DIALOGTERM) != 0) {
+        app->debug.assembler_find_dialog = NULL;
+        SetFocus(app->debug.assembler_source);
+    } else if ((find_replace->Flags & FR_FINDNEXT) != 0) {
+        app_assembler_find_next(app, find_replace);
+    } else if ((find_replace->Flags & FR_REPLACE) != 0) {
+        app_assembler_replace_selection(app, find_replace);
+    } else if ((find_replace->Flags & FR_REPLACEALL) != 0) {
+        app_assembler_replace_all(app, find_replace);
+    }
+    return 0;
 }
 
 /* Adds assembler-specific shortcuts to the Scintilla editor. */
@@ -640,6 +873,14 @@ static LRESULT CALLBACK app_assembler_source_wndproc(HWND hwnd, UINT msg, WPARAM
                 case 'B':
                     app->debug.assembler_suppress_next_char = true;
                     SendMessageA(command_target, WM_COMMAND, APP_MENU_ASM_BUILD_ASSEMBLE, 0);
+                    return 0;
+                case 'F':
+                    app->debug.assembler_suppress_next_char = true;
+                    SendMessageA(command_target, WM_COMMAND, APP_MENU_ASM_EDIT_FIND, 0);
+                    return 0;
+                case 'H':
+                    app->debug.assembler_suppress_next_char = true;
+                    SendMessageA(command_target, WM_COMMAND, APP_MENU_ASM_EDIT_REPLACE, 0);
                     return 0;
                 default:
                     break;
@@ -781,6 +1022,14 @@ static INT_PTR CALLBACK app_assembler_dlgproc(HWND hwnd, UINT msg, WPARAM wparam
             }
             if (LOWORD(wparam) == APP_MENU_ASM_EDIT_FONT) {
                 app_assembler_choose_font(app->debug.assembler_hwnd != NULL ? app->debug.assembler_hwnd : hwnd, app);
+                return TRUE;
+            }
+            if (LOWORD(wparam) == APP_MENU_ASM_EDIT_FIND || LOWORD(wparam) == APP_MENU_ASM_EDIT_REPLACE) {
+                app_assembler_show_find_dialog(
+                    app->debug.assembler_hwnd != NULL ? app->debug.assembler_hwnd : hwnd,
+                    app,
+                    LOWORD(wparam) == APP_MENU_ASM_EDIT_REPLACE
+                );
                 return TRUE;
             }
             if (LOWORD(wparam) == APP_MENU_ASM_EDIT_FORMAT) {

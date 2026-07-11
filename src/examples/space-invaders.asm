@@ -2,7 +2,7 @@
 ; Built for the emulator's integrated mini assembler.
 ;
 ; Build:    Ctrl+F5 assembles the source at 8000h and runs from 8000h.
-; Controls: 5 moves left, 8 moves right, 0 fires, and Q quits to the ROM.
+; Controls: 5 moves left, 8 moves right, and 0 fires.
 ;
 ; Gameplay: destroy the animated 3x6 formation before it reaches the player.
 ; Four destructible shield bases stop one laser or alien bomb per occupied cell.
@@ -12,7 +12,8 @@
 ; the player, projectiles, explosions, and bases. Spectrum attributes colour
 ; individual objects while direct bitmap writes keep drawing independent of ROM.
 ;
-; Audio: the 48K beeper supplies fire, hit, formation-step, and bomb-drop effects.
+; Audio: the 48K beeper supplies fire, explosion, hit, formation-step, and
+; bomb-drop effects.
 
 ; UDG character assignments. Alternate alien frames are seven codes above the
 ; corresponding primary frame, which lets draw_swarm select them with ADD A,7.
@@ -45,8 +46,6 @@ main_loop:
 	; One iteration updates every actor. game_state remains zero while playing,
 	; becomes one after defeat, and becomes two after the final alien is removed.
 	CALL frame_delay
-	CALL key_quit
-	JP Z,quit_game
 	CALL handle_player
 	CALL update_laser
 	CALL update_bomb
@@ -65,11 +64,6 @@ check_game_state:
 	CP 2
 	JP Z,show_win
 	JP show_game_over
-
-quit_game:
-	DI
-	RST 0
-
 ; ---------------------------------------------------------------------------
 ; Game setup
 
@@ -222,12 +216,6 @@ key_fire:
 	AND 01h
 	RET
 
-key_quit:
-	LD BC,0FBFEh
-	DB 0EDh,078h
-	AND 01h
-	RET
-
 ; ---------------------------------------------------------------------------
 ; Player laser
 
@@ -326,7 +314,7 @@ collision_column:
 	LD (score),A
 	LD A,EXPLODE_CHAR
 	CALL print_at
-	CALL hit_sound
+	CALL explosion_sound
 	LD A,SPACE_CHAR
 	CALL print_at
 	RET
@@ -514,7 +502,7 @@ player_hit:
 	LD D,21
 	LD A,EXPLODE_CHAR
 	CALL print_at
-	CALL hit_sound
+	CALL explosion_sound
 	CALL frame_delay
 	CALL frame_delay
 	LD A,(lives)
@@ -1005,6 +993,32 @@ hit_sound_delay:
 	POP BC
 	RET
 
+explosion_sound:
+	; A longer sequence of irregular pulse widths gives destroyed invaders and
+	; player hits a rough, descending explosion instead of the short impact beep.
+	PUSH BC
+	LD C,96
+
+explosion_sound_pulse:
+	LD A,C
+	AND 31
+	ADD A,24
+	LD B,A
+
+explosion_sound_delay:
+	DJNZ explosion_sound_delay
+	LD A,(sound_phase)
+	XOR 10h
+	LD (sound_phase),A
+	OUT (0FEh),A
+	DEC C
+	JR NZ,explosion_sound_pulse
+	XOR A
+	LD (sound_phase),A
+	OUT (0FEh),A
+	POP BC
+	RET
+
 move_sound:
 	; Low, short pulses accompany each completed formation step.
 	PUSH BC
@@ -1060,10 +1074,6 @@ show_game_over:
 	LD E,4
 	LD HL,restart_text
 	CALL print_text
-	LD D,14
-	LD E,8
-	LD HL,quit_text
-	CALL print_text
 	JR wait_restart
 
 show_win:
@@ -1077,16 +1087,10 @@ show_win:
 	LD E,4
 	LD HL,restart_text
 	CALL print_text
-	LD D,14
-	LD E,8
-	LD HL,quit_text
-	CALL print_text
 
 wait_restart:
 	; Fire restarts through start so every array and counter is initialized again.
 	CALL frame_delay
-	CALL key_quit
-	JP Z,quit_game
 	CALL key_fire
 	JR NZ,wait_restart
 	JP start
@@ -1099,7 +1103,7 @@ header_text:
 	DB "SCORE 000   LIVES 3   ALIENS 18",0
 
 help_text:
-	DB "5/8 MOVE   0 FIRE   Q QUIT",0
+	DB "5/8 MOVE       0 FIRE",0
 
 game_over_text:
 	DB "GAME OVER",0
@@ -1109,9 +1113,6 @@ you_win_text:
 
 restart_text:
 	DB "PRESS 0 TO PLAY AGAIN",0
-
-quit_text:
-	DB "Q TO QUIT",0
 
 player_x:
 	DB 15

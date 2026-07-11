@@ -99,6 +99,7 @@ With no arguments, the emulator looks for `128.rom` in `.\src` first and starts 
 - `INCLUDE "file.asm"` expands another source file in place during assembly, so it can appear in the middle of a source file; relative paths are resolved from the current source file
 - `Ctrl+B` assembles the current source
 - `Ctrl+F5` assembles the current source and starts execution at its `ORG` address
+- `Ctrl+F` opens Find and `Ctrl+H` opens Find and Replace; both support match case and whole-word searches, and searches wrap around the document
 - `Ctrl+A`, `Ctrl+Z`, `Ctrl+X`, `Ctrl+C`, and `Ctrl+V` work like a normal text editor inside the assembler source box
 - Assembler writes are limited to RAM at `0x4000`-`0xFFFF`; ROM addresses are read-only in the running machine
 - Working samples are included at [hello.asm](/C:/Users/Les%20Farrell/OneDrive/Desktop/emu/src/examples/hello.asm), [include-main.asm](/C:/Users/Les%20Farrell/OneDrive/Desktop/emu/src/examples/include-main.asm), and [space-invaders.asm](/C:/Users/Les%20Farrell/OneDrive/Desktop/emu/src/examples/space-invaders.asm)
@@ -107,7 +108,7 @@ With no arguments, the emulator looks for `128.rom` in `.\src` first and starts 
 
 The included `space-invaders.asm` is a complete 48K mini-game and a larger example of the integrated assembler. Open it in `Tools -> Assembler...` and press `Ctrl+F5` to assemble it at `8000h` and start it immediately.
 
-- Use `5` and `8` to move, `0` to fire, and `Q` to quit to the Spectrum ROM
+- Use `5` and `8` to move and `0` to fire; invader and player explosions have a dedicated beeper effect
 - The game includes a three-row animated alien formation, aimed alien bombs, four destructible shield bases, collision detection, score, lives, and win/game-over screens
 - Eleven custom 8x8 UDG characters provide the player, projectiles, explosion, bases, and two animation frames for each alien type
 - Spectrum attributes give the alien rows and game objects distinct colours
