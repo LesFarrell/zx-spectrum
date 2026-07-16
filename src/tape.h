@@ -20,6 +20,8 @@ typedef struct TapeSegment {
 typedef struct TapeBlock {
     uint8_t *bytes;
     size_t length;
+    /* First timed segment that must play after this block is fast-loaded. */
+    size_t resume_segment_index;
 } TapeBlock;
 
 typedef enum TapeAutoloadTarget {

@@ -2,7 +2,7 @@ ORG 8000h
 
 start:
     LD A,2
-    CALL 1601h      ; CHAN-OPEN, select upper screen
+    CALL 1615h      ; CHAN-OPEN, select upper screen
     LD HL,text
 
 print_loop:

@@ -1296,7 +1296,7 @@ static void app_debug_run_to_address(AppState *app, uint16_t address) {
 
 /* Runs one model-accurate frame slice with debugger breakpoints armed, then
    pauses and refreshes the debugger if any enabled address was reached. */
-static void app_debug_run_frame(AppState *app) {
+static void app_debug_run_frame(AppState *app, bool render_frame) {
     uint32_t frame_us;
     const bool debugger_active = app->debug.debugger_hwnd != NULL;
 
@@ -1347,7 +1347,9 @@ static void app_debug_run_frame(AppState *app) {
         app->spec.machine.debug.callback.user_data = NULL;
         app->spec.machine.debug.stopped = NULL;
     }
-    spectrum_render_frame(&app->spec);
+    if (render_frame) {
+        spectrum_render_frame(&app->spec);
+    }
 
     if (app->debug.breakpoint_hit || app->debug.watchpoint_hit || app->debug.debugger_run_to_hit) {
         app->debug.paused = true;

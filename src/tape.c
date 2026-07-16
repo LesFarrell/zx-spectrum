@@ -138,7 +138,12 @@ static bool tape_reserve_blocks(TapePlayer *player, size_t additional_count) {
     return true;
 }
 
-static bool tape_append_fast_block(TapePlayer *player, const uint8_t *data, size_t length) {
+static bool tape_append_fast_block(
+    TapePlayer *player,
+    const uint8_t *data,
+    size_t length,
+    size_t resume_segment_index
+) {
     TapeBlock *block;
 
     if (!tape_reserve_blocks(player, 1)) {
@@ -152,6 +157,7 @@ static bool tape_append_fast_block(TapePlayer *player, const uint8_t *data, size
     }
     memcpy(block->bytes, data, length);
     block->length = length;
+    block->resume_segment_index = resume_segment_index;
     return true;
 }
 
@@ -496,7 +502,8 @@ static bool tape_append_standard_block(
     TapeBuilder *builder,
     const uint8_t *data,
     size_t length,
-    uint16_t pause_ms
+    uint16_t pause_ms,
+    size_t *resume_segment_index_out
 ) {
     uint16_t pilot_count;
 
@@ -512,6 +519,9 @@ static bool tape_append_standard_block(
     }
     if (!tape_append_data_bits(builder, data, length, 8, TAPE_ZERO_PULSE_TICKS, TAPE_ONE_PULSE_TICKS)) {
         return false;
+    }
+    if (resume_segment_index_out != NULL) {
+        *resume_segment_index_out = builder->player->segment_count;
     }
     if (pause_ms > 0) {
         return tape_append_pause(builder, pause_ms);
@@ -567,6 +577,7 @@ static bool tape_parse_tap(
 
     while (offset < size) {
         uint16_t block_length;
+        size_t resume_segment_index;
 
         if (!tape_has_bytes(offset, 2, size)) {
             tape_set_error(error_buffer, error_buffer_size, "Corrupt TAP block header", path);
@@ -578,11 +589,16 @@ static bool tape_parse_tap(
             tape_set_error(error_buffer, error_buffer_size, "Truncated TAP block", path);
             return false;
         }
-        if (!tape_append_standard_block(&builder, &data[offset], block_length, TAPE_TAP_BLOCK_PAUSE_MS)) {
+        if (!tape_append_standard_block(
+                &builder,
+                &data[offset],
+                block_length,
+                TAPE_TAP_BLOCK_PAUSE_MS,
+                &resume_segment_index)) {
             tape_set_error(error_buffer, error_buffer_size, "Out of memory while decoding TAP file", path);
             return false;
         }
-        if (!tape_append_fast_block(player, &data[offset], block_length)) {
+        if (!tape_append_fast_block(player, &data[offset], block_length, resume_segment_index)) {
             tape_set_error(error_buffer, error_buffer_size, "Out of memory while indexing TAP blocks", path);
             return false;
         }
@@ -899,12 +915,22 @@ static bool tape_parse_tzx(
             case 0x10: {
                 const uint16_t pause_ms = tape_read_u16(&data[offset]);
                 const uint16_t block_length = tape_read_u16(&data[offset + 2]);
+                size_t resume_segment_index;
                 offset += 4;
-                if (!tape_append_standard_block(&builder, &data[offset], block_length, pause_ms)) {
+                if (!tape_append_standard_block(
+                        &builder,
+                        &data[offset],
+                        block_length,
+                        pause_ms,
+                        &resume_segment_index)) {
                     failure_message = "Could not decode TZX standard data block";
                     goto finished;
                 }
-                if (!tape_append_fast_block(player, &data[offset], block_length)) {
+                if (!tape_append_fast_block(
+                        player,
+                        &data[offset],
+                        block_length,
+                        resume_segment_index)) {
                     failure_message = "Out of memory while indexing TZX blocks";
                     goto finished;
                 }
@@ -1339,6 +1365,27 @@ void tape_rewind(TapePlayer *player, uint32_t tick_hz) {
     if (player == NULL) {
         return;
     }
+    /* A tape may be decoded before autoload switches from a 48K to a 128K
+       machine. Preserve its real-time pulse lengths across that clock change. */
+    if (tick_hz > 0 && player->tick_hz > 0 && tick_hz != player->tick_hz) {
+        const uint32_t previous_tick_hz = player->tick_hz;
+        for (size_t index = 0; index < player->segment_count; ++index) {
+            TapeSegment *segment = &player->segments[index];
+            uint64_t scaled_ticks;
+            if (segment->duration_ticks == 0) {
+                continue;
+            }
+            scaled_ticks =
+                ((uint64_t)segment->duration_ticks * tick_hz + (previous_tick_hz / 2u)) /
+                previous_tick_hz;
+            if (scaled_ticks == 0) {
+                scaled_ticks = 1;
+            } else if (scaled_ticks > UINT32_MAX) {
+                scaled_ticks = UINT32_MAX;
+            }
+            segment->duration_ticks = (uint32_t)scaled_ticks;
+        }
+    }
     player->tick_hz = tick_hz;
     player->next_block_index = 0;
     player->play_index = 0;
@@ -1432,7 +1479,6 @@ bool tape_try_fast_load(TapePlayer *player, void *machine_ptr) {
     }
 
     player->next_block_index++;
-    player->playing = false;
 
     parity = block->bytes[0];
     machine->cpu.a = 0;
@@ -1480,6 +1526,17 @@ bool tape_try_fast_load(TapePlayer *player, void *machine_ptr) {
     machine->cpu.b = 0xB0;
 
 finished:
+    /* Skip the waveform already injected by the trap, retain its post-block
+       pause, and continue timed playback for any custom loader that follows. */
+    player->play_index = block->resume_segment_index;
+    if (player->play_index < player->segment_count) {
+        player->playing = true;
+        player->segment_end_tick =
+            machine->tick_count + player->segments[player->play_index].duration_ticks;
+    } else {
+        player->playing = false;
+        player->segment_end_tick = 0;
+    }
     machine->cpu.c = 1;
     machine->cpu.h = parity;
     machine->cpu.de = (uint16_t)(requested_length - bytes_processed);

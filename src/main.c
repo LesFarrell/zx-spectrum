@@ -42,12 +42,15 @@ enum {
     APP_AUDIO_BUFFER_SAMPLES = 1024,
     APP_AUDIO_BUFFER_COUNT = 4,
     APP_AUDIO_RING_SAMPLES = 16384,
+    APP_TAPE_WARP_MAX_FRAMES = 256,
+    APP_TAPE_WARP_BUDGET_MS = 30,
     APP_MENU_FILE_OPEN_SNAPSHOT = 1001,
     APP_MENU_FILE_RESET = 1002,
     APP_MENU_FILE_EXIT = 1003,
     APP_MENU_FILE_PLAY_TAPE = 1004,
     APP_MENU_FILE_STOP_TAPE = 1005,
     APP_MENU_FILE_AUTOLOAD_TAPES = 1006,
+    APP_MENU_FILE_FAST_TAPE_LOADING = 1008,
     APP_MENU_TOOLS_ASSEMBLER = 1301,
     APP_MENU_TOOLS_DEBUGGER = 1302,
     APP_MENU_TOOLS_POKE = 1303,
@@ -330,6 +333,8 @@ struct AppState {
     int active_key_codes[256];
     bool tape_autoload_enabled;
     bool tape_autoplay_pending;
+    bool fast_tape_loading_enabled;
+    bool tape_warp_active;
     bool tape_load_in_progress;
     bool snapshot_load_in_progress;
     bool running;
@@ -428,13 +433,14 @@ static void app_debug_navigate_view(AppState *app, int delta);
 static void app_debug_view_pc(AppState *app);
 static void app_debug_view_sp(AppState *app);
 static void app_debug_run_to_address(AppState *app, uint16_t address);
-static void app_debug_run_frame(AppState *app);
+static void app_debug_run_frame(AppState *app, bool render_frame);
 static void app_debug_run_from_address(AppState *app, uint16_t address);
 static HMENU app_create_debugger_menu(void);
 static void app_show_debugger_help(HWND hwnd);
 static HMENU app_create_assembler_menu(void);
 static void app_save_model(SpectrumModel model);
 static void app_save_tape_autoload(bool enabled);
+static void app_save_fast_tape_loading(bool enabled);
 static void app_update_model_menu(HWND hwnd, SpectrumModel model);
 static void app_audio_callback(const float *samples, int num_samples, void *user_data);
 static void app_debug_refresh_window(AppState *app);
@@ -592,6 +598,7 @@ static HMENU app_create_menu(void) {
     AppendMenuA(tape_menu, MF_STRING, APP_MENU_FILE_PLAY_TAPE, "&Play Tape\tF3");
     AppendMenuA(tape_menu, MF_STRING, APP_MENU_FILE_STOP_TAPE, "S&top Tape\tF4");
     AppendMenuA(tape_menu, MF_STRING, APP_MENU_FILE_AUTOLOAD_TAPES, "&Auto-load Tapes On Open");
+    AppendMenuA(tape_menu, MF_STRING, APP_MENU_FILE_FAST_TAPE_LOADING, "Use &Fast Tape Loading");
     AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_48K, "&48K\tCtrl+1");
     AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_128K, "&128K\tCtrl+2");
     AppendMenuA(tools_menu, MF_STRING, APP_MENU_TOOLS_ASSEMBLER, "&Assembler...\tCtrl+Shift+A");
@@ -916,7 +923,7 @@ static void app_audio_push_samples(AppState *app, const float *samples, int num_
    them in the frontend ring buffer for later waveOut submission. */
 static void app_audio_callback(const float *samples, int num_samples, void *user_data) {
     AppState *app = (AppState *)user_data;
-    if (app == NULL) {
+    if (app == NULL || app->tape_warp_active) {
         return;
     }
     app_audio_push_samples(app, samples, num_samples);
@@ -1599,8 +1606,11 @@ static double app_model_frame_duration_ms(SpectrumModel model) {
    the normal idle loop and the timer path used during modal move/size loops. */
 static void app_tick_emulator(AppState *app) {
     LARGE_INTEGER now;
+    LARGE_INTEGER warp_started;
+    LARGE_INTEGER warp_now;
     double elapsed_ms;
     double frame_ms;
+    bool warp_requested;
     bool rendered = false;
     int frames_run = 0;
 
@@ -1612,6 +1622,54 @@ static void app_tick_emulator(AppState *app) {
     elapsed_ms = (double)(now.QuadPart - app->last_tick.QuadPart) * 1000.0 / (double)app->perf_freq.QuadPart;
     app->last_tick = now;
     frame_ms = app_model_frame_duration_ms(app->spec.model);
+
+    warp_requested = app->fast_tape_loading_enabled && !app->debug.paused &&
+        (app->tape_autoplay_pending || app->tape.playing);
+    if (warp_requested) {
+        if (!app->tape_warp_active) {
+            app->tape_warp_active = true;
+            app->emulation_accumulator_ms = 0.0;
+            app_audio_flush(app);
+        }
+
+        warp_started = now;
+        while (frames_run < APP_TAPE_WARP_MAX_FRAMES && !app->debug.paused) {
+            app_run_autotype(app);
+            app_debug_run_frame(app, false);
+            frames_run++;
+
+            if (!app->tape_autoplay_pending && !app->tape.playing) {
+                break;
+            }
+            if ((frames_run & 7) == 0) {
+                QueryPerformanceCounter(&warp_now);
+                if ((warp_now.QuadPart - warp_started.QuadPart) * 1000 >=
+                    app->perf_freq.QuadPart * APP_TAPE_WARP_BUDGET_MS) {
+                    break;
+                }
+            }
+        }
+
+        if (frames_run > 0) {
+            spectrum_render_frame(&app->spec);
+            InvalidateRect(app->main_hwnd, NULL, FALSE);
+        }
+        if (app->debug.paused || (!app->tape_autoplay_pending && !app->tape.playing)) {
+            app->tape_warp_active = false;
+            app->emulation_accumulator_ms = 0.0;
+            app_audio_flush(app);
+            QueryPerformanceCounter(&app->last_tick);
+        }
+        app_audio_service(app);
+        return;
+    }
+
+    if (app->tape_warp_active) {
+        app->tape_warp_active = false;
+        app->emulation_accumulator_ms = 0.0;
+        app_audio_flush(app);
+        elapsed_ms = 0.0;
+    }
     app->emulation_accumulator_ms += elapsed_ms;
     if (app->emulation_accumulator_ms > frame_ms * 8.0) {
         app->emulation_accumulator_ms = frame_ms * 8.0;
@@ -1622,7 +1680,7 @@ static void app_tick_emulator(AppState *app) {
     if (!app->debug.paused) {
         while (app->emulation_accumulator_ms >= frame_ms && frames_run < 8) {
             app_run_autotype(app);
-            app_debug_run_frame(app);
+            app_debug_run_frame(app, true);
             app->emulation_accumulator_ms -= frame_ms;
             rendered = true;
             frames_run++;
@@ -1760,6 +1818,7 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                     if (!job->ok) {
                         app_show_error(job->error);
                     } else if (!app_apply_loaded_tape(hwnd, app, &job->tape, job->error, sizeof(job->error))) {
+                        tape_init(&job->tape);
                         app_show_error(job->error);
                     } else {
                         tape_init(&job->tape);
@@ -1841,7 +1900,20 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                     case APP_MENU_FILE_AUTOLOAD_TAPES:
                         app->tape_autoload_enabled = !app->tape_autoload_enabled;
                         app_save_tape_autoload(app->tape_autoload_enabled);
-                        app_update_tape_menu(hwnd, app->tape_autoload_enabled);
+                        app_update_tape_menu(
+                            hwnd,
+                            app->tape_autoload_enabled,
+                            app->fast_tape_loading_enabled
+                        );
+                        return 0;
+                    case APP_MENU_FILE_FAST_TAPE_LOADING:
+                        app->fast_tape_loading_enabled = !app->fast_tape_loading_enabled;
+                        app_save_fast_tape_loading(app->fast_tape_loading_enabled);
+                        app_update_tape_menu(
+                            hwnd,
+                            app->tape_autoload_enabled,
+                            app->fast_tape_loading_enabled
+                        );
                         return 0;
                     case APP_MENU_FILE_RESET:
                         app_autotype_clear(app);
@@ -2046,6 +2118,25 @@ static bool app_load_saved_tape_autoload(bool *enabled) {
     return false;
 }
 
+static bool app_load_saved_fast_tape_loading(bool *enabled) {
+    char path[MAX_PATH];
+    char value[16];
+
+    if (!app_settings_path(path, sizeof(path))) {
+        return false;
+    }
+    GetPrivateProfileStringA("emulator", "fast_tape_loading", "", value, sizeof(value), path);
+    if (strcmp(value, "1") == 0) {
+        *enabled = true;
+        return true;
+    }
+    if (strcmp(value, "0") == 0) {
+        *enabled = false;
+        return true;
+    }
+    return false;
+}
+
 /* Persists the user's menu-selected machine preference so future launches
    start in the same 48K or 128K mode when possible. */
 static void app_save_model(SpectrumModel model) {
@@ -2072,6 +2163,19 @@ static void app_save_tape_autoload(bool enabled) {
         "emulator",
         "tape_autoload",
         app_tape_autoload_settings_value(enabled),
+        path
+    );
+}
+
+static void app_save_fast_tape_loading(bool enabled) {
+    char path[MAX_PATH];
+    if (!app_settings_path(path, sizeof(path))) {
+        return;
+    }
+    WritePrivateProfileStringA(
+        "emulator",
+        "fast_tape_loading",
+        enabled ? "1" : "0",
         path
     );
 }
@@ -2454,12 +2558,15 @@ int main(int argc, char **argv) {
     RomSelection selection;
     SpectrumModel saved_model = SPECTRUM_MODEL_48K;
     bool saved_tape_autoload = true;
+    bool saved_fast_tape_loading = true;
     bool has_saved_model;
     bool has_saved_tape_autoload;
+    bool has_saved_fast_tape_loading;
     INITCOMMONCONTROLSEX common_controls;
     ZeroMemory(&selection, sizeof(selection));
     has_saved_model = app_load_saved_model(&saved_model);
     has_saved_tape_autoload = app_load_saved_tape_autoload(&saved_tape_autoload);
+    has_saved_fast_tape_loading = app_load_saved_fast_tape_loading(&saved_fast_tape_loading);
     if (!app_resolve_roms(argc, argv, has_saved_model, saved_model, &selection)) {
         app_print_usage();
         app_show_error("No compatible ROM found. Place 48.rom and/or 128.rom next to the EXE or in the repo.");
@@ -2470,6 +2577,8 @@ int main(int argc, char **argv) {
     ZeroMemory(&app, sizeof(app));
     app.roms = selection;
     app.tape_autoload_enabled = has_saved_tape_autoload ? saved_tape_autoload : true;
+    app.fast_tape_loading_enabled =
+        has_saved_fast_tape_loading ? saved_fast_tape_loading : true;
     tape_init(&app.tape);
     app_audio_init(&app);
     app_controller_init(&app);
@@ -2569,7 +2678,11 @@ int main(int argc, char **argv) {
     app.main_hwnd = hwnd;
     app_update_title(hwnd, &app.spec);
     app_update_model_menu(hwnd, app.spec.model);
-    app_update_tape_menu(hwnd, app.tape_autoload_enabled);
+    app_update_tape_menu(
+        hwnd,
+        app.tape_autoload_enabled,
+        app.fast_tape_loading_enabled
+    );
     app.running = true;
     app_debug_machine_changed(&app);
 

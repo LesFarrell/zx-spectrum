@@ -83,6 +83,7 @@ With no arguments, the emulator looks for `128.rom` in `.\src` first and starts 
 - With auto-load off, opening a tape just inserts and rewinds it for manual loading
 - Tape and snapshot file reading now run in the background so opening larger `.tap`, `.tzx`, `.z80`, `.sna`, or `.szx` files does not stall the main window
 - Standard ROM `LOAD ""` operations fast-load automatically for `.tap` and standard-block `.tzx` files
+- `Tape -> Use Fast Tape Loading` runs custom and turbo tape loaders as quickly as the host CPU allows, without generating intermediate audio or frames; it is enabled by default
 - Use `F3` or `File -> Play Tape` only for custom loaders or real-time tape playback
 - Press `F4` or use `File -> Stop Tape` to stop real-time playback
 - `File -> Reset` resets the active machine

@@ -176,8 +176,12 @@ static void app_update_model_menu(HWND hwnd, SpectrumModel model) {
     );
 }
 
-/* Reflects the current tape auto-load setting in the Tape menu. */
-static void app_update_tape_menu(HWND hwnd, bool enabled) {
+/* Reflects the current tape loading settings in the Tape menu. */
+static void app_update_tape_menu(
+    HWND hwnd,
+    bool autoload_enabled,
+    bool fast_loading_enabled
+) {
     HMENU menu = GetMenu(hwnd);
     if (menu == NULL) {
         return;
@@ -185,7 +189,12 @@ static void app_update_tape_menu(HWND hwnd, bool enabled) {
     CheckMenuItem(
         menu,
         APP_MENU_FILE_AUTOLOAD_TAPES,
-        MF_BYCOMMAND | (enabled ? MF_CHECKED : MF_UNCHECKED)
+        MF_BYCOMMAND | (autoload_enabled ? MF_CHECKED : MF_UNCHECKED)
+    );
+    CheckMenuItem(
+        menu,
+        APP_MENU_FILE_FAST_TAPE_LOADING,
+        MF_BYCOMMAND | (fast_loading_enabled ? MF_CHECKED : MF_UNCHECKED)
     );
 }
 

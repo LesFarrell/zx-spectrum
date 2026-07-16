@@ -1,6 +1,6 @@
-ORG 8000h
-ld a,255
-loop: dec a
-out(254),a
-jp nz, loop
-ret
+	ORG 8000H
+	LD A,255
+LOOP:	DEC A
+	OUT(254),A
+	JP NZ, LOOP
+	RET
