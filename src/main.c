@@ -44,6 +44,8 @@ enum {
     APP_AUDIO_RING_SAMPLES = 16384,
     APP_TAPE_WARP_MAX_FRAMES = 256,
     APP_TAPE_WARP_BUDGET_MS = 30,
+    APP_TAPE_LOADER_ACTIVE_READS = 32,
+    APP_TAPE_LOADER_IDLE_FRAMES = 250,
     APP_MENU_FILE_OPEN_SNAPSHOT = 1001,
     APP_MENU_FILE_RESET = 1002,
     APP_MENU_FILE_EXIT = 1003,
@@ -331,10 +333,14 @@ struct AppState {
     TapePlayer tape;
     DebugState debug;
     int active_key_codes[256];
+    uint32_t tape_input_reads_this_frame;
+    uint32_t tape_loader_idle_frames;
     bool tape_autoload_enabled;
     bool tape_autoplay_pending;
     bool fast_tape_loading_enabled;
     bool tape_warp_active;
+    bool tape_input_seen;
+    bool tape_auto_stop_armed;
     bool tape_load_in_progress;
     bool snapshot_load_in_progress;
     bool running;
@@ -411,6 +417,8 @@ static bool app_load_snapshot_file(HWND hwnd, AppState *app, const char *path, c
 static bool app_apply_loaded_snapshot(HWND hwnd, AppState *app, AppSnapshotLoadJob *job, char *error_buffer, size_t error_buffer_size);
 static void app_play_tape(AppState *app);
 static void app_stop_tape(AppState *app);
+static void app_start_tape_playback(AppState *app);
+static bool app_update_tape_loader_activity(AppState *app);
 static void app_sync_tape_stop_mode(AppState *app);
 static void app_set_modal_loop_timer(AppState *app, HWND hwnd, bool enabled);
 static void app_controller_init(AppState *app);
@@ -1162,6 +1170,15 @@ static void app_release_all_keys(AppState *app) {
    reads can see the waveform on EAR bit 6. */
 static bool app_tape_input_callback(void *user_data, uint64_t tick_count) {
     AppState *app = (AppState *)user_data;
+    if (app == NULL) {
+        return false;
+    }
+    if (app->tape.playing) {
+        app->tape_input_seen = true;
+        if (app->tape_input_reads_this_frame < UINT32_MAX) {
+            app->tape_input_reads_this_frame++;
+        }
+    }
     return tape_input_level(&app->tape, tick_count);
 }
 
@@ -1169,7 +1186,13 @@ static bool app_tape_input_callback(void *user_data, uint64_t tick_count) {
    injected directly instead of being edge-timed through the EAR bit. */
 static bool app_tape_fast_load_trap(void *user_data, void *machine) {
     AppState *app = (AppState *)user_data;
-    return tape_try_fast_load(&app->tape, (zx_t *)machine);
+    const bool loaded = tape_try_fast_load(&app->tape, (zx_t *)machine);
+    if (loaded) {
+        app->tape_input_seen = true;
+        app->tape_input_reads_this_frame = APP_TAPE_LOADER_ACTIVE_READS;
+        app->tape_loader_idle_frames = 0;
+    }
+    return loaded;
 }
 
 /* Queues a short ROM-facing command sequence, such as the tape autoload
@@ -1366,7 +1389,7 @@ static bool app_apply_loaded_tape(
 
     tape_discard(&app->tape);
     app->tape = *loaded_tape;
-    tape_stop(&app->tape);
+    app_stop_tape(app);
 
     if (app->tape_autoload_enabled) {
         if (autoload_target == TAPE_AUTOLOAD_TARGET_128_MENU) {
@@ -1398,7 +1421,7 @@ static bool app_apply_loaded_tape(
             app->auto_type.cooldown_frames = APP_AUTOTYPE_BOOT_DELAY_FRAMES;
         }
         if (!app->tape_autoplay_pending) {
-            tape_start(&app->tape, app->spec.machine.tick_count);
+            app_start_tape_playback(app);
         }
     } else {
         app_sync_tape_stop_mode(app);
@@ -1480,7 +1503,7 @@ static void app_run_autotype(AppState *app) {
             app->auto_type.position = 0;
             if (app->tape_autoplay_pending) {
                 app->tape_autoplay_pending = false;
-                tape_start(&app->tape, app->spec.machine.tick_count);
+                app_start_tape_playback(app);
             }
         }
         return;
@@ -1506,13 +1529,55 @@ static void app_play_tape(AppState *app) {
     }
     app->tape_autoplay_pending = false;
     app_sync_tape_stop_mode(app);
-    tape_start(&app->tape, app->spec.machine.tick_count);
+    app_start_tape_playback(app);
 }
 
 /* Stops the current tape playback position without ejecting the inserted tape. */
 static void app_stop_tape(AppState *app) {
     app->tape_autoplay_pending = false;
     tape_stop(&app->tape);
+    app->tape_auto_stop_armed = false;
+    app->tape_input_seen = false;
+    app->tape_input_reads_this_frame = 0;
+    app->tape_loader_idle_frames = 0;
+}
+
+/* Arms loader-completion detection whenever tape playback begins. */
+static void app_start_tape_playback(AppState *app) {
+    tape_start(&app->tape, app->spec.machine.tick_count);
+    app->tape_auto_stop_armed = app->fast_tape_loading_enabled && app->tape.playing;
+    app->tape_input_seen = false;
+    app->tape_input_reads_this_frame = 0;
+    app->tape_loader_idle_frames = 0;
+}
+
+/* Stops a fast-running tape after sustained low EAR-read activity indicates
+   that control has passed from the loader to the loaded program. */
+static bool app_update_tape_loader_activity(AppState *app) {
+    if (!app->tape_auto_stop_armed) {
+        app->tape_input_reads_this_frame = 0;
+        return false;
+    }
+    if (!app->tape.playing) {
+        app->tape_auto_stop_armed = false;
+        app->tape_input_reads_this_frame = 0;
+        app->tape_loader_idle_frames = 0;
+        return false;
+    }
+
+    if (app->tape_input_reads_this_frame >= APP_TAPE_LOADER_ACTIVE_READS) {
+        app->tape_loader_idle_frames = 0;
+    } else if (app->tape_input_seen &&
+               app->tape_loader_idle_frames < APP_TAPE_LOADER_IDLE_FRAMES) {
+        app->tape_loader_idle_frames++;
+    }
+    app->tape_input_reads_this_frame = 0;
+
+    if (app->tape_loader_idle_frames >= APP_TAPE_LOADER_IDLE_FRAMES) {
+        app_stop_tape(app);
+        return true;
+    }
+    return false;
 }
 
 static void app_sync_tape_stop_mode(AppState *app) {
@@ -1637,6 +1702,7 @@ static void app_tick_emulator(AppState *app) {
             app_run_autotype(app);
             app_debug_run_frame(app, false);
             frames_run++;
+            (void)app_update_tape_loader_activity(app);
 
             if (!app->tape_autoplay_pending && !app->tape.playing) {
                 break;
@@ -1681,6 +1747,7 @@ static void app_tick_emulator(AppState *app) {
         while (app->emulation_accumulator_ms >= frame_ms && frames_run < 8) {
             app_run_autotype(app);
             app_debug_run_frame(app, true);
+            (void)app_update_tape_loader_activity(app);
             app->emulation_accumulator_ms -= frame_ms;
             rendered = true;
             frames_run++;
@@ -1908,6 +1975,11 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                         return 0;
                     case APP_MENU_FILE_FAST_TAPE_LOADING:
                         app->fast_tape_loading_enabled = !app->fast_tape_loading_enabled;
+                        app->tape_auto_stop_armed =
+                            app->fast_tape_loading_enabled && app->tape.playing;
+                        app->tape_input_seen = false;
+                        app->tape_input_reads_this_frame = 0;
+                        app->tape_loader_idle_frames = 0;
                         app_save_fast_tape_loading(app->fast_tape_loading_enabled);
                         app_update_tape_menu(
                             hwnd,
