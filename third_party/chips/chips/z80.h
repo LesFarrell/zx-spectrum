@@ -363,6 +363,7 @@ typedef struct {
     uint16_t af2, bc2, de2, hl2; // shadow register bank
     uint8_t im;
     bool iff1, iff2;
+    bool suppress_int;  // suppress maskable interrupts until the next instruction
 } z80_t;
 
 // initialize a new Z80 instance and return initial pin mask
@@ -944,6 +945,8 @@ static inline uint64_t _z80_refresh(z80_t* cpu, uint64_t pins) {
 
 // initiate a fetch machine cycle for regular (non-prefixed) instructions, or initiate interrupt handling
 static inline uint64_t _z80_fetch(z80_t* cpu, uint64_t pins) {
+    const bool suppress_int = cpu->suppress_int;
+    cpu->suppress_int = false;
     cpu->hlx_idx = 0;
     cpu->prefix_active = false;
     // shortcut no interrupts requested
@@ -961,7 +964,7 @@ static inline uint64_t _z80_fetch(z80_t* cpu, uint64_t pins) {
         // NOTE: PC is *not* incremented!
         return _z80_set_ab_x(pins, cpu->pc, Z80_M1|Z80_MREQ|Z80_RD);
     } else if (cpu->int_bits & Z80_INT) {
-        if (cpu->iff1) {
+        if (cpu->iff1 && !suppress_int) {
             // maskable interrupts start with a special M1 machine cycle which
             // doesn't fetch the next opcode, but instead activate the
             // pins M1|IOQR to request a special byte which is handled differently

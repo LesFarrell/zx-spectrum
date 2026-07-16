@@ -13,15 +13,22 @@ Small ZX Spectrum emulator in C for Windows. It uses the Win32 API for display, 
 - 48K beeper sound through the Windows audio device
 - 128K AY sound through the Windows audio device
 - `.tap` tape loading
-- `.tzx` tape loading for standard-speed and common pulse/data blocks
+- `.tzx` v1.20 tape loading, including direct recording, RLE CSW,
+  generalized data, and loop/jump/call/select control flow
 - `.z80` snapshot loading for 48K and 128K snapshots
+- `.sna` snapshot loading for 48K and 128K snapshots
+- `.szx` ZX-State snapshot loading for original 48K and 128K machines,
+  including zlib-compressed RAM pages, 128K paging, and AY state
 
 ## Not implemented
 
-- Advanced `.tzx` block types such as direct recording, generalized data, and call/jump control flow
+- Z-RLE-compressed CSW blocks and an interactive choice UI for TZX select
+  blocks (the first select option is used automatically)
+- 128K SNA snapshots captured with the TR-DOS ROM paged in
 - Full ULA I/O contention timing
-- `.sna` snapshot loading
 - Non-48K/128K `.z80` snapshot models
+- SZX machine variants other than the original 48K and 128K models; SZX
+  peripheral blocks are skipped while the core machine state is restored
 
 ## Build
 
@@ -70,11 +77,11 @@ With no arguments, the emulator looks for `128.rom` in `.\src` first and starts 
 
 ## Menu
 
-- `File -> Open Tape/Snapshot...` opens `.tap`, `.tzx`, or `.z80` files
+- `File -> Open Tape/Snapshot...` opens `.tap`, `.tzx`, `.z80`, `.sna`, or `.szx` files
 - `File -> Auto-load Tapes On Open` toggles whether opening a tape starts loading automatically
 - With auto-load on, opening a tape inspects the tape and chooses `48 BASIC` or the `128K` tape loader automatically
 - With auto-load off, opening a tape just inserts and rewinds it for manual loading
-- Tape and snapshot file reading now run in the background so opening larger `.tap`, `.tzx`, or `.z80` files does not stall the main window
+- Tape and snapshot file reading now run in the background so opening larger `.tap`, `.tzx`, `.z80`, `.sna`, or `.szx` files does not stall the main window
 - Standard ROM `LOAD ""` operations fast-load automatically for `.tap` and standard-block `.tzx` files
 - Use `F3` or `File -> Play Tape` only for custom loaders or real-time tape playback
 - Press `F4` or use `File -> Stop Tape` to stop real-time playback
@@ -84,6 +91,15 @@ With no arguments, the emulator looks for `128.rom` in `.\src` first and starts 
 - `Tools -> Assembler...` opens a small RAM patching assembler with support for common Z80 instructions plus `ORG`, `DB`, `DW`, `DS`/`DEFS`, `INCBIN`, `INCLUDE`, and TAP export
 - `Tools -> Debugger...` opens a separate debugger window with pause, run, single-step, register state, and memory/disassembly views
 - `Tools -> Poke...` opens a small RAM poke tool for writing one or more byte values directly to memory
+
+## Tape tests
+
+Run the focused TAP/TZX decoder and snapshot-state tests with:
+
+```powershell
+.\src\test_tape.bat
+.\src\test_snapshot.bat
+```
 
 ## Assembler Notes
 

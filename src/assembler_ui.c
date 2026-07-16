@@ -948,6 +948,7 @@ static INT_PTR CALLBACK app_assembler_dlgproc(HWND hwnd, UINT msg, WPARAM wparam
                 GWLP_WNDPROC,
                 (LONG_PTR)app_assembler_source_wndproc
             );
+            app_apply_flat_control_style(hwnd);
             app_assembler_layout_controls(app, hwnd);
             app_assembler_set_status(
                 app,
@@ -1329,7 +1330,7 @@ static void app_assembler_set_status(AppState *app, const char *text) {
     if (app == NULL || app->debug.assembler_status == NULL) {
         return;
     }
-    SendMessageA(app->debug.assembler_status, SB_SETTEXTA, 0, (LPARAM)text);
+    SendMessageA(app->debug.assembler_status, SB_SETTEXTA, SBT_NOBORDERS, (LPARAM)text);
 }
 
 /* Reads the last-write timestamp for one source file so the assembler can

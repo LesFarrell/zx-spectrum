@@ -156,6 +156,12 @@ typedef struct AppTapeLoadJob {
     bool ok;
 } AppTapeLoadJob;
 
+typedef enum AppSnapshotFormat {
+    APP_SNAPSHOT_FORMAT_Z80,
+    APP_SNAPSHOT_FORMAT_SNA,
+    APP_SNAPSHOT_FORMAT_SZX
+} AppSnapshotFormat;
+
 typedef struct AppSnapshotLoadJob {
     HWND hwnd;
     char path[MAX_PATH];
@@ -163,6 +169,7 @@ typedef struct AppSnapshotLoadJob {
     size_t size;
     SpectrumModel model;
     char error[256];
+    AppSnapshotFormat format;
     bool ok;
 } AppSnapshotLoadJob;
 
@@ -221,6 +228,7 @@ typedef struct DebugState {
     HWND poke_address_edit;
     HWND poke_values_edit;
     HWND poke_apply_button;
+    HWND poke_status;
     HBRUSH poke_background_brush;
     HBRUSH poke_input_brush;
     HBRUSH assembler_source_brush;
@@ -627,6 +635,246 @@ static const char *app_tape_autoload_settings_value(bool enabled) {
     return enabled ? "1" : "0";
 }
 
+static bool app_draw_flat_button(const DRAWITEMSTRUCT *draw) {
+    char text[256];
+    RECT rect;
+    COLORREF background_color = GetSysColor(COLOR_WINDOW);
+    COLORREF border_color = GetSysColor(COLOR_BTNSHADOW);
+    COLORREF text_color = GetSysColor(COLOR_BTNTEXT);
+    HBRUSH background_brush;
+    HBRUSH border_brush;
+    HFONT font;
+    HGDIOBJ old_font = NULL;
+
+    if (draw == NULL || draw->CtlType != ODT_BUTTON || draw->hwndItem == NULL) {
+        return false;
+    }
+
+    if ((draw->itemState & ODS_DISABLED) != 0) {
+        background_color = GetSysColor(COLOR_BTNFACE);
+        border_color = GetSysColor(COLOR_3DLIGHT);
+        text_color = GetSysColor(COLOR_GRAYTEXT);
+    } else if ((draw->itemState & ODS_SELECTED) != 0) {
+        background_color = GetSysColor(COLOR_3DLIGHT);
+        border_color = GetSysColor(COLOR_HIGHLIGHT);
+    } else if ((draw->itemState & ODS_FOCUS) != 0) {
+        border_color = GetSysColor(COLOR_HIGHLIGHT);
+    }
+
+    background_brush = CreateSolidBrush(background_color);
+    border_brush = CreateSolidBrush(border_color);
+    if (background_brush == NULL || border_brush == NULL) {
+        if (background_brush != NULL) {
+            DeleteObject(background_brush);
+        }
+        if (border_brush != NULL) {
+            DeleteObject(border_brush);
+        }
+        return false;
+    }
+
+    rect = draw->rcItem;
+    FillRect(draw->hDC, &rect, background_brush);
+    FrameRect(draw->hDC, &rect, border_brush);
+    SetBkMode(draw->hDC, TRANSPARENT);
+    SetTextColor(draw->hDC, text_color);
+    font = (HFONT)SendMessageA(draw->hwndItem, WM_GETFONT, 0, 0);
+    if (font != NULL) {
+        old_font = SelectObject(draw->hDC, font);
+    }
+    GetWindowTextA(draw->hwndItem, text, (int)sizeof(text));
+    DrawTextA(draw->hDC, text, -1, &rect, DT_CENTER | DT_END_ELLIPSIS | DT_SINGLELINE | DT_VCENTER);
+    if (old_font != NULL) {
+        SelectObject(draw->hDC, old_font);
+    }
+    DeleteObject(border_brush);
+    DeleteObject(background_brush);
+    return true;
+}
+
+static void app_draw_flat_edit_border(HWND control) {
+    RECT rect;
+    HDC hdc;
+    HBRUSH border_brush;
+    COLORREF border_color;
+
+    if (control == NULL) {
+        return;
+    }
+
+    if (!IsWindowEnabled(control)) {
+        border_color = GetSysColor(COLOR_3DLIGHT);
+    } else if (GetFocus() == control) {
+        border_color = GetSysColor(COLOR_HIGHLIGHT);
+    } else {
+        border_color = GetSysColor(COLOR_BTNSHADOW);
+    }
+
+    hdc = GetDC(control);
+    if (hdc == NULL) {
+        return;
+    }
+    border_brush = CreateSolidBrush(border_color);
+    if (border_brush != NULL) {
+        GetClientRect(control, &rect);
+        FrameRect(hdc, &rect, border_brush);
+        DeleteObject(border_brush);
+    }
+    ReleaseDC(control, hdc);
+}
+
+static void app_fill_flat_edit_background(HWND control, HDC hdc) {
+    RECT rect;
+    HBRUSH background_brush;
+
+    if (control == NULL || hdc == NULL) {
+        return;
+    }
+    background_brush = GetSysColorBrush(IsWindowEnabled(control) ? COLOR_WINDOW : COLOR_BTNFACE);
+    GetClientRect(control, &rect);
+    FillRect(hdc, &rect, background_brush);
+}
+
+static void app_fill_flat_edit_padding(HWND control) {
+    RECT client_rect;
+    RECT format_rect;
+    RECT padding_rect;
+    HBRUSH background_brush;
+    HDC hdc;
+
+    if (control == NULL) {
+        return;
+    }
+    GetClientRect(control, &client_rect);
+    SendMessageA(control, EM_GETRECT, 0, (LPARAM)&format_rect);
+    format_rect.left = max(format_rect.left, client_rect.left);
+    format_rect.top = max(format_rect.top, client_rect.top);
+    format_rect.right = min(format_rect.right, client_rect.right);
+    format_rect.bottom = min(format_rect.bottom, client_rect.bottom);
+    if (format_rect.left > format_rect.right || format_rect.top > format_rect.bottom) {
+        return;
+    }
+
+    hdc = GetDC(control);
+    if (hdc == NULL) {
+        return;
+    }
+    background_brush = GetSysColorBrush(IsWindowEnabled(control) ? COLOR_WINDOW : COLOR_BTNFACE);
+
+    SetRect(&padding_rect, client_rect.left, client_rect.top, client_rect.right, format_rect.top);
+    FillRect(hdc, &padding_rect, background_brush);
+    SetRect(&padding_rect, client_rect.left, format_rect.bottom, client_rect.right, client_rect.bottom);
+    FillRect(hdc, &padding_rect, background_brush);
+    SetRect(&padding_rect, client_rect.left, format_rect.top, format_rect.left, format_rect.bottom);
+    FillRect(hdc, &padding_rect, background_brush);
+    SetRect(&padding_rect, format_rect.right, format_rect.top, client_rect.right, format_rect.bottom);
+    FillRect(hdc, &padding_rect, background_brush);
+    ReleaseDC(control, hdc);
+}
+
+static LRESULT CALLBACK app_flat_edit_subclass_proc(
+    HWND hwnd,
+    UINT msg,
+    WPARAM wparam,
+    LPARAM lparam,
+    UINT_PTR subclass_id,
+    DWORD_PTR reference_data
+) {
+    LRESULT result;
+    (void)reference_data;
+
+    if (msg == WM_NCDESTROY) {
+        RemoveWindowSubclass(hwnd, app_flat_edit_subclass_proc, subclass_id);
+        return DefSubclassProc(hwnd, msg, wparam, lparam);
+    }
+
+    if (msg == WM_ERASEBKGND) {
+        app_fill_flat_edit_background(hwnd, (HDC)wparam);
+        return 1;
+    }
+
+    if (msg == WM_PAINT) {
+        HDC hdc = GetDC(hwnd);
+        if (hdc != NULL) {
+            app_fill_flat_edit_background(hwnd, hdc);
+            ReleaseDC(hwnd, hdc);
+        }
+    }
+
+    result = DefSubclassProc(hwnd, msg, wparam, lparam);
+    if (msg == WM_PAINT) {
+        app_fill_flat_edit_padding(hwnd);
+        app_draw_flat_edit_border(hwnd);
+    } else if (msg == WM_SETFOCUS || msg == WM_KILLFOCUS || msg == WM_ENABLE) {
+        RedrawWindow(hwnd, NULL, NULL, RDW_ERASE | RDW_INVALIDATE | RDW_UPDATENOW);
+    }
+    return result;
+}
+
+static void app_make_control_flat(HWND control) {
+    char class_name[64];
+    LONG_PTR style;
+    LONG_PTR extended_style;
+
+    if (control == NULL) {
+        return;
+    }
+
+    style = GetWindowLongPtrA(control, GWL_STYLE);
+    if (GetClassNameA(control, class_name, (int)sizeof(class_name)) > 0) {
+        if (_stricmp(class_name, "Button") == 0) {
+            LONG_PTR button_type = style & BS_TYPEMASK;
+            if (button_type == BS_PUSHBUTTON || button_type == BS_DEFPUSHBUTTON) {
+                style = (style & ~BS_TYPEMASK) | BS_OWNERDRAW | BS_FLAT;
+            } else {
+                style |= BS_FLAT;
+            }
+        } else if (_stricmp(class_name, "Edit") == 0 &&
+                   SetWindowSubclass(control, app_flat_edit_subclass_proc, 1, 0)) {
+            style &= ~WS_BORDER;
+            SendMessageA(
+                control,
+                EM_SETMARGINS,
+                EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                MAKELPARAM(4, 4)
+            );
+        } else if (_stricmp(class_name, STATUSCLASSNAMEA) == 0) {
+            style |= CCS_NODIVIDER;
+            style &= ~SBARS_SIZEGRIP;
+        }
+        SetWindowLongPtrA(control, GWL_STYLE, style);
+    }
+
+    extended_style = GetWindowLongPtrA(control, GWL_EXSTYLE);
+    extended_style &= ~(WS_EX_CLIENTEDGE | WS_EX_STATICEDGE | WS_EX_WINDOWEDGE);
+    SetWindowLongPtrA(control, GWL_EXSTYLE, extended_style);
+    SetWindowPos(
+        control,
+        NULL,
+        0,
+        0,
+        0,
+        0,
+        SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+    );
+    RedrawWindow(
+        control,
+        NULL,
+        NULL,
+        RDW_ERASE | RDW_FRAME | RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN
+    );
+}
+
+static BOOL CALLBACK app_make_child_control_flat(HWND control, LPARAM unused) {
+    (void)unused;
+    app_make_control_flat(control);
+    return TRUE;
+}
+
+static void app_apply_flat_control_style(HWND parent) {
+    EnumChildWindows(parent, app_make_child_control_flat, 0);
+}
+
 /* Keep the UI modules in separate files while preserving the existing single
    translation unit and static helper visibility. */
 #include "debugger.c"
@@ -969,9 +1217,18 @@ static DWORD WINAPI app_tape_load_worker(void *param) {
 }
 
 /* Runs snapshot file I/O and model detection away from the window thread so
-   loading larger `.z80` files does not stall painting or input processing. */
+   loading larger snapshot files does not stall painting or input. */
 static DWORD WINAPI app_snapshot_load_worker(void *param) {
     AppSnapshotLoadJob *job = (AppSnapshotLoadJob *)param;
+    const char *extension = strrchr(job->path, '.');
+
+    if (extension != NULL && _stricmp(extension, ".sna") == 0) {
+        job->format = APP_SNAPSHOT_FORMAT_SNA;
+    } else if (extension != NULL && _stricmp(extension, ".szx") == 0) {
+        job->format = APP_SNAPSHOT_FORMAT_SZX;
+    } else {
+        job->format = APP_SNAPSHOT_FORMAT_Z80;
+    }
 
     job->ok = app_read_file_all(
         job->path,
@@ -982,8 +1239,25 @@ static DWORD WINAPI app_snapshot_load_worker(void *param) {
         "snapshot"
     );
     if (job->ok) {
-        if (!spectrum_detect_snapshot_model_data(job->data, job->size, &job->model)) {
-            snprintf(job->error, sizeof(job->error), "Unsupported or corrupt .z80 snapshot: %s", job->path);
+        bool detected;
+        const char *format_name;
+        if (job->format == APP_SNAPSHOT_FORMAT_SNA) {
+            detected = spectrum_detect_snapshot_sna_model_data(job->data, job->size, &job->model);
+            format_name = "sna";
+        } else if (job->format == APP_SNAPSHOT_FORMAT_SZX) {
+            detected = spectrum_detect_snapshot_szx_model_data(job->data, job->size, &job->model);
+            format_name = "szx";
+        } else {
+            detected = spectrum_detect_snapshot_model_data(job->data, job->size, &job->model);
+            format_name = "z80";
+        }
+        if (!detected) {
+            snprintf(
+                job->error,
+                sizeof(job->error),
+                "Unsupported or corrupt .%s snapshot: %s",
+                format_name,
+                job->path);
             job->ok = false;
         }
     }
@@ -1130,7 +1404,7 @@ static bool app_apply_loaded_tape(
 }
 
 /* Applies a background-loaded snapshot on the main thread, rebuilding the
-   machine only if the decoded `.z80` payload targets a different model. */
+   machine only if the decoded payload targets a different model. */
 static bool app_apply_loaded_snapshot(
     HWND hwnd,
     AppState *app,
@@ -1152,7 +1426,18 @@ static bool app_apply_loaded_snapshot(
             return false;
         }
     }
-    if (!spectrum_load_snapshot_z80_data(&app->spec, job->data, job->size, error_buffer, error_buffer_size)) {
+    bool loaded;
+    if (job->format == APP_SNAPSHOT_FORMAT_SNA) {
+        loaded = spectrum_load_snapshot_sna_data(
+            &app->spec, job->data, job->size, error_buffer, error_buffer_size);
+    } else if (job->format == APP_SNAPSHOT_FORMAT_SZX) {
+        loaded = spectrum_load_snapshot_szx_data(
+            &app->spec, job->data, job->size, error_buffer, error_buffer_size);
+    } else {
+        loaded = spectrum_load_snapshot_z80_data(
+            &app->spec, job->data, job->size, error_buffer, error_buffer_size);
+    }
+    if (!loaded) {
         if (model_changed) {
             app->spec = previous_spec;
             app_sync_tape_stop_mode(app);
@@ -1515,9 +1800,9 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                         ofn.lStructSize = sizeof(ofn);
                         ofn.hwndOwner = hwnd;
                         ofn.lpstrFilter =
-                            "ZX Spectrum Files (*.tap;*.tzx;*.z80)\0*.tap;*.tzx;*.z80\0"
+                            "ZX Spectrum Files (*.tap;*.tzx;*.z80;*.sna;*.szx)\0*.tap;*.tzx;*.z80;*.sna;*.szx\0"
                             "Tape Images (*.tap;*.tzx)\0*.tap;*.tzx\0"
-                            "ZX Spectrum Snapshots (*.z80)\0*.z80\0"
+                            "ZX Spectrum Snapshots (*.z80;*.sna;*.szx)\0*.z80;*.sna;*.szx\0"
                             "All Files (*.*)\0*.*\0";
                         ofn.lpstrFile = path;
                         ofn.nMaxFile = MAX_PATH;
@@ -1534,14 +1819,16 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                                 return 0;
                             }
 
-                            if (extension != NULL && _stricmp(extension, ".z80") == 0) {
+                            if (extension != NULL &&
+                                (_stricmp(extension, ".z80") == 0 || _stricmp(extension, ".sna") == 0 ||
+                                 _stricmp(extension, ".szx") == 0)) {
                                 if (!app_load_snapshot_file(hwnd, app, path, error_buffer, sizeof(error_buffer))) {
                                     app_show_error(error_buffer);
                                 }
                                 return 0;
                             }
 
-                            app_show_error("Unsupported file type. Open a .tap, .tzx, or .z80 file.");
+                            app_show_error("Unsupported file type. Open a .tap, .tzx, .z80, .sna, or .szx file.");
                         }
                         return 0;
                     }

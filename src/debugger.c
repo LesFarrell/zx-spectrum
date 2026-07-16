@@ -1723,6 +1723,7 @@ static INT_PTR CALLBACK app_debugger_dlgproc(HWND hwnd, UINT msg, WPARAM wparam,
                 GWLP_WNDPROC,
                 (LONG_PTR)app_debugger_points_wndproc
             );
+            app_apply_flat_control_style(hwnd);
             app_debugger_layout_controls(app, hwnd);
             app_debug_sync_view_controls(app);
             app_debug_refresh_window(app);
@@ -1743,6 +1744,11 @@ static INT_PTR CALLBACK app_debugger_dlgproc(HWND hwnd, UINT msg, WPARAM wparam,
                 GetClientRect(hwnd, &rect);
                 FillRect((HDC)wparam, &rect, app->debug.debugger_background_brush);
                 SetWindowLongPtrA(hwnd, DWLP_MSGRESULT, 1);
+                return TRUE;
+            }
+            break;
+        case WM_DRAWITEM:
+            if (app_draw_flat_button((const DRAWITEMSTRUCT *)lparam)) {
                 return TRUE;
             }
             break;

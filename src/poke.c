@@ -78,7 +78,6 @@ static INT_PTR CALLBACK app_poke_dlgproc(HWND hwnd, UINT msg, WPARAM wparam, LPA
 
     switch (msg) {
         case WM_INITDIALOG: {
-            HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
             app = (AppState *)lparam;
             SetWindowLongPtrA(hwnd, GWLP_USERDATA, (LONG_PTR)app);
             if (app == NULL) {
@@ -89,12 +88,11 @@ static INT_PTR CALLBACK app_poke_dlgproc(HWND hwnd, UINT msg, WPARAM wparam, LPA
             app->debug.poke_address_edit = GetDlgItem(hwnd, APP_CTRL_POKE_ADDRESS);
             app->debug.poke_values_edit = GetDlgItem(hwnd, APP_CTRL_POKE_VALUES);
             app->debug.poke_apply_button = GetDlgItem(hwnd, APP_CTRL_POKE_APPLY);
+            app->debug.poke_status = GetDlgItem(hwnd, APP_CTRL_POKE_STATUS);
 
             SendMessageA(app->debug.poke_address_edit, EM_SETLIMITTEXT, 15, 0);
             SendMessageA(app->debug.poke_values_edit, EM_SETLIMITTEXT, 2047, 0);
-            SendMessageA(app->debug.poke_address_edit, WM_SETFONT, (WPARAM)font, TRUE);
-            SendMessageA(app->debug.poke_values_edit, WM_SETFONT, (WPARAM)font, TRUE);
-            SendMessageA(app->debug.poke_apply_button, WM_SETFONT, (WPARAM)font, TRUE);
+            app_apply_flat_control_style(hwnd);
             app_poke_layout_controls(app, hwnd);
             app_poke_refresh_window(app);
             return FALSE;
@@ -133,12 +131,28 @@ static INT_PTR CALLBACK app_poke_dlgproc(HWND hwnd, UINT msg, WPARAM wparam, LPA
         case WM_CTLCOLORSTATIC:
             if (app != NULL) {
                 HDC hdc = (HDC)wparam;
+                HWND control = (HWND)lparam;
+                if ((control == app->debug.poke_address_edit || control == app->debug.poke_values_edit) &&
+                    IsWindowEnabled(control)) {
+                    SetTextColor(hdc, GetSysColor(COLOR_WINDOWTEXT));
+                    SetBkColor(hdc, GetSysColor(COLOR_WINDOW));
+                    SetBkMode(hdc, OPAQUE);
+                    SetWindowLongPtrA(hwnd, DWLP_MSGRESULT, (LONG_PTR)(app->debug.poke_input_brush != NULL
+                        ? app->debug.poke_input_brush
+                        : GetSysColorBrush(COLOR_WINDOW)));
+                    return TRUE;
+                }
                 SetTextColor(hdc, GetSysColor(COLOR_BTNTEXT));
                 SetBkColor(hdc, GetSysColor(COLOR_BTNFACE));
                 SetBkMode(hdc, TRANSPARENT);
                 SetWindowLongPtrA(hwnd, DWLP_MSGRESULT, (LONG_PTR)(app->debug.poke_background_brush != NULL
                     ? app->debug.poke_background_brush
                     : GetSysColorBrush(COLOR_BTNFACE)));
+                return TRUE;
+            }
+            break;
+        case WM_DRAWITEM:
+            if (app_draw_flat_button((const DRAWITEMSTRUCT *)lparam)) {
                 return TRUE;
             }
             break;
@@ -172,6 +186,7 @@ static INT_PTR CALLBACK app_poke_dlgproc(HWND hwnd, UINT msg, WPARAM wparam, LPA
                 app->debug.poke_address_edit = NULL;
                 app->debug.poke_values_edit = NULL;
                 app->debug.poke_apply_button = NULL;
+                app->debug.poke_status = NULL;
             }
             return TRUE;
         default:
@@ -197,7 +212,7 @@ static void app_open_poke_window(AppState *app) {
         CW_USEDEFAULT,
         CW_USEDEFAULT,
         230,
-        135,
+        175,
         app->main_hwnd,
         NULL,
         GetModuleHandleA(NULL),
@@ -214,12 +229,10 @@ static void app_poke_set_status(AppState *app, const char *text) {
         return;
     }
 
-    if (text == NULL || text[0] == '\0') {
-        SetWindowTextA(app->debug.poke_hwnd, "Spectrum Poke");
-        return;
+    SetWindowTextA(app->debug.poke_hwnd, "Spectrum Poke");
+    if (app->debug.poke_status != NULL) {
+        SetWindowTextA(app->debug.poke_status, text != NULL ? text : "");
     }
-
-    SetWindowTextA(app->debug.poke_hwnd, text);
 }
 
 /* Lays out the compact poke controls inside their tool window. */
@@ -228,11 +241,12 @@ static void app_poke_layout_controls(AppState *app, HWND hwnd) {
     int width;
     const int edge = 10;
     const int label_h = 16;
-    const int edit_h = 22;
+    const int edit_h = 18;
     const int row_gap = 28;
-    const int button_y = 64;
     const int button_h = 24;
     const int button_w = 96;
+    const int status_y = 66;
+    const int status_h = 34;
 
     if (app == NULL || hwnd == NULL || app->debug.poke_address_edit == NULL || app->debug.poke_values_edit == NULL) {
         return;
@@ -245,7 +259,17 @@ static void app_poke_layout_controls(AppState *app, HWND hwnd) {
     MoveWindow(app->debug.poke_address_edit, edge + 80, edge - 2, width - (edge * 2) - 80, edit_h, TRUE);
     MoveWindow(GetDlgItem(hwnd, APP_CTRL_POKE_VALUES_LABEL), edge, edge + row_gap, 80, label_h, TRUE);
     MoveWindow(app->debug.poke_values_edit, edge + 80, edge + row_gap - 2, width - (edge * 2) - 80, edit_h, TRUE);
-    MoveWindow(app->debug.poke_apply_button, width - edge - button_w, button_y, button_w, button_h, TRUE);
+    if (app->debug.poke_status != NULL) {
+        MoveWindow(app->debug.poke_status, edge, status_y, width - (edge * 2), status_h, TRUE);
+    }
+    MoveWindow(
+        app->debug.poke_apply_button,
+        width - edge - button_w,
+        rect.bottom - edge - button_h,
+        button_w,
+        button_h,
+        TRUE
+    );
 }
 
 /* Refreshes enabled state and default status text for the poke tool. */

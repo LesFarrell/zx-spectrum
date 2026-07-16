@@ -69,7 +69,7 @@ extern "C" {
 #endif
 
 // bump this whenever the zx_t struct layout changes
-#define ZX_SNAPSHOT_VERSION (0x0002)
+#define ZX_SNAPSHOT_VERSION (0x0003)
 
 #define ZX_MAX_AUDIO_SAMPLES (1024)      // max number of audio samples in internal sample buffer
 #define ZX_DEFAULT_AUDIO_SAMPLES (128)   // default number of samples in internal sample buffer

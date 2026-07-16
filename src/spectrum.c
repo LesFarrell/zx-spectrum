@@ -9,6 +9,7 @@
 #include "systems/zx.h"
 
 #include "spectrum.h"
+#include "szx_inflate.h"
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -19,8 +20,27 @@ enum
     ZX_HOST_KEY_CAPS_SHIFT = 1,
     ZX_HOST_KEY_SYMBOL_SHIFT = 2,
     ZX_48K_FRAME_US = 19968,
-    ZX_128K_FRAME_US = 19992
+    ZX_128K_FRAME_US = 19992,
+    SNA_HEADER_SIZE = 27,
+    SNA_RAM_BANK_SIZE = 0x4000,
+    SNA_48K_SIZE = SNA_HEADER_SIZE + (3 * SNA_RAM_BANK_SIZE),
+    SNA_128K_BASE_SIZE = SNA_48K_SIZE + 4,
+    SNA_128K_SIZE = SNA_128K_BASE_SIZE + (5 * SNA_RAM_BANK_SIZE),
+    SNA_128K_DUPLICATE_BANK_SIZE = SNA_128K_BASE_SIZE + (6 * SNA_RAM_BANK_SIZE)
 };
+
+static uint16_t spectrum_read_u16(const uint8_t *data)
+{
+    return (uint16_t)(data[0] | (data[1] << 8));
+}
+
+static uint32_t spectrum_read_u32(const uint8_t *data)
+{
+    return (uint32_t)data[0] |
+        ((uint32_t)data[1] << 8) |
+        ((uint32_t)data[2] << 16) |
+        ((uint32_t)data[3] << 24);
+}
 
 /* Reads a ROM file into the provided buffer, rejects files larger than the
    expected maximum size, and pads short reads with 0xFF bytes. */
@@ -149,6 +169,28 @@ bool spectrum_detect_snapshot_model_data(
         *model = SPECTRUM_MODEL_128K;
     }
     return true;
+}
+
+bool spectrum_detect_snapshot_sna_model_data(
+    const uint8_t *data,
+    size_t size,
+    SpectrumModel *model)
+{
+    if (data == NULL || model == NULL)
+    {
+        return false;
+    }
+    if (size == SNA_48K_SIZE)
+    {
+        *model = SPECTRUM_MODEL_48K;
+        return true;
+    }
+    if (size == SNA_128K_SIZE || size == SNA_128K_DUPLICATE_BANK_SIZE)
+    {
+        *model = SPECTRUM_MODEL_128K;
+        return true;
+    }
+    return false;
 }
 
 /* Builds the chips ZX Spectrum machine from the already loaded ROM buffers and
@@ -449,6 +491,503 @@ void spectrum_set_joystick_mask(Spectrum *spec, uint8_t mask)
         return;
     }
     zx_joystick(&spec->machine, mask);
+}
+
+static void spectrum_restore_sna_registers(zx_t *machine, const uint8_t *header)
+{
+    z80_reset(&machine->cpu);
+    machine->cpu.i = header[0];
+    machine->cpu.hl2 = spectrum_read_u16(&header[1]);
+    machine->cpu.de2 = spectrum_read_u16(&header[3]);
+    machine->cpu.bc2 = spectrum_read_u16(&header[5]);
+    machine->cpu.af2 = spectrum_read_u16(&header[7]);
+    machine->cpu.hl = spectrum_read_u16(&header[9]);
+    machine->cpu.de = spectrum_read_u16(&header[11]);
+    machine->cpu.bc = spectrum_read_u16(&header[13]);
+    machine->cpu.iy = spectrum_read_u16(&header[15]);
+    machine->cpu.ix = spectrum_read_u16(&header[17]);
+    machine->cpu.iff2 = (header[19] & 0x04u) != 0;
+    machine->cpu.iff1 = machine->cpu.iff2;
+    machine->cpu.r = header[20];
+    machine->cpu.af = spectrum_read_u16(&header[21]);
+    machine->cpu.sp = spectrum_read_u16(&header[23]);
+    machine->cpu.im = header[25];
+    machine->border_color = header[26] & 0x07u;
+    machine->last_fe_out = machine->border_color;
+    beeper_set(&machine->beeper, false);
+}
+
+bool spectrum_load_snapshot_sna_data(
+    Spectrum *spec,
+    const uint8_t *data,
+    size_t data_size,
+    char *error_buffer,
+    size_t error_buffer_size)
+{
+    SpectrumModel snapshot_model;
+    uint8_t paged_bank = 0;
+    uint8_t port_7ffd = 0;
+    size_t expected_size = SNA_48K_SIZE;
+
+    if (spec == NULL || data == NULL ||
+        !spectrum_detect_snapshot_sna_model_data(data, data_size, &snapshot_model))
+    {
+        snprintf(error_buffer, error_buffer_size, "Unsupported or corrupt .sna snapshot.");
+        return false;
+    }
+    if (data[25] > 2)
+    {
+        snprintf(error_buffer, error_buffer_size, "Invalid interrupt mode in .sna snapshot.");
+        return false;
+    }
+
+    if (snapshot_model == SPECTRUM_MODEL_48K)
+    {
+        const uint16_t stack_pointer = spectrum_read_u16(&data[23]);
+        if (stack_pointer < 0x4000u || stack_pointer == 0xFFFFu)
+        {
+            snprintf(error_buffer, error_buffer_size, "Invalid 48K .sna program-counter stack address.");
+            return false;
+        }
+    }
+    else
+    {
+        port_7ffd = data[SNA_48K_SIZE + 2u];
+        paged_bank = port_7ffd & 0x07u;
+        expected_size = (paged_bank == 2 || paged_bank == 5)
+            ? SNA_128K_DUPLICATE_BANK_SIZE
+            : SNA_128K_SIZE;
+        if (data_size != expected_size)
+        {
+            snprintf(error_buffer, error_buffer_size, "128K .sna snapshot has the wrong RAM-bank count.");
+            return false;
+        }
+        if (data[SNA_48K_SIZE + 3u] != 0)
+        {
+            snprintf(error_buffer, error_buffer_size, "TR-DOS-paged .sna snapshots are not supported.");
+            return false;
+        }
+    }
+
+    if (snapshot_model != spec->model)
+    {
+        if (!spectrum_rebuild_for_model(spec, snapshot_model, error_buffer, error_buffer_size))
+        {
+            return false;
+        }
+    }
+
+    if (snapshot_model == SPECTRUM_MODEL_48K)
+    {
+        uint16_t program_counter;
+        memcpy(spec->machine.ram[0], &data[SNA_HEADER_SIZE], SNA_RAM_BANK_SIZE);
+        memcpy(spec->machine.ram[1], &data[SNA_HEADER_SIZE + SNA_RAM_BANK_SIZE], SNA_RAM_BANK_SIZE);
+        memcpy(spec->machine.ram[2], &data[SNA_HEADER_SIZE + (2 * SNA_RAM_BANK_SIZE)], SNA_RAM_BANK_SIZE);
+        spectrum_restore_sna_registers(&spec->machine, data);
+
+        program_counter = (uint16_t)(
+            mem_rd(&spec->machine.mem, spec->machine.cpu.sp) |
+            (mem_rd(&spec->machine.mem, (uint16_t)(spec->machine.cpu.sp + 1u)) << 8));
+        spec->machine.cpu.sp = (uint16_t)(spec->machine.cpu.sp + 2u);
+        spec->machine.pins = z80_prefetch(&spec->machine.cpu, program_counter);
+    }
+    else
+    {
+        size_t remaining_offset = SNA_128K_BASE_SIZE;
+        memcpy(spec->machine.ram[5], &data[SNA_HEADER_SIZE], SNA_RAM_BANK_SIZE);
+        memcpy(spec->machine.ram[2], &data[SNA_HEADER_SIZE + SNA_RAM_BANK_SIZE], SNA_RAM_BANK_SIZE);
+        memcpy(spec->machine.ram[paged_bank], &data[SNA_HEADER_SIZE + (2 * SNA_RAM_BANK_SIZE)], SNA_RAM_BANK_SIZE);
+
+        for (uint8_t bank = 0; bank < 8; ++bank)
+        {
+            if (bank == 5 || bank == 2 || bank == paged_bank)
+            {
+                continue;
+            }
+            memcpy(spec->machine.ram[bank], &data[remaining_offset], SNA_RAM_BANK_SIZE);
+            remaining_offset += SNA_RAM_BANK_SIZE;
+        }
+        if (remaining_offset != expected_size)
+        {
+            snprintf(error_buffer, error_buffer_size, "Could not map all RAM banks from .sna snapshot.");
+            return false;
+        }
+
+        spectrum_restore_sna_registers(&spec->machine, data);
+        ay38910_reset(&spec->machine.ay);
+        spec->machine.memory_paging_disabled = false;
+        _zx_update_memory_map_zx128(&spec->machine, port_7ffd);
+        spec->machine.pins = z80_prefetch(
+            &spec->machine.cpu,
+            spectrum_read_u16(&data[SNA_48K_SIZE]));
+    }
+
+    spectrum_render_frame(spec);
+    return true;
+}
+
+bool spectrum_load_snapshot_sna(
+    Spectrum *spec,
+    const char *snapshot_path,
+    char *error_buffer,
+    size_t error_buffer_size)
+{
+    uint8_t *data = NULL;
+    size_t data_size = 0;
+    bool ok;
+
+    if (!spectrum_load_file_all(snapshot_path, &data, &data_size))
+    {
+        snprintf(error_buffer, error_buffer_size, "Could not read snapshot file: %s", snapshot_path);
+        return false;
+    }
+    ok = spectrum_load_snapshot_sna_data(spec, data, data_size, error_buffer, error_buffer_size);
+    if (!ok && error_buffer[0] != '\0')
+    {
+        char message[256];
+        snprintf(message, sizeof(message), "%s: %s", error_buffer, snapshot_path);
+        snprintf(error_buffer, error_buffer_size, "%s", message);
+    }
+    free(data);
+    return ok;
+}
+
+enum {
+    SZX_HEADER_SIZE = 8,
+    SZX_BLOCK_HEADER_SIZE = 8,
+    SZX_Z80R_SIZE = 37,
+    SZX_SPCR_SIZE = 8,
+    SZX_AY_SIZE = 18,
+    SZX_PAGE_SIZE = 0x4000,
+    SZX_RAMP_COMPRESSED = 1
+};
+
+typedef struct SpectrumSzxState {
+    SpectrumModel model;
+    uint8_t z80[SZX_Z80R_SIZE];
+    uint8_t spcr[SZX_SPCR_SIZE];
+    uint8_t ay[SZX_AY_SIZE];
+    uint8_t *pages[8];
+    uint8_t page_mask;
+    bool has_z80;
+    bool has_spcr;
+    bool has_ay;
+} SpectrumSzxState;
+
+bool spectrum_detect_snapshot_szx_model_data(
+    const uint8_t *data,
+    size_t size,
+    SpectrumModel *model)
+{
+    if (data == NULL || model == NULL || size < SZX_HEADER_SIZE ||
+        memcmp(data, "ZXST", 4) != 0 || data[4] != 1)
+    {
+        return false;
+    }
+    if (data[6] == 1)
+    {
+        *model = SPECTRUM_MODEL_48K;
+        return true;
+    }
+    if (data[6] == 2)
+    {
+        *model = SPECTRUM_MODEL_128K;
+        return true;
+    }
+    return false;
+}
+
+static void spectrum_discard_szx_state(SpectrumSzxState *state)
+{
+    for (unsigned page = 0; page < 8; ++page)
+    {
+        free(state->pages[page]);
+        state->pages[page] = NULL;
+    }
+}
+
+static bool spectrum_parse_szx(
+    const uint8_t *data,
+    size_t data_size,
+    SpectrumSzxState *state,
+    char *error_buffer,
+    size_t error_buffer_size)
+{
+    size_t offset = SZX_HEADER_SIZE;
+    SpectrumModel model;
+    memset(state, 0, sizeof(*state));
+
+    if (!spectrum_detect_snapshot_szx_model_data(data, data_size, &model))
+    {
+        snprintf(error_buffer, error_buffer_size,
+            "Unsupported SZX version or machine (only original 48K and 128K are supported).");
+        return false;
+    }
+    state->model = model;
+
+    while (offset < data_size)
+    {
+        const uint8_t *header;
+        const uint8_t *payload;
+        uint32_t payload_size;
+        if (data_size - offset < SZX_BLOCK_HEADER_SIZE)
+        {
+            snprintf(error_buffer, error_buffer_size, "Truncated SZX block header.");
+            goto fail;
+        }
+        header = data + offset;
+        payload_size = spectrum_read_u32(header + 4);
+        offset += SZX_BLOCK_HEADER_SIZE;
+        if (payload_size > data_size - offset)
+        {
+            snprintf(error_buffer, error_buffer_size, "Truncated SZX block payload.");
+            goto fail;
+        }
+        payload = data + offset;
+
+        if (memcmp(header, "Z80R", 4) == 0)
+        {
+            if (state->has_z80 || payload_size != SZX_Z80R_SIZE)
+            {
+                snprintf(error_buffer, error_buffer_size, "Invalid or duplicate SZX Z80R block.");
+                goto fail;
+            }
+            memcpy(state->z80, payload, sizeof(state->z80));
+            state->has_z80 = true;
+        }
+        else if (memcmp(header, "SPCR", 4) == 0)
+        {
+            if (state->has_spcr || payload_size != SZX_SPCR_SIZE)
+            {
+                snprintf(error_buffer, error_buffer_size, "Invalid or duplicate SZX SPCR block.");
+                goto fail;
+            }
+            memcpy(state->spcr, payload, sizeof(state->spcr));
+            state->has_spcr = true;
+        }
+        else if (memcmp(header, "AY\0\0", 4) == 0)
+        {
+            if (state->has_ay || payload_size != SZX_AY_SIZE)
+            {
+                snprintf(error_buffer, error_buffer_size, "Invalid or duplicate SZX AY block.");
+                goto fail;
+            }
+            memcpy(state->ay, payload, sizeof(state->ay));
+            state->has_ay = true;
+        }
+        else if (memcmp(header, "RAMP", 4) == 0)
+        {
+            uint16_t flags;
+            uint8_t page;
+            if (payload_size < 3)
+            {
+                snprintf(error_buffer, error_buffer_size, "Invalid SZX RAMP block.");
+                goto fail;
+            }
+            flags = spectrum_read_u16(payload);
+            page = payload[2];
+            if (page >= 8 || (flags & ~SZX_RAMP_COMPRESSED) != 0 ||
+                state->pages[page] != NULL ||
+                (state->model == SPECTRUM_MODEL_48K && page != 0 && page != 2 && page != 5))
+            {
+                snprintf(error_buffer, error_buffer_size, "Invalid or duplicate SZX RAM page %u.", page);
+                goto fail;
+            }
+            state->pages[page] = (uint8_t *)malloc(SZX_PAGE_SIZE);
+            if (state->pages[page] == NULL)
+            {
+                snprintf(error_buffer, error_buffer_size, "Out of memory while decoding SZX RAM.");
+                goto fail;
+            }
+            if ((flags & SZX_RAMP_COMPRESSED) != 0)
+            {
+                if (!szx_inflate_zlib(
+                        payload + 3, payload_size - 3,
+                        state->pages[page], SZX_PAGE_SIZE))
+                {
+                    snprintf(error_buffer, error_buffer_size,
+                        "Could not decompress SZX RAM page %u.", page);
+                    goto fail;
+                }
+            }
+            else
+            {
+                if (payload_size != 3 + SZX_PAGE_SIZE)
+                {
+                    snprintf(error_buffer, error_buffer_size,
+                        "Uncompressed SZX RAM page %u is not 16 KB.", page);
+                    goto fail;
+                }
+                memcpy(state->pages[page], payload + 3, SZX_PAGE_SIZE);
+            }
+            state->page_mask |= (uint8_t)(1u << page);
+        }
+        /* ZX-State is extensible: blocks for unsupported peripherals can be
+           skipped without losing the core machine state. */
+        offset += payload_size;
+    }
+
+    if (!state->has_z80 || !state->has_spcr ||
+        (state->model == SPECTRUM_MODEL_48K && state->page_mask != 0x25u) ||
+        (state->model == SPECTRUM_MODEL_128K && state->page_mask != 0xFFu))
+    {
+        snprintf(error_buffer, error_buffer_size, "SZX snapshot is missing required machine-state blocks.");
+        goto fail;
+    }
+    if (state->z80[28] > 2)
+    {
+        snprintf(error_buffer, error_buffer_size, "Invalid interrupt mode in SZX Z80R block.");
+        goto fail;
+    }
+    {
+        const uint32_t frame_tstates = state->model == SPECTRUM_MODEL_48K
+            ? 312u * 224u
+            : 311u * 228u;
+        if (spectrum_read_u32(state->z80 + 29) >= frame_tstates)
+        {
+            snprintf(error_buffer, error_buffer_size, "Invalid frame timing in SZX Z80R block.");
+            goto fail;
+        }
+    }
+    return true;
+
+fail:
+    spectrum_discard_szx_state(state);
+    return false;
+}
+
+static void spectrum_restore_szx_cpu(zx_t *machine, const uint8_t *state)
+{
+    const uint16_t program_counter = spectrum_read_u16(state + 22);
+    const uint8_t flags = state[34];
+    z80_reset(&machine->cpu);
+    machine->cpu.af = spectrum_read_u16(state);
+    machine->cpu.bc = spectrum_read_u16(state + 2);
+    machine->cpu.de = spectrum_read_u16(state + 4);
+    machine->cpu.hl = spectrum_read_u16(state + 6);
+    machine->cpu.af2 = spectrum_read_u16(state + 8);
+    machine->cpu.bc2 = spectrum_read_u16(state + 10);
+    machine->cpu.de2 = spectrum_read_u16(state + 12);
+    machine->cpu.hl2 = spectrum_read_u16(state + 14);
+    machine->cpu.ix = spectrum_read_u16(state + 16);
+    machine->cpu.iy = spectrum_read_u16(state + 18);
+    machine->cpu.sp = spectrum_read_u16(state + 20);
+    machine->cpu.i = state[24];
+    machine->cpu.r = state[25];
+    machine->cpu.iff1 = state[26] != 0;
+    machine->cpu.iff2 = state[27] != 0;
+    machine->cpu.im = state[28];
+    machine->cpu.wz = spectrum_read_u16(state + 35);
+    machine->cpu.suppress_int = (flags & 0x01u) != 0;
+    machine->pins = z80_prefetch(&machine->cpu, program_counter);
+    if ((flags & 0x02u) != 0)
+    {
+        /* chips keeps PC on the HALT opcode while the bus repeats its fetch. */
+        machine->cpu.pc--;
+        machine->pins |= Z80_HALT;
+    }
+}
+
+static void spectrum_restore_szx_timing(zx_t *machine, const uint8_t *state)
+{
+    const uint32_t frame_tstate = spectrum_read_u32(state + 29);
+    const uint8_t interrupt_cycles = state[33];
+    const uint32_t line_position = frame_tstate % (uint32_t)machine->scanline_period;
+
+    machine->tick_count = frame_tstate;
+    machine->frame_tstate = frame_tstate;
+    machine->scanline_y = (int)(frame_tstate / (uint32_t)machine->scanline_period);
+    machine->scanline_counter = machine->scanline_period - (int)line_position;
+    machine->int_counter = interrupt_cycles != 0 ? (int)interrupt_cycles - 1 : 0;
+    if (interrupt_cycles != 0)
+    {
+        machine->pins |= Z80_INT;
+        machine->cpu.int_bits |= Z80_INT;
+    }
+    else
+    {
+        machine->pins &= ~Z80_INT;
+        machine->cpu.int_bits &= ~Z80_INT;
+    }
+}
+
+bool spectrum_load_snapshot_szx_data(
+    Spectrum *spec,
+    const uint8_t *data,
+    size_t data_size,
+    char *error_buffer,
+    size_t error_buffer_size)
+{
+    SpectrumSzxState state;
+    if (spec == NULL || data == NULL ||
+        !spectrum_parse_szx(data, data_size, &state, error_buffer, error_buffer_size))
+    {
+        return false;
+    }
+    if (state.model != spec->model &&
+        !spectrum_rebuild_for_model(spec, state.model, error_buffer, error_buffer_size))
+    {
+        spectrum_discard_szx_state(&state);
+        return false;
+    }
+
+    if (state.model == SPECTRUM_MODEL_48K)
+    {
+        memcpy(spec->machine.ram[0], state.pages[5], SZX_PAGE_SIZE);
+        memcpy(spec->machine.ram[1], state.pages[2], SZX_PAGE_SIZE);
+        memcpy(spec->machine.ram[2], state.pages[0], SZX_PAGE_SIZE);
+    }
+    else
+    {
+        for (unsigned page = 0; page < 8; ++page)
+        {
+            memcpy(spec->machine.ram[page], state.pages[page], SZX_PAGE_SIZE);
+        }
+        spec->machine.memory_paging_disabled = false;
+        _zx_update_memory_map_zx128(&spec->machine, state.spcr[1]);
+        ay38910_reset(&spec->machine.ay);
+        if (state.has_ay)
+        {
+            for (uint8_t reg = 0; reg < AY38910_NUM_REGISTERS; ++reg)
+            {
+                ay38910_set_register(&spec->machine.ay, reg, state.ay[2 + reg]);
+            }
+            ay38910_set_addr_latch(&spec->machine.ay, state.ay[1] & 0x0Fu);
+        }
+    }
+    spectrum_restore_szx_cpu(&spec->machine, state.z80);
+    spectrum_restore_szx_timing(&spec->machine, state.z80);
+    spec->machine.border_color = state.spcr[0] & 0x07u;
+    spec->machine.last_fe_out = state.spcr[3];
+    beeper_set(&spec->machine.beeper, (state.spcr[3] & 0x10u) != 0);
+    spectrum_discard_szx_state(&state);
+    spectrum_render_frame(spec);
+    return true;
+}
+
+bool spectrum_load_snapshot_szx(
+    Spectrum *spec,
+    const char *snapshot_path,
+    char *error_buffer,
+    size_t error_buffer_size)
+{
+    uint8_t *data = NULL;
+    size_t data_size = 0;
+    bool ok;
+    if (!spectrum_load_file_all(snapshot_path, &data, &data_size))
+    {
+        snprintf(error_buffer, error_buffer_size, "Could not read snapshot file: %s", snapshot_path);
+        return false;
+    }
+    ok = spectrum_load_snapshot_szx_data(spec, data, data_size, error_buffer, error_buffer_size);
+    if (!ok && error_buffer[0] != '\0')
+    {
+        char message[256];
+        snprintf(message, sizeof(message), "%s: %s", error_buffer, snapshot_path);
+        snprintf(error_buffer, error_buffer_size, "%s", message);
+    }
+    free(data);
+    return ok;
 }
 
 /* Loads a `.z80` snapshot file, switches the backend model when necessary,
