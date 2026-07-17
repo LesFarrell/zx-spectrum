@@ -53,6 +53,7 @@ enum {
     APP_MENU_FILE_STOP_TAPE = 1005,
     APP_MENU_FILE_AUTOLOAD_TAPES = 1006,
     APP_MENU_FILE_FAST_TAPE_LOADING = 1008,
+    APP_MENU_SOUND_MUTE = 1101,
     APP_MENU_TOOLS_ASSEMBLER = 1301,
     APP_MENU_TOOLS_DEBUGGER = 1302,
     APP_MENU_TOOLS_POKE = 1303,
@@ -139,6 +140,7 @@ typedef struct AudioState {
     size_t ring_write;
     size_t ring_count;
     bool enabled;
+    bool muted;
 } AudioState;
 
 typedef DWORD (WINAPI *AppXInputGetStateFn)(DWORD user_index, XINPUT_STATE *state);
@@ -449,7 +451,9 @@ static HMENU app_create_assembler_menu(void);
 static void app_save_model(SpectrumModel model);
 static void app_save_tape_autoload(bool enabled);
 static void app_save_fast_tape_loading(bool enabled);
+static void app_save_sound_muted(bool muted);
 static void app_update_model_menu(HWND hwnd, SpectrumModel model);
+static void app_update_sound_menu(HWND hwnd, bool muted);
 static void app_audio_callback(const float *samples, int num_samples, void *user_data);
 static void app_debug_refresh_window(AppState *app);
 static void app_assembler_refresh_window(AppState *app);
@@ -578,11 +582,16 @@ static HMENU app_create_menu(void) {
     HMENU file_menu = CreatePopupMenu();
     HMENU tape_menu = CreatePopupMenu();
     HMENU machine_menu = CreatePopupMenu();
+    HMENU sound_menu = CreatePopupMenu();
     HMENU tools_menu = CreatePopupMenu();
 
-    if (menu_bar == NULL || file_menu == NULL || tape_menu == NULL || machine_menu == NULL || tools_menu == NULL) {
+    if (menu_bar == NULL || file_menu == NULL || tape_menu == NULL || machine_menu == NULL ||
+        sound_menu == NULL || tools_menu == NULL) {
         if (tools_menu != NULL) {
             DestroyMenu(tools_menu);
+        }
+        if (sound_menu != NULL) {
+            DestroyMenu(sound_menu);
         }
         if (machine_menu != NULL) {
             DestroyMenu(machine_menu);
@@ -609,14 +618,29 @@ static HMENU app_create_menu(void) {
     AppendMenuA(tape_menu, MF_STRING, APP_MENU_FILE_FAST_TAPE_LOADING, "Use &Fast Tape Loading");
     AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_48K, "&48K\tCtrl+1");
     AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_128K, "&128K\tCtrl+2");
+    AppendMenuA(sound_menu, MF_STRING, APP_MENU_SOUND_MUTE, "&Mute Sound\tCtrl+M");
     AppendMenuA(tools_menu, MF_STRING, APP_MENU_TOOLS_ASSEMBLER, "&Assembler...\tCtrl+Shift+A");
     AppendMenuA(tools_menu, MF_STRING, APP_MENU_TOOLS_DEBUGGER, "&Debugger...\tCtrl+Shift+D");
     AppendMenuA(tools_menu, MF_STRING, APP_MENU_TOOLS_POKE, "&Poke...\tCtrl+Shift+P");
     AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)file_menu, "&File");
     AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)tape_menu, "&Tape");
     AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)machine_menu, "&Machine");
+    AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)sound_menu, "&Sound");
     AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)tools_menu, "&Tools");
     return menu_bar;
+}
+
+/* Keeps the Sound menu check mark synchronized with the current mute state. */
+static void app_update_sound_menu(HWND hwnd, bool muted) {
+    HMENU menu = GetMenu(hwnd);
+    if (menu == NULL) {
+        return;
+    }
+    CheckMenuItem(
+        menu,
+        APP_MENU_SOUND_MUTE,
+        MF_BYCOMMAND | (muted ? MF_CHECKED : MF_UNCHECKED)
+    );
 }
 
 static const char *app_model_name(SpectrumModel model) {
@@ -903,7 +927,7 @@ static void app_apply_flat_control_style(HWND parent) {
 static void app_audio_push_samples(AppState *app, const float *samples, int num_samples) {
     AudioState *audio = &app->audio;
 
-    if (!audio->enabled) {
+    if (!audio->enabled || audio->muted) {
         return;
     }
 
@@ -1817,6 +1841,9 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                 }
                 if (ctrl_down && !shift_down && !alt_down) {
                     switch ((UINT)wparam) {
+                        case 'M':
+                            SendMessageA(hwnd, WM_COMMAND, APP_MENU_SOUND_MUTE, 0);
+                            return 0;
                         case 'O':
                             SendMessageA(hwnd, WM_COMMAND, APP_MENU_FILE_OPEN_SNAPSHOT, 0);
                             return 0;
@@ -1996,6 +2023,13 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                         tape_rewind(&app->tape, (uint32_t)app->spec.machine.freq_hz);
                         app_debug_machine_changed(app);
                         InvalidateRect(hwnd, NULL, FALSE);
+                        return 0;
+                    case APP_MENU_SOUND_MUTE:
+                        app->audio.muted = !app->audio.muted;
+                        app_audio_flush(app);
+                        app_audio_service(app);
+                        app_save_sound_muted(app->audio.muted);
+                        app_update_sound_menu(hwnd, app->audio.muted);
                         return 0;
                     case APP_MENU_MACHINE_48K:
                         app_switch_model(hwnd, app, SPECTRUM_MODEL_48K);
@@ -2209,6 +2243,26 @@ static bool app_load_saved_fast_tape_loading(bool *enabled) {
     return false;
 }
 
+/* Reads the persisted sound mute state, defaulting to audible output. */
+static bool app_load_saved_sound_muted(bool *muted) {
+    char path[MAX_PATH];
+    char value[16];
+
+    if (!app_settings_path(path, sizeof(path))) {
+        return false;
+    }
+    GetPrivateProfileStringA("emulator", "sound_muted", "", value, sizeof(value), path);
+    if (strcmp(value, "1") == 0) {
+        *muted = true;
+        return true;
+    }
+    if (strcmp(value, "0") == 0) {
+        *muted = false;
+        return true;
+    }
+    return false;
+}
+
 /* Persists the user's menu-selected machine preference so future launches
    start in the same 48K or 128K mode when possible. */
 static void app_save_model(SpectrumModel model) {
@@ -2248,6 +2302,20 @@ static void app_save_fast_tape_loading(bool enabled) {
         "emulator",
         "fast_tape_loading",
         enabled ? "1" : "0",
+        path
+    );
+}
+
+/* Persists the Sound menu mute option between emulator launches. */
+static void app_save_sound_muted(bool muted) {
+    char path[MAX_PATH];
+    if (!app_settings_path(path, sizeof(path))) {
+        return;
+    }
+    WritePrivateProfileStringA(
+        "emulator",
+        "sound_muted",
+        muted ? "1" : "0",
         path
     );
 }
@@ -2631,14 +2699,17 @@ int main(int argc, char **argv) {
     SpectrumModel saved_model = SPECTRUM_MODEL_48K;
     bool saved_tape_autoload = true;
     bool saved_fast_tape_loading = true;
+    bool saved_sound_muted = false;
     bool has_saved_model;
     bool has_saved_tape_autoload;
     bool has_saved_fast_tape_loading;
+    bool has_saved_sound_muted;
     INITCOMMONCONTROLSEX common_controls;
     ZeroMemory(&selection, sizeof(selection));
     has_saved_model = app_load_saved_model(&saved_model);
     has_saved_tape_autoload = app_load_saved_tape_autoload(&saved_tape_autoload);
     has_saved_fast_tape_loading = app_load_saved_fast_tape_loading(&saved_fast_tape_loading);
+    has_saved_sound_muted = app_load_saved_sound_muted(&saved_sound_muted);
     if (!app_resolve_roms(argc, argv, has_saved_model, saved_model, &selection)) {
         app_print_usage();
         app_show_error("No compatible ROM found. Place 48.rom and/or 128.rom next to the EXE or in the repo.");
@@ -2651,6 +2722,7 @@ int main(int argc, char **argv) {
     app.tape_autoload_enabled = has_saved_tape_autoload ? saved_tape_autoload : true;
     app.fast_tape_loading_enabled =
         has_saved_fast_tape_loading ? saved_fast_tape_loading : true;
+    app.audio.muted = has_saved_sound_muted ? saved_sound_muted : false;
     tape_init(&app.tape);
     app_audio_init(&app);
     app_controller_init(&app);
@@ -2750,6 +2822,7 @@ int main(int argc, char **argv) {
     app.main_hwnd = hwnd;
     app_update_title(hwnd, &app.spec);
     app_update_model_menu(hwnd, app.spec.model);
+    app_update_sound_menu(hwnd, app.audio.muted);
     app_update_tape_menu(
         hwnd,
         app.tape_autoload_enabled,
