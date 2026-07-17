@@ -6,6 +6,8 @@ Small ZX Spectrum emulator in C for Windows. It uses the Win32 API for display, 
 
 - 48K model
 - 128K model with ROM switching and RAM paging through port `0x7FFD`
+- Spectrum +3 model with four ROM banks, `0x7FFD`/`0x1FFD` paging,
+  all-RAM modes, AY audio, and an empty-drive uPD765 controller response
 - ULA screen rendering with border and flash attributes
 - Memory-side ULA contention timing for 48K and 128K RAM accesses
 - Keyboard matrix input
@@ -29,6 +31,8 @@ Small ZX Spectrum emulator in C for Windows. It uses the Win32 API for display, 
 - Non-48K/128K `.z80` snapshot models
 - SZX machine variants other than the original 48K and 128K models; SZX
   peripheral blocks are skipped while the core machine state is restored
+- Spectrum +3 disk images and floppy data transfer; the +3 currently boots
+  into BASIC and reports that no disk is inserted
 
 ## Build
 
@@ -38,7 +42,9 @@ Small ZX Spectrum emulator in C for Windows. It uses the Win32 API for display, 
 
 ## Run
 
-With no arguments, the emulator looks for `128.rom` in `.\src` first and starts in `128K` mode. If that is not present, it falls back to `48.rom`.
+With no arguments, the emulator looks for `plus3.rom`, `128.rom`, and
+`48.rom` in `.\src`. It restores the last selected model when that ROM is
+available; on a fresh configuration it prefers +3, then 128K, then 48K.
 
 ```powershell
 .\src\zxspecemu.exe
@@ -60,6 +66,12 @@ With no arguments, the emulator looks for `128.rom` in `.\src` first and starts 
 
 ```powershell
 .\src\zxspecemu.exe --128 path\to\128k-combined.rom
+```
+
+Spectrum +3 with one combined 64 KB ROM:
+
+```powershell
+.\src\zxspecemu.exe --plus3 path\to\plus3.rom
 ```
 
 ## Keyboard
@@ -88,7 +100,8 @@ With no arguments, the emulator looks for `128.rom` in `.\src` first and starts 
 - Press `F4` or use `File -> Stop Tape` to stop real-time playback
 - `File -> Reset` resets the active machine
 - `File -> Exit` closes the emulator
-- `Machine -> 48K` / `Machine -> 128K` rebuilds the emulator for that model and remembers the choice between runs
+- `Machine -> 48K` / `Machine -> 128K` / `Machine -> +3` rebuilds the emulator for that model and remembers the choice between runs
+- `Ctrl+1`, `Ctrl+2`, and `Ctrl+3` switch directly to the 48K, 128K, and +3 models
 - `Sound -> Mute Sound` or `Ctrl+M` toggles all emulator audio and remembers the choice between runs
 - `Tools -> Assembler...` opens a small RAM patching assembler with support for common Z80 instructions plus `ORG`, `DB`, `DW`, `DS`/`DEFS`, `INCBIN`, `INCLUDE`, and TAP export
 - `Tools -> Debugger...` opens a separate debugger window with pause, run, single-step, register state, and memory/disassembly views

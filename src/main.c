@@ -59,6 +59,7 @@ enum {
     APP_MENU_TOOLS_POKE = 1303,
     APP_MENU_MACHINE_48K = 1201,
     APP_MENU_MACHINE_128K = 1202,
+    APP_MENU_MACHINE_PLUS3 = 1203,
     APP_CTRL_DEBUG_TEXT = 2001,
     APP_CTRL_DEBUG_PAUSE = 2002,
     APP_CTRL_DEBUG_STEP = 2003,
@@ -319,6 +320,7 @@ struct RomSelection {
     SpectrumModel model;
     RomSet rom_48k;
     RomSet rom_128k;
+    RomSet rom_plus3;
 };
 
 struct AppState {
@@ -618,6 +620,7 @@ static HMENU app_create_menu(void) {
     AppendMenuA(tape_menu, MF_STRING, APP_MENU_FILE_FAST_TAPE_LOADING, "Use &Fast Tape Loading");
     AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_48K, "&48K\tCtrl+1");
     AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_128K, "&128K\tCtrl+2");
+    AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_PLUS3, "+&3\tCtrl+3");
     AppendMenuA(sound_menu, MF_STRING, APP_MENU_SOUND_MUTE, "&Mute Sound\tCtrl+M");
     AppendMenuA(tools_menu, MF_STRING, APP_MENU_TOOLS_ASSEMBLER, "&Assembler...\tCtrl+Shift+A");
     AppendMenuA(tools_menu, MF_STRING, APP_MENU_TOOLS_DEBUGGER, "&Debugger...\tCtrl+Shift+D");
@@ -645,6 +648,7 @@ static void app_update_sound_menu(HWND hwnd, bool muted) {
 
 static const char *app_model_name(SpectrumModel model) {
     switch (model) {
+        case SPECTRUM_MODEL_PLUS3: return "+3";
         case SPECTRUM_MODEL_128K: return "128K";
         case SPECTRUM_MODEL_48K:
         default:
@@ -654,6 +658,7 @@ static const char *app_model_name(SpectrumModel model) {
 
 static UINT app_model_menu_id(SpectrumModel model) {
     switch (model) {
+        case SPECTRUM_MODEL_PLUS3: return APP_MENU_MACHINE_PLUS3;
         case SPECTRUM_MODEL_128K: return APP_MENU_MACHINE_128K;
         case SPECTRUM_MODEL_48K:
         default:
@@ -663,6 +668,7 @@ static UINT app_model_menu_id(SpectrumModel model) {
 
 static const char *app_model_settings_value(SpectrumModel model) {
     switch (model) {
+        case SPECTRUM_MODEL_PLUS3: return "plus3";
         case SPECTRUM_MODEL_128K: return "128";
         case SPECTRUM_MODEL_48K:
         default:
@@ -1417,7 +1423,9 @@ static bool app_apply_loaded_tape(
 
     if (app->tape_autoload_enabled) {
         if (autoload_target == TAPE_AUTOLOAD_TARGET_128_MENU) {
-            autoload_model = SPECTRUM_MODEL_128K;
+            autoload_model = app->spec.model == SPECTRUM_MODEL_PLUS3
+                ? SPECTRUM_MODEL_PLUS3
+                : SPECTRUM_MODEL_128K;
         } else if (autoload_target == TAPE_AUTOLOAD_TARGET_48_BASIC) {
             autoload_model = SPECTRUM_MODEL_48K;
         }
@@ -1436,7 +1444,7 @@ static bool app_apply_loaded_tape(
         spectrum_reset(&app->spec);
         app_sync_tape_stop_mode(app);
         tape_rewind(&app->tape, (uint32_t)app->spec.machine.freq_hz);
-        if (autoload_model == SPECTRUM_MODEL_128K) {
+        if (autoload_model != SPECTRUM_MODEL_48K) {
             app->tape_autoplay_pending = app_start_autotype(app, L"\r");
         } else {
             app->tape_autoplay_pending = app_start_autotype(app, L"j\"\"\r");
@@ -1858,6 +1866,10 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                         case VK_NUMPAD2:
                             SendMessageA(hwnd, WM_COMMAND, APP_MENU_MACHINE_128K, 0);
                             return 0;
+                        case '3':
+                        case VK_NUMPAD3:
+                            SendMessageA(hwnd, WM_COMMAND, APP_MENU_MACHINE_PLUS3, 0);
+                            return 0;
                         default:
                             break;
                     }
@@ -2037,6 +2049,9 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                     case APP_MENU_MACHINE_128K:
                         app_switch_model(hwnd, app, SPECTRUM_MODEL_128K);
                         return 0;
+                    case APP_MENU_MACHINE_PLUS3:
+                        app_switch_model(hwnd, app, SPECTRUM_MODEL_PLUS3);
+                        return 0;
                     case APP_MENU_TOOLS_ASSEMBLER:
                         app_open_assembler_window(app);
                         return 0;
@@ -2129,6 +2144,11 @@ static bool app_parse_args(
             *model_explicit = true;
             continue;
         }
+        if (strcmp(argv[i], "--plus3") == 0 || strcmp(argv[i], "--3") == 0) {
+            *model = SPECTRUM_MODEL_PLUS3;
+            *model_explicit = true;
+            continue;
+        }
         if (strcmp(argv[i], "--48") == 0) {
             *model = SPECTRUM_MODEL_48K;
             *model_explicit = true;
@@ -2153,8 +2173,9 @@ static void app_print_usage(void) {
     fprintf(stderr, "  zxspecemu --48  <48k.rom>\n");
     fprintf(stderr, "  zxspecemu --128 <128k-0.rom> <128k-1.rom>\n");
     fprintf(stderr, "  zxspecemu --128 <128k-combined-32k.rom>\n");
+    fprintf(stderr, "  zxspecemu --plus3 <plus3-combined-64k.rom>\n");
     fprintf(stderr, "  zxspecemu\n");
-    fprintf(stderr, "\nAutodetects .\\128.rom first, then .\\48.rom if present.\n");
+    fprintf(stderr, "\nAutodetects .\\plus3.rom, .\\128.rom, and .\\48.rom.\n");
 }
 
 /* Resolves the persisted settings file path, preferring `%APPDATA%` so the
@@ -2191,6 +2212,10 @@ static bool app_load_saved_model(SpectrumModel *model) {
     }
 
     GetPrivateProfileStringA("emulator", "model", "", value, sizeof(value), path);
+    if (strcmp(value, "plus3") == 0) {
+        *model = SPECTRUM_MODEL_PLUS3;
+        return true;
+    }
     if (strcmp(value, "128") == 0) {
         *model = SPECTRUM_MODEL_128K;
         return true;
@@ -2358,6 +2383,8 @@ static bool app_find_rom(char *out_path, size_t out_size, const char *filename) 
    selection catalog and later machine-switch state. */
 static RomSet *app_rom_set_for_model(RomSelection *selection, SpectrumModel model) {
     switch (model) {
+        case SPECTRUM_MODEL_PLUS3:
+            return &selection->rom_plus3;
         case SPECTRUM_MODEL_128K:
             return &selection->rom_128k;
         case SPECTRUM_MODEL_48K:
@@ -2370,6 +2397,8 @@ static RomSet *app_rom_set_for_model(RomSelection *selection, SpectrumModel mode
    resolved ROM catalog without mutating it. */
 static const RomSet *app_rom_set_for_model_const(const RomSelection *selection, SpectrumModel model) {
     switch (model) {
+        case SPECTRUM_MODEL_PLUS3:
+            return &selection->rom_plus3;
         case SPECTRUM_MODEL_128K:
             return &selection->rom_128k;
         case SPECTRUM_MODEL_48K:
@@ -2665,6 +2694,9 @@ static bool app_resolve_roms(
     if (app_find_rom(rom_path, sizeof(rom_path), "128.rom")) {
         app_rom_set_set_paths(&selection->rom_128k, rom_path, NULL);
     }
+    if (app_find_rom(rom_path, sizeof(rom_path), "plus3.rom")) {
+        app_rom_set_set_paths(&selection->rom_plus3, rom_path, NULL);
+    }
 
     if (model_explicit) {
         return app_rom_set_is_available(app_rom_set_for_model_const(selection, model));
@@ -2675,6 +2707,10 @@ static bool app_resolve_roms(
         return true;
     }
 
+    if (app_rom_set_is_available(&selection->rom_plus3)) {
+        selection->model = SPECTRUM_MODEL_PLUS3;
+        return true;
+    }
     if (app_rom_set_is_available(&selection->rom_128k)) {
         selection->model = SPECTRUM_MODEL_128K;
         return true;
@@ -2712,7 +2748,7 @@ int main(int argc, char **argv) {
     has_saved_sound_muted = app_load_saved_sound_muted(&saved_sound_muted);
     if (!app_resolve_roms(argc, argv, has_saved_model, saved_model, &selection)) {
         app_print_usage();
-        app_show_error("No compatible ROM found. Place 48.rom and/or 128.rom next to the EXE or in the repo.");
+        app_show_error("No compatible ROM found. Place plus3.rom, 128.rom, and/or 48.rom next to the EXE or in the repo.");
         return 1;
     }
 

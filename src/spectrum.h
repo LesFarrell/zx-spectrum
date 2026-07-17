@@ -21,7 +21,8 @@ enum {
 
 typedef enum SpectrumModel {
     SPECTRUM_MODEL_48K = 0,
-    SPECTRUM_MODEL_128K = 1
+    SPECTRUM_MODEL_128K = 1,
+    SPECTRUM_MODEL_PLUS3 = 2
 } SpectrumModel;
 
 /* Holds the selected machine model, loaded ROM images, the embedded chips
@@ -41,8 +42,8 @@ typedef struct Spectrum {
     void *tape_user_data;
     int rom48_index;
 
-    uint8_t rom[2][0x4000];
-    bool rom_loaded[2];
+    uint8_t rom[4][0x4000];
+    bool rom_loaded[4];
 
     uint32_t framebuffer[ZX_SCREEN_WIDTH * ZX_SCREEN_HEIGHT];
 } Spectrum;
@@ -51,8 +52,8 @@ typedef struct Spectrum {
    once ROM data has been provided. */
 void spectrum_init(Spectrum *spec, SpectrumModel model);
 
-/* Loads ROM data into the local ROM buffers, validates the layout for 48K
-   or 128K mode, and initializes the embedded emulator instance. */
+/* Loads ROM data into the local ROM buffers, validates the layout for 48K,
+   128K, or +3 mode, and initializes the embedded emulator instance. */
 bool spectrum_load_roms(
     Spectrum *spec,
     const char *rom_path_a,

@@ -69,7 +69,7 @@ extern "C" {
 #endif
 
 // bump this whenever the zx_t struct layout changes
-#define ZX_SNAPSHOT_VERSION (0x0003)
+#define ZX_SNAPSHOT_VERSION (0x0004)
 
 #define ZX_MAX_AUDIO_SAMPLES (1024)      // max number of audio samples in internal sample buffer
 #define ZX_DEFAULT_AUDIO_SAMPLES (128)   // default number of samples in internal sample buffer
@@ -83,6 +83,7 @@ extern "C" {
 typedef enum {
     ZX_TYPE_48K,
     ZX_TYPE_128,
+    ZX_TYPE_PLUS3,
 } zx_type_t;
 
 // ZX Spectrum joystick types
@@ -127,6 +128,11 @@ typedef struct {
         // ZX Spectrum 128
         chips_range_t zx128_0;
         chips_range_t zx128_1;
+        // ZX Spectrum +3
+        chips_range_t zxplus3_0;
+        chips_range_t zxplus3_1;
+        chips_range_t zxplus3_2;
+        chips_range_t zxplus3_3;
     } roms;
 } zx_desc_t;
 
@@ -143,6 +149,7 @@ typedef struct {
     uint32_t tick_count;
     uint32_t frame_tstate;
     uint8_t last_mem_config;    // last out to 0x7FFD
+    uint8_t last_plus3_mem_config; // last out to 0x1FFD
     uint8_t last_fe_out;        // last out value to 0xFE port
     uint8_t blink_counter;      // incremented on each vblank
     uint8_t border_color;
@@ -168,8 +175,20 @@ typedef struct {
         int sample_pos;
         float sample_buffer[ZX_MAX_AUDIO_SAMPLES];
     } audio;
+    struct {
+        uint8_t command;
+        uint8_t params[8];
+        uint8_t results[7];
+        uint8_t param_count;
+        uint8_t param_expected;
+        uint8_t result_count;
+        uint8_t result_index;
+        uint8_t last_drive;
+        uint8_t cylinder[4];
+        bool interrupt_pending;
+    } plus3_fdc;
     uint8_t ram[8][0x4000];
-    uint8_t rom[2][0x4000];
+    uint8_t rom[4][0x4000];
     uint8_t junk[0x4000];
     alignas(64) uint8_t fb[ZX_FRAMEBUFFER_SIZE_BYTES];
 } zx_t;
@@ -257,6 +276,20 @@ void zx_init(zx_t* sys, const zx_desc_t* desc) {
         sys->top_border_scanlines = 63;
         sys->scanline_period = 228;
     }
+    else if (ZX_TYPE_PLUS3 == sys->type) {
+        CHIPS_ASSERT(desc->roms.zxplus3_0.ptr && (desc->roms.zxplus3_0.size == 0x4000));
+        CHIPS_ASSERT(desc->roms.zxplus3_1.ptr && (desc->roms.zxplus3_1.size == 0x4000));
+        CHIPS_ASSERT(desc->roms.zxplus3_2.ptr && (desc->roms.zxplus3_2.size == 0x4000));
+        CHIPS_ASSERT(desc->roms.zxplus3_3.ptr && (desc->roms.zxplus3_3.size == 0x4000));
+        memcpy(sys->rom[0], desc->roms.zxplus3_0.ptr, 0x4000);
+        memcpy(sys->rom[1], desc->roms.zxplus3_1.ptr, 0x4000);
+        memcpy(sys->rom[2], desc->roms.zxplus3_2.ptr, 0x4000);
+        memcpy(sys->rom[3], desc->roms.zxplus3_3.ptr, 0x4000);
+        sys->display_ram_bank = 5;
+        sys->frame_scan_lines = 311;
+        sys->top_border_scanlines = 63;
+        sys->scanline_period = 228;
+    }
     else {
         CHIPS_ASSERT(desc->roms.zx48k.ptr && (desc->roms.zx48k.size == 0x4000));
         memcpy(sys->rom[0], desc->roms.zx48k.ptr, 0x4000);
@@ -304,6 +337,7 @@ void zx_reset(zx_t* sys) {
     sys->joy_joymask = 0;
     sys->frame_tstate = 0;
     sys->last_mem_config = 0;
+    sys->last_plus3_mem_config = 0;
     sys->last_fe_out = 0;
     sys->scanline_counter = sys->scanline_period;
     sys->scanline_y = 0;
@@ -313,6 +347,9 @@ void zx_reset(zx_t* sys) {
     }
     else {
         sys->display_ram_bank = 5;
+    }
+    if (sys->type == ZX_TYPE_PLUS3) {
+        memset(&sys->plus3_fdc, 0, sizeof(sys->plus3_fdc));
     }
     _zx_init_memory_map(sys);
 }
@@ -437,6 +474,213 @@ static void _zx_update_memory_map_zx128(zx_t* sys, uint8_t data) {
     }
 }
 
+/* Applies the +3's normal four-ROM layout or one of its four all-RAM maps
+   from the values last written to ports 7FFD and 1FFD. */
+static void _zx_update_memory_map_plus3(zx_t* sys) {
+    static const uint8_t all_ram_banks[4][4] = {
+        { 0, 1, 2, 3 },
+        { 4, 5, 6, 7 },
+        { 4, 5, 6, 3 },
+        { 4, 7, 6, 3 },
+    };
+
+    if (sys->last_plus3_mem_config & 1) {
+        const uint8_t config = (sys->last_plus3_mem_config >> 1) & 3;
+        for (uint8_t slot = 0; slot < 4; ++slot) {
+            mem_map_ram(
+                &sys->mem,
+                0,
+                (uint16_t)(slot * 0x4000),
+                0x4000,
+                sys->ram[all_ram_banks[config][slot]]);
+        }
+    }
+    else {
+        const uint8_t rom_index =
+            (uint8_t)(((sys->last_plus3_mem_config & (1<<2)) >> 1) |
+                      ((sys->last_mem_config & (1<<4)) >> 4));
+        mem_map_rom(&sys->mem, 0, 0x0000, 0x4000, sys->rom[rom_index]);
+        mem_map_ram(&sys->mem, 0, 0x4000, 0x4000, sys->ram[5]);
+        mem_map_ram(&sys->mem, 0, 0x8000, 0x4000, sys->ram[2]);
+        mem_map_ram(
+            &sys->mem,
+            0,
+            0xC000,
+            0x4000,
+            sys->ram[sys->last_mem_config & 0x7]);
+    }
+}
+
+static void _zx_write_memory_control_plus3(zx_t* sys, uint16_t addr, uint8_t data) {
+    if (sys->memory_paging_disabled) {
+        return;
+    }
+
+    if ((addr & 0xF002) == 0x1000) {
+        sys->last_plus3_mem_config = data;
+        _zx_update_memory_map_plus3(sys);
+    }
+    else if ((addr & 0xC002) == 0x4000) {
+        sys->last_mem_config = data;
+        sys->display_ram_bank = (data & (1<<3)) ? 7 : 5;
+        _zx_update_memory_map_plus3(sys);
+        if (data & (1<<5)) {
+            sys->memory_paging_disabled = true;
+        }
+    }
+}
+
+/* Models an empty uPD765A closely enough for +3DOS to initialize the
+   controller and report that no disk is present. Disk media transfer is
+   intentionally left to the frontend's future disk-image implementation. */
+static uint8_t _zx_plus3_fdc_status(const zx_t* sys) {
+    if (sys->plus3_fdc.result_index < sys->plus3_fdc.result_count) {
+        return 0xD0; /* RQM | DIO | controller busy */
+    }
+    if (sys->plus3_fdc.param_count < sys->plus3_fdc.param_expected) {
+        return 0x90; /* RQM | controller busy */
+    }
+    return 0x80; /* ready to accept a command */
+}
+
+static void _zx_plus3_fdc_set_results(
+    zx_t* sys,
+    const uint8_t* results,
+    uint8_t count)
+{
+    CHIPS_ASSERT(count <= sizeof(sys->plus3_fdc.results));
+    memcpy(sys->plus3_fdc.results, results, count);
+    sys->plus3_fdc.result_count = count;
+    sys->plus3_fdc.result_index = 0;
+    sys->plus3_fdc.param_count = 0;
+    sys->plus3_fdc.param_expected = 0;
+}
+
+static void _zx_plus3_fdc_execute(zx_t* sys) {
+    const uint8_t operation = sys->plus3_fdc.command & 0x1F;
+    const uint8_t drive = sys->plus3_fdc.param_count > 0
+        ? sys->plus3_fdc.params[0] & 3
+        : sys->plus3_fdc.last_drive;
+    const uint8_t head_drive = sys->plus3_fdc.param_count > 0
+        ? sys->plus3_fdc.params[0] & 7
+        : drive;
+    uint8_t results[7] = {0};
+
+    sys->plus3_fdc.last_drive = drive;
+    switch (operation) {
+        case 0x03: /* Specify */
+            sys->plus3_fdc.param_count = 0;
+            sys->plus3_fdc.param_expected = 0;
+            break;
+        case 0x04: /* Sense Drive Status */
+            results[0] = (uint8_t)(head_drive | 0x10); /* track 0, not ready */
+            _zx_plus3_fdc_set_results(sys, results, 1);
+            break;
+        case 0x07: /* Recalibrate */
+            sys->plus3_fdc.cylinder[drive] = 0;
+            sys->plus3_fdc.interrupt_pending = true;
+            sys->plus3_fdc.param_count = 0;
+            sys->plus3_fdc.param_expected = 0;
+            break;
+        case 0x08: /* Sense Interrupt Status */
+            if (sys->plus3_fdc.interrupt_pending) {
+                results[0] = (uint8_t)(0x48 | sys->plus3_fdc.last_drive);
+                results[1] = sys->plus3_fdc.cylinder[sys->plus3_fdc.last_drive];
+                sys->plus3_fdc.interrupt_pending = false;
+                _zx_plus3_fdc_set_results(sys, results, 2);
+            }
+            else {
+                results[0] = 0x80;
+                _zx_plus3_fdc_set_results(sys, results, 1);
+            }
+            break;
+        case 0x0F: /* Seek */
+            sys->plus3_fdc.cylinder[drive] = sys->plus3_fdc.params[1];
+            sys->plus3_fdc.interrupt_pending = true;
+            sys->plus3_fdc.param_count = 0;
+            sys->plus3_fdc.param_expected = 0;
+            break;
+        case 0x02: /* Read Track */
+        case 0x05: /* Write Data */
+        case 0x06: /* Read Data */
+        case 0x09: /* Write Deleted Data */
+        case 0x0C: /* Read Deleted Data */
+        case 0x0D: /* Format Track */
+        case 0x0A: /* Read ID */
+        case 0x11: /* Scan Equal */
+        case 0x19: /* Scan Low Or Equal */
+        case 0x1D: /* Scan High Or Equal */
+            results[0] = (uint8_t)(0x48 | head_drive); /* abnormal: drive not ready */
+            results[1] = 0x04; /* no data */
+            results[2] = 0;
+            if (sys->plus3_fdc.param_count >= 5) {
+                results[3] = sys->plus3_fdc.params[1];
+                results[4] = sys->plus3_fdc.params[2];
+                results[5] = sys->plus3_fdc.params[3];
+                results[6] = sys->plus3_fdc.params[4];
+            }
+            _zx_plus3_fdc_set_results(sys, results, 7);
+            break;
+        default: /* Invalid command */
+            results[0] = 0x80;
+            _zx_plus3_fdc_set_results(sys, results, 1);
+            break;
+    }
+}
+
+static uint8_t _zx_plus3_fdc_parameter_count(uint8_t command) {
+    switch (command & 0x1F) {
+        case 0x03: return 2;
+        case 0x04:
+        case 0x07:
+        case 0x0A: return 1;
+        case 0x08: return 0;
+        case 0x0D: return 5;
+        case 0x0F: return 2;
+        case 0x02:
+        case 0x05:
+        case 0x06:
+        case 0x09:
+        case 0x0C:
+        case 0x11:
+        case 0x19:
+        case 0x1D: return 8;
+        default: return 0;
+    }
+}
+
+static void _zx_plus3_fdc_write(zx_t* sys, uint8_t data) {
+    if (sys->plus3_fdc.result_index < sys->plus3_fdc.result_count) {
+        return;
+    }
+    if (sys->plus3_fdc.param_count < sys->plus3_fdc.param_expected) {
+        sys->plus3_fdc.params[sys->plus3_fdc.param_count++] = data;
+        if (sys->plus3_fdc.param_count == sys->plus3_fdc.param_expected) {
+            _zx_plus3_fdc_execute(sys);
+        }
+        return;
+    }
+
+    sys->plus3_fdc.command = data;
+    sys->plus3_fdc.param_count = 0;
+    sys->plus3_fdc.param_expected = _zx_plus3_fdc_parameter_count(data);
+    if (sys->plus3_fdc.param_expected == 0) {
+        _zx_plus3_fdc_execute(sys);
+    }
+}
+
+static uint8_t _zx_plus3_fdc_read(zx_t* sys) {
+    uint8_t data = 0xFF;
+    if (sys->plus3_fdc.result_index < sys->plus3_fdc.result_count) {
+        data = sys->plus3_fdc.results[sys->plus3_fdc.result_index++];
+        if (sys->plus3_fdc.result_index == sys->plus3_fdc.result_count) {
+            sys->plus3_fdc.result_index = 0;
+            sys->plus3_fdc.result_count = 0;
+        }
+    }
+    return data;
+}
+
 /* Returns the current machine's active contention delay for the current
    frame t-state, or zero when the ULA/gate array is not stealing the bus. */
 static uint8_t _zx_contention_delay(zx_t* sys) {
@@ -456,7 +700,7 @@ static uint8_t _zx_contention_delay(zx_t* sys) {
         return 0;
     }
 
-    if (sys->type == ZX_TYPE_128) {
+    if (sys->type == ZX_TYPE_128 || sys->type == ZX_TYPE_PLUS3) {
         if (t >= 14361) {
             const uint32_t rel = t - 14361;
             if (rel < (192u * 228u)) {
@@ -487,6 +731,33 @@ static bool _zx_is_contended_addr(zx_t* sys, uint16_t addr) {
             return 0 != ((sys->last_mem_config & 0x7) & 1);
         }
         return false;
+    }
+
+    if (sys->type == ZX_TYPE_PLUS3) {
+        uint8_t bank;
+        if (sys->last_plus3_mem_config & 1) {
+            static const uint8_t all_ram_banks[4][4] = {
+                { 0, 1, 2, 3 },
+                { 4, 5, 6, 7 },
+                { 4, 5, 6, 3 },
+                { 4, 7, 6, 3 },
+            };
+            const uint8_t config = (sys->last_plus3_mem_config >> 1) & 3;
+            bank = all_ram_banks[config][addr >> 14];
+        }
+        else if (addr < 0x4000) {
+            return false;
+        }
+        else if (addr < 0x8000) {
+            bank = 5;
+        }
+        else if (addr < 0xC000) {
+            bank = 2;
+        }
+        else {
+            bank = sys->last_mem_config & 7;
+        }
+        return bank >= 4;
     }
 
     return false;
@@ -576,13 +847,35 @@ static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
                 beeper_set(&sys->beeper, 0 != (data & (1<<4)));
             }
         }
+        else if ((pins & Z80_WR) && (sys->type == ZX_TYPE_PLUS3) &&
+                 (((Z80_GET_ADDR(pins) & 0xF002) == 0x1000) ||
+                  ((Z80_GET_ADDR(pins) & 0xC002) == 0x4000))) {
+            _zx_write_memory_control_plus3(
+                sys,
+                Z80_GET_ADDR(pins),
+                Z80_GET_DATA(pins));
+        }
+        else if ((sys->type == ZX_TYPE_PLUS3) &&
+                 ((Z80_GET_ADDR(pins) & 0xF002) == 0x2000) &&
+                 (pins & Z80_RD)) {
+            Z80_SET_DATA(pins, _zx_plus3_fdc_status(sys));
+        }
+        else if ((sys->type == ZX_TYPE_PLUS3) &&
+                 ((Z80_GET_ADDR(pins) & 0xF002) == 0x3000)) {
+            if (pins & Z80_RD) {
+                Z80_SET_DATA(pins, _zx_plus3_fdc_read(sys));
+            }
+            else if (pins & Z80_WR) {
+                _zx_plus3_fdc_write(sys, Z80_GET_DATA(pins));
+            }
+        }
         else if (((pins & (Z80_WR|Z80_A15|Z80_A1)) == Z80_WR) && (sys->type == ZX_TYPE_128)) {
             /* Spectrum 128 memory control (0.............0.)
                 http://8bit.yarek.pl/computer/zx.128/
             */
             _zx_update_memory_map_zx128(sys, Z80_GET_DATA(pins));
         }
-        else if (((pins & (Z80_A15|Z80_A1)) == Z80_A15) && (sys->type == ZX_TYPE_128)) {
+        else if (((pins & (Z80_A15|Z80_A1)) == Z80_A15) && (sys->type != ZX_TYPE_48K)) {
             // AY-3-8912 access (1*............0.)
             if (pins & Z80_A14) { pins |= AY38910_BC1; }
             if (pins & Z80_WR) { pins |= AY38910_BDIR; }
@@ -796,7 +1089,7 @@ void zx_set_tape_load_trap(zx_t* sys, zx_tape_load_trap_callback_t callback, voi
 
 static void _zx_init_memory_map(zx_t* sys) {
     mem_init(&sys->mem);
-    if (sys->type == ZX_TYPE_128) {
+    if (sys->type == ZX_TYPE_128 || sys->type == ZX_TYPE_PLUS3) {
         mem_map_ram(&sys->mem, 0, 0x4000, 0x4000, sys->ram[5]);
         mem_map_ram(&sys->mem, 0, 0x8000, 0x4000, sys->ram[2]);
         mem_map_ram(&sys->mem, 0, 0xC000, 0x4000, sys->ram[0]);

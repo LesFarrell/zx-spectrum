@@ -199,7 +199,11 @@ static void spectrum_init_machine(Spectrum *spec)
 {
     zx_desc_t desc;
     memset(&desc, 0, sizeof(desc));
-    if (spec->model == SPECTRUM_MODEL_128K)
+    if (spec->model == SPECTRUM_MODEL_PLUS3)
+    {
+        desc.type = ZX_TYPE_PLUS3;
+    }
+    else if (spec->model == SPECTRUM_MODEL_128K)
     {
         desc.type = ZX_TYPE_128;
     }
@@ -216,7 +220,18 @@ static void spectrum_init_machine(Spectrum *spec)
     desc.tape.callback = spec->tape_callback;
     desc.tape.load_trap = spec->tape_load_trap;
     desc.tape.user_data = spec->tape_user_data;
-    if (spec->model == SPECTRUM_MODEL_128K)
+    if (spec->model == SPECTRUM_MODEL_PLUS3)
+    {
+        desc.roms.zxplus3_0.ptr = spec->rom[0];
+        desc.roms.zxplus3_0.size = sizeof(spec->rom[0]);
+        desc.roms.zxplus3_1.ptr = spec->rom[1];
+        desc.roms.zxplus3_1.size = sizeof(spec->rom[1]);
+        desc.roms.zxplus3_2.ptr = spec->rom[2];
+        desc.roms.zxplus3_2.size = sizeof(spec->rom[2]);
+        desc.roms.zxplus3_3.ptr = spec->rom[3];
+        desc.roms.zxplus3_3.size = sizeof(spec->rom[3]);
+    }
+    else if (spec->model == SPECTRUM_MODEL_128K)
     {
         desc.roms.zx128_0.ptr = spec->rom[0];
         desc.roms.zx128_0.size = sizeof(spec->rom[0]);
@@ -259,6 +274,15 @@ static bool spectrum_rebuild_for_model(
             error_buffer,
             error_buffer_size,
             "This machine needs 128K ROMs, but only a 48K ROM is available.");
+        return false;
+    }
+    if (model == SPECTRUM_MODEL_PLUS3 &&
+        (!spec->rom_loaded[1] || !spec->rom_loaded[2] || !spec->rom_loaded[3]))
+    {
+        snprintf(
+            error_buffer,
+            error_buffer_size,
+            "This machine needs the four +3 ROM banks, but they are not all available.");
         return false;
     }
 
@@ -325,8 +349,8 @@ void spectrum_configure_tape_load_trap(
     }
 }
 
-/* Loads ROM data from disk, validates whether it matches the requested 48K
-   or 128K layout, then creates and resets the embedded chips-based machine. */
+/* Loads ROM data from disk, validates whether it matches the requested 48K,
+   128K, or +3 layout, then creates and resets the embedded chips-based machine. */
 bool spectrum_load_roms(
     Spectrum *spec,
     const char *rom_path_a,
@@ -335,7 +359,7 @@ bool spectrum_load_roms(
     size_t error_buffer_size)
 {
     size_t file_size = 0;
-    uint8_t combined[0x8000];
+    uint8_t combined[0x10000];
     memset(spec->rom_loaded, 0, sizeof(spec->rom_loaded));
     spec->rom48_index = 0;
 
@@ -359,9 +383,23 @@ bool spectrum_load_roms(
             spec->rom_loaded[1] = true;
             spec->rom48_index = 1;
         }
+        else if (file_size == 0x10000 && spec->model == SPECTRUM_MODEL_PLUS3)
+        {
+            for (size_t bank = 0; bank < 4; ++bank)
+            {
+                memcpy(spec->rom[bank], combined + (bank * 0x4000), 0x4000);
+                spec->rom_loaded[bank] = true;
+            }
+        }
         else
         {
-            snprintf(error_buffer, error_buffer_size, "ROM file must be 16 KB or 32 KB: %s", rom_path_a);
+            snprintf(
+                error_buffer,
+                error_buffer_size,
+                spec->model == SPECTRUM_MODEL_PLUS3
+                    ? "+3 mode needs one combined 64 KB ROM: %s"
+                    : "ROM file must be 16 KB or 32 KB: %s",
+                rom_path_a);
             return false;
         }
     }
@@ -389,6 +427,13 @@ bool spectrum_load_roms(
             error_buffer,
             error_buffer_size,
             "128K mode needs either a combined 32 KB ROM or two 16 KB ROMs.");
+        return false;
+    }
+    if (spec->model == SPECTRUM_MODEL_PLUS3 &&
+        (!spec->rom_loaded[0] || !spec->rom_loaded[1] ||
+         !spec->rom_loaded[2] || !spec->rom_loaded[3]))
+    {
+        snprintf(error_buffer, error_buffer_size, "+3 mode needs one combined 64 KB ROM.");
         return false;
     }
 
