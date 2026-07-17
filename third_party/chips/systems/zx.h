@@ -69,7 +69,7 @@ extern "C" {
 #endif
 
 // bump this whenever the zx_t struct layout changes
-#define ZX_SNAPSHOT_VERSION (0x0004)
+#define ZX_SNAPSHOT_VERSION (0x0005)
 
 #define ZX_MAX_AUDIO_SAMPLES (1024)      // max number of audio samples in internal sample buffer
 #define ZX_DEFAULT_AUDIO_SAMPLES (128)   // default number of samples in internal sample buffer
@@ -78,6 +78,7 @@ extern "C" {
 #define ZX_FRAMEBUFFER_SIZE_BYTES (ZX_FRAMEBUFFER_WIDTH * ZX_FRAMEBUFFER_HEIGHT)
 #define ZX_DISPLAY_WIDTH (320)
 #define ZX_DISPLAY_HEIGHT (256)
+#define ZX_PLUS3_MAX_SECTOR_SIZE (8192)
 
 // ZX Spectrum models
 typedef enum {
@@ -103,6 +104,40 @@ typedef enum {
 
 typedef bool (*zx_tape_input_callback_t)(void *user_data, uint64_t tick_count);
 typedef bool (*zx_tape_load_trap_callback_t)(void *user_data, void *machine);
+typedef bool (*zx_disk_ready_callback_t)(void *user_data, uint8_t drive);
+typedef bool (*zx_disk_read_sector_callback_t)(
+    void *user_data,
+    uint8_t drive,
+    uint8_t c,
+    uint8_t h,
+    uint8_t r,
+    uint8_t n,
+    uint8_t *buffer,
+    uint32_t buffer_size,
+    uint32_t *data_size,
+    uint8_t *st1,
+    uint8_t *st2);
+typedef bool (*zx_disk_write_sector_callback_t)(
+    void *user_data,
+    uint8_t drive,
+    uint8_t c,
+    uint8_t h,
+    uint8_t r,
+    uint8_t n,
+    const uint8_t *buffer,
+    uint32_t data_size);
+typedef bool (*zx_disk_sector_id_callback_t)(
+    void *user_data,
+    uint8_t drive,
+    uint8_t c,
+    uint8_t h,
+    uint8_t index,
+    uint8_t *out_c,
+    uint8_t *out_h,
+    uint8_t *out_r,
+    uint8_t *out_n,
+    uint8_t *st1,
+    uint8_t *st2);
 
 // config parameters for zx_init()
 typedef struct {
@@ -121,6 +156,13 @@ typedef struct {
         zx_tape_load_trap_callback_t load_trap;
         void *user_data;
     } tape;
+    struct {
+        zx_disk_ready_callback_t ready;
+        zx_disk_read_sector_callback_t read_sector;
+        zx_disk_write_sector_callback_t write_sector;
+        zx_disk_sector_id_callback_t sector_id;
+        void *user_data;
+    } disk;
     // ROM images
     struct {
         // ZX Spectrum 48K
@@ -169,6 +211,11 @@ typedef struct {
     zx_tape_input_callback_t tape_callback;
     zx_tape_load_trap_callback_t tape_load_trap;
     void *tape_user_data;
+    zx_disk_ready_callback_t disk_ready;
+    zx_disk_read_sector_callback_t disk_read_sector;
+    zx_disk_write_sector_callback_t disk_write_sector;
+    zx_disk_sector_id_callback_t disk_sector_id;
+    void *disk_user_data;
     struct {
         chips_audio_callback_t callback;
         int num_samples;
@@ -185,6 +232,18 @@ typedef struct {
         uint8_t result_index;
         uint8_t last_drive;
         uint8_t cylinder[4];
+        uint8_t id_index[4][2];
+        uint8_t transfer_mode;
+        uint8_t transfer_c;
+        uint8_t transfer_h;
+        uint8_t transfer_r;
+        uint8_t transfer_n;
+        uint8_t transfer_eot;
+        uint8_t transfer_st1;
+        uint8_t transfer_st2;
+        uint32_t transfer_size;
+        uint32_t transfer_pos;
+        uint8_t transfer[ZX_PLUS3_MAX_SECTOR_SIZE];
         bool interrupt_pending;
     } plus3_fdc;
     uint8_t ram[8][0x4000];
@@ -217,6 +276,16 @@ void zx_joystick(zx_t* sys, uint8_t mask);
 void zx_set_tape_input(zx_t* sys, zx_tape_input_callback_t callback, void *user_data);
 // set a callback used to fast-trap the ROM tape loader for standard blocks
 void zx_set_tape_load_trap(zx_t* sys, zx_tape_load_trap_callback_t callback, void *user_data);
+// set callbacks used by the Spectrum +3 floppy controller
+void zx_set_disk_callbacks(
+    zx_t* sys,
+    zx_disk_ready_callback_t ready,
+    zx_disk_read_sector_callback_t read_sector,
+    zx_disk_write_sector_callback_t write_sector,
+    zx_disk_sector_id_callback_t sector_id,
+    void *user_data);
+// notify the +3 controller that media was inserted or ejected
+void zx_notify_disk_changed(zx_t* sys);
 // load a ZX Z80 file into the emulator
 bool zx_quickload(zx_t* sys, chips_range_t data);
 // save a snapshot, patches any pointers to zero, returns a snapshot version
@@ -263,6 +332,11 @@ void zx_init(zx_t* sys, const zx_desc_t* desc) {
     sys->tape_callback = desc->tape.callback;
     sys->tape_load_trap = desc->tape.load_trap;
     sys->tape_user_data = desc->tape.user_data;
+    sys->disk_ready = desc->disk.ready;
+    sys->disk_read_sector = desc->disk.read_sector;
+    sys->disk_write_sector = desc->disk.write_sector;
+    sys->disk_sector_id = desc->disk.sector_id;
+    sys->disk_user_data = desc->disk.user_data;
 
     // initalize the hardware
     sys->border_color = 0;
@@ -530,12 +604,26 @@ static void _zx_write_memory_control_plus3(zx_t* sys, uint16_t addr, uint8_t dat
     }
 }
 
-/* Models an empty uPD765A closely enough for +3DOS to initialize the
-   controller and report that no disk is present. Disk media transfer is
-   intentionally left to the frontend's future disk-image implementation. */
+enum {
+    _ZX_PLUS3_FDC_TRANSFER_NONE,
+    _ZX_PLUS3_FDC_TRANSFER_READ,
+    _ZX_PLUS3_FDC_TRANSFER_WRITE
+};
+
+static bool _zx_plus3_disk_ready(const zx_t* sys, uint8_t drive) {
+    return sys->disk_ready != 0 && sys->disk_ready(sys->disk_user_data, drive);
+}
+
+/* Reports the uPD765 phase through RQM, DIO, non-DMA, and busy bits. */
 static uint8_t _zx_plus3_fdc_status(const zx_t* sys) {
     if (sys->plus3_fdc.result_index < sys->plus3_fdc.result_count) {
         return 0xD0; /* RQM | DIO | controller busy */
+    }
+    if (sys->plus3_fdc.transfer_mode == _ZX_PLUS3_FDC_TRANSFER_READ) {
+        return 0xF0; /* RQM | DIO | non-DMA | controller busy */
+    }
+    if (sys->plus3_fdc.transfer_mode == _ZX_PLUS3_FDC_TRANSFER_WRITE) {
+        return 0xB0; /* RQM | non-DMA | controller busy */
     }
     if (sys->plus3_fdc.param_count < sys->plus3_fdc.param_expected) {
         return 0x90; /* RQM | controller busy */
@@ -554,6 +642,161 @@ static void _zx_plus3_fdc_set_results(
     sys->plus3_fdc.result_index = 0;
     sys->plus3_fdc.param_count = 0;
     sys->plus3_fdc.param_expected = 0;
+    sys->plus3_fdc.transfer_mode = _ZX_PLUS3_FDC_TRANSFER_NONE;
+    sys->plus3_fdc.transfer_pos = 0;
+    sys->plus3_fdc.transfer_size = 0;
+}
+
+static void _zx_plus3_fdc_finish_data(zx_t* sys, uint8_t st0, uint8_t st1, uint8_t st2) {
+    uint8_t results[7] = {0};
+    results[0] = st0;
+    results[1] = st1;
+    results[2] = st2;
+    results[3] = sys->plus3_fdc.transfer_c;
+    results[4] = sys->plus3_fdc.transfer_h;
+    results[5] = sys->plus3_fdc.transfer_r;
+    results[6] = sys->plus3_fdc.transfer_n;
+    _zx_plus3_fdc_set_results(sys, results, 7);
+}
+
+static bool _zx_plus3_fdc_load_read_sector(zx_t* sys) {
+    uint32_t data_size = 0;
+    uint8_t st1 = 0;
+    uint8_t st2 = 0;
+    const uint8_t drive = sys->plus3_fdc.last_drive;
+    const uint8_t head_drive = (uint8_t)(drive | ((sys->plus3_fdc.transfer_h & 1) << 2));
+
+    if (!_zx_plus3_disk_ready(sys, drive)) {
+        _zx_plus3_fdc_finish_data(sys, (uint8_t)(0x48 | head_drive), 0, 0);
+        return false;
+    }
+    if (sys->disk_read_sector == 0 ||
+        !sys->disk_read_sector(
+            sys->disk_user_data,
+            drive,
+            sys->plus3_fdc.transfer_c,
+            sys->plus3_fdc.transfer_h,
+            sys->plus3_fdc.transfer_r,
+            sys->plus3_fdc.transfer_n,
+            sys->plus3_fdc.transfer,
+            sizeof(sys->plus3_fdc.transfer),
+            &data_size,
+            &st1,
+            &st2) ||
+        data_size == 0 ||
+        data_size > sizeof(sys->plus3_fdc.transfer)) {
+        _zx_plus3_fdc_finish_data(sys, (uint8_t)(0x40 | head_drive), 0x04, 0);
+        return false;
+    }
+
+    sys->plus3_fdc.transfer_st1 = st1;
+    sys->plus3_fdc.transfer_st2 = st2;
+    sys->plus3_fdc.transfer_size = data_size;
+    sys->plus3_fdc.transfer_pos = 0;
+    sys->plus3_fdc.transfer_mode = _ZX_PLUS3_FDC_TRANSFER_READ;
+    return true;
+}
+
+static void _zx_plus3_fdc_complete_sector(zx_t* sys, bool writing) {
+    const uint8_t drive = sys->plus3_fdc.last_drive;
+    const uint8_t head_drive = (uint8_t)(drive | ((sys->plus3_fdc.transfer_h & 1) << 2));
+    bool ok = true;
+
+    if (writing) {
+        if (sys->disk_write_sector == 0) {
+            _zx_plus3_fdc_finish_data(sys, (uint8_t)(0x40 | head_drive), 0x02, 0);
+            return;
+        }
+        ok = sys->disk_write_sector(
+                sys->disk_user_data,
+                drive,
+                sys->plus3_fdc.transfer_c,
+                sys->plus3_fdc.transfer_h,
+                sys->plus3_fdc.transfer_r,
+                sys->plus3_fdc.transfer_n,
+                sys->plus3_fdc.transfer,
+                sys->plus3_fdc.transfer_size);
+        if (!ok) {
+            _zx_plus3_fdc_finish_data(sys, (uint8_t)(0x40 | head_drive), 0x04, 0);
+            return;
+        }
+    }
+
+    if (sys->plus3_fdc.transfer_r < sys->plus3_fdc.transfer_eot) {
+        sys->plus3_fdc.transfer_r++;
+        if (writing) {
+            sys->plus3_fdc.transfer_pos = 0;
+            sys->plus3_fdc.transfer_mode = _ZX_PLUS3_FDC_TRANSFER_WRITE;
+        }
+        else {
+            _zx_plus3_fdc_load_read_sector(sys);
+        }
+        return;
+    }
+
+    if ((sys->plus3_fdc.command & 0x80) != 0 &&
+        sys->plus3_fdc.transfer_h == 0) {
+        sys->plus3_fdc.transfer_h = 1;
+        sys->plus3_fdc.transfer_r = sys->plus3_fdc.params[3];
+        if (writing) {
+            sys->plus3_fdc.transfer_pos = 0;
+            sys->plus3_fdc.transfer_mode = _ZX_PLUS3_FDC_TRANSFER_WRITE;
+        }
+        else {
+            _zx_plus3_fdc_load_read_sector(sys);
+        }
+        return;
+    }
+
+    _zx_plus3_fdc_finish_data(
+        sys,
+        (uint8_t)(((sys->plus3_fdc.transfer_st1 | sys->plus3_fdc.transfer_st2) != 0
+            ? 0x40
+            : 0x00) | head_drive),
+        sys->plus3_fdc.transfer_st1,
+        sys->plus3_fdc.transfer_st2);
+}
+
+static uint32_t _zx_plus3_fdc_requested_size(const zx_t* sys) {
+    const uint8_t n = sys->plus3_fdc.params[4];
+    if (n == 0 && sys->plus3_fdc.params[7] != 0) {
+        return sys->plus3_fdc.params[7];
+    }
+    if (n > 6) {
+        return 0;
+    }
+    return 128u << n;
+}
+
+static void _zx_plus3_fdc_begin_data(zx_t* sys, bool writing) {
+    const uint8_t drive = sys->plus3_fdc.params[0] & 3;
+    const uint8_t head_drive = sys->plus3_fdc.params[0] & 7;
+    sys->plus3_fdc.last_drive = drive;
+    sys->plus3_fdc.transfer_c = sys->plus3_fdc.params[1];
+    sys->plus3_fdc.transfer_h = sys->plus3_fdc.params[2];
+    sys->plus3_fdc.transfer_r = sys->plus3_fdc.params[3];
+    sys->plus3_fdc.transfer_n = sys->plus3_fdc.params[4];
+    sys->plus3_fdc.transfer_eot = sys->plus3_fdc.params[5];
+    sys->plus3_fdc.transfer_st1 = 0;
+    sys->plus3_fdc.transfer_st2 = 0;
+
+    if (!_zx_plus3_disk_ready(sys, drive)) {
+        _zx_plus3_fdc_finish_data(sys, (uint8_t)(0x48 | head_drive), 0, 0);
+        return;
+    }
+    if (writing) {
+        const uint32_t size = _zx_plus3_fdc_requested_size(sys);
+        if (size == 0 || size > sizeof(sys->plus3_fdc.transfer)) {
+            _zx_plus3_fdc_finish_data(sys, (uint8_t)(0x40 | head_drive), 0x04, 0);
+            return;
+        }
+        sys->plus3_fdc.transfer_size = size;
+        sys->plus3_fdc.transfer_pos = 0;
+        sys->plus3_fdc.transfer_mode = _ZX_PLUS3_FDC_TRANSFER_WRITE;
+    }
+    else {
+        _zx_plus3_fdc_load_read_sector(sys);
+    }
 }
 
 static void _zx_plus3_fdc_execute(zx_t* sys) {
@@ -572,10 +815,26 @@ static void _zx_plus3_fdc_execute(zx_t* sys) {
             sys->plus3_fdc.param_count = 0;
             sys->plus3_fdc.param_expected = 0;
             break;
-        case 0x04: /* Sense Drive Status */
-            results[0] = (uint8_t)(head_drive | 0x10); /* track 0, not ready */
+        case 0x04: { /* Sense Drive Status */
+            const bool ready = _zx_plus3_disk_ready(sys, drive);
+            bool double_sided = false;
+            if (ready && sys->disk_sector_id != 0) {
+                double_sided = sys->disk_sector_id(
+                    sys->disk_user_data,
+                    drive,
+                    sys->plus3_fdc.cylinder[drive],
+                    1,
+                    0,
+                    0, 0, 0, 0, 0, 0);
+            }
+            results[0] = (uint8_t)(
+                head_drive |
+                (sys->plus3_fdc.cylinder[drive] == 0 ? 0x10 : 0) |
+                (ready ? 0x20 : 0) |
+                (double_sided ? 0x08 : 0));
             _zx_plus3_fdc_set_results(sys, results, 1);
             break;
+        }
         case 0x07: /* Recalibrate */
             sys->plus3_fdc.cylinder[drive] = 0;
             sys->plus3_fdc.interrupt_pending = true;
@@ -584,7 +843,9 @@ static void _zx_plus3_fdc_execute(zx_t* sys) {
             break;
         case 0x08: /* Sense Interrupt Status */
             if (sys->plus3_fdc.interrupt_pending) {
-                results[0] = (uint8_t)(0x48 | sys->plus3_fdc.last_drive);
+                results[0] = (uint8_t)(
+                    (_zx_plus3_disk_ready(sys, sys->plus3_fdc.last_drive) ? 0x20 : 0x48) |
+                    sys->plus3_fdc.last_drive);
                 results[1] = sys->plus3_fdc.cylinder[sys->plus3_fdc.last_drive];
                 sys->plus3_fdc.interrupt_pending = false;
                 _zx_plus3_fdc_set_results(sys, results, 2);
@@ -601,25 +862,70 @@ static void _zx_plus3_fdc_execute(zx_t* sys) {
             sys->plus3_fdc.param_expected = 0;
             break;
         case 0x02: /* Read Track */
-        case 0x05: /* Write Data */
         case 0x06: /* Read Data */
-        case 0x09: /* Write Deleted Data */
         case 0x0C: /* Read Deleted Data */
+            _zx_plus3_fdc_begin_data(sys, false);
+            break;
+        case 0x05: /* Write Data */
+        case 0x09: /* Write Deleted Data */
+            _zx_plus3_fdc_begin_data(sys, true);
+            break;
+        case 0x0A: { /* Read ID */
+            uint8_t c = sys->plus3_fdc.cylinder[drive];
+            uint8_t h = (head_drive >> 2) & 1;
+            uint8_t r = 0;
+            uint8_t n = 0;
+            uint8_t st1 = 0;
+            uint8_t st2 = 0;
+            if (!_zx_plus3_disk_ready(sys, drive)) {
+                sys->plus3_fdc.transfer_c = c;
+                sys->plus3_fdc.transfer_h = h;
+                sys->plus3_fdc.transfer_r = 0;
+                sys->plus3_fdc.transfer_n = 0;
+                _zx_plus3_fdc_finish_data(sys, (uint8_t)(0x48 | head_drive), 0, 0);
+            }
+            else if (sys->disk_sector_id == 0 ||
+                     !sys->disk_sector_id(
+                         sys->disk_user_data,
+                         drive,
+                         c,
+                         h,
+                         sys->plus3_fdc.id_index[drive][h]++,
+                         &c, &h, &r, &n, &st1, &st2)) {
+                sys->plus3_fdc.transfer_c = c;
+                sys->plus3_fdc.transfer_h = h;
+                sys->plus3_fdc.transfer_r = r;
+                sys->plus3_fdc.transfer_n = n;
+                _zx_plus3_fdc_finish_data(sys, (uint8_t)(0x40 | head_drive), 0x04, 0);
+            }
+            else {
+                sys->plus3_fdc.transfer_c = c;
+                sys->plus3_fdc.transfer_h = h;
+                sys->plus3_fdc.transfer_r = r;
+                sys->plus3_fdc.transfer_n = n;
+                _zx_plus3_fdc_finish_data(
+                    sys,
+                    (uint8_t)(((st1 | st2) != 0 ? 0x40 : 0) | head_drive),
+                    st1,
+                    st2);
+            }
+            break;
+        }
         case 0x0D: /* Format Track */
-        case 0x0A: /* Read ID */
+            sys->plus3_fdc.transfer_c = sys->plus3_fdc.cylinder[drive];
+            sys->plus3_fdc.transfer_h = (head_drive >> 2) & 1;
+            sys->plus3_fdc.transfer_r = 0;
+            sys->plus3_fdc.transfer_n = sys->plus3_fdc.params[1];
+            _zx_plus3_fdc_finish_data(sys, (uint8_t)(0x40 | head_drive), 0x02, 0);
+            break;
         case 0x11: /* Scan Equal */
         case 0x19: /* Scan Low Or Equal */
         case 0x1D: /* Scan High Or Equal */
-            results[0] = (uint8_t)(0x48 | head_drive); /* abnormal: drive not ready */
-            results[1] = 0x04; /* no data */
-            results[2] = 0;
-            if (sys->plus3_fdc.param_count >= 5) {
-                results[3] = sys->plus3_fdc.params[1];
-                results[4] = sys->plus3_fdc.params[2];
-                results[5] = sys->plus3_fdc.params[3];
-                results[6] = sys->plus3_fdc.params[4];
-            }
-            _zx_plus3_fdc_set_results(sys, results, 7);
+            sys->plus3_fdc.transfer_c = sys->plus3_fdc.params[1];
+            sys->plus3_fdc.transfer_h = sys->plus3_fdc.params[2];
+            sys->plus3_fdc.transfer_r = sys->plus3_fdc.params[3];
+            sys->plus3_fdc.transfer_n = sys->plus3_fdc.params[4];
+            _zx_plus3_fdc_finish_data(sys, (uint8_t)(0x40 | head_drive), 0x04, 0);
             break;
         default: /* Invalid command */
             results[0] = 0x80;
@@ -653,6 +959,13 @@ static void _zx_plus3_fdc_write(zx_t* sys, uint8_t data) {
     if (sys->plus3_fdc.result_index < sys->plus3_fdc.result_count) {
         return;
     }
+    if (sys->plus3_fdc.transfer_mode == _ZX_PLUS3_FDC_TRANSFER_WRITE) {
+        sys->plus3_fdc.transfer[sys->plus3_fdc.transfer_pos++] = data;
+        if (sys->plus3_fdc.transfer_pos == sys->plus3_fdc.transfer_size) {
+            _zx_plus3_fdc_complete_sector(sys, true);
+        }
+        return;
+    }
     if (sys->plus3_fdc.param_count < sys->plus3_fdc.param_expected) {
         sys->plus3_fdc.params[sys->plus3_fdc.param_count++] = data;
         if (sys->plus3_fdc.param_count == sys->plus3_fdc.param_expected) {
@@ -671,7 +984,14 @@ static void _zx_plus3_fdc_write(zx_t* sys, uint8_t data) {
 
 static uint8_t _zx_plus3_fdc_read(zx_t* sys) {
     uint8_t data = 0xFF;
-    if (sys->plus3_fdc.result_index < sys->plus3_fdc.result_count) {
+    if (sys->plus3_fdc.transfer_mode == _ZX_PLUS3_FDC_TRANSFER_READ &&
+        sys->plus3_fdc.transfer_pos < sys->plus3_fdc.transfer_size) {
+        data = sys->plus3_fdc.transfer[sys->plus3_fdc.transfer_pos++];
+        if (sys->plus3_fdc.transfer_pos == sys->plus3_fdc.transfer_size) {
+            _zx_plus3_fdc_complete_sector(sys, false);
+        }
+    }
+    else if (sys->plus3_fdc.result_index < sys->plus3_fdc.result_count) {
         data = sys->plus3_fdc.results[sys->plus3_fdc.result_index++];
         if (sys->plus3_fdc.result_index == sys->plus3_fdc.result_count) {
             sys->plus3_fdc.result_index = 0;
@@ -1087,6 +1407,27 @@ void zx_set_tape_load_trap(zx_t* sys, zx_tape_load_trap_callback_t callback, voi
     sys->tape_user_data = user_data;
 }
 
+void zx_set_disk_callbacks(
+    zx_t* sys,
+    zx_disk_ready_callback_t ready,
+    zx_disk_read_sector_callback_t read_sector,
+    zx_disk_write_sector_callback_t write_sector,
+    zx_disk_sector_id_callback_t sector_id,
+    void *user_data)
+{
+    CHIPS_ASSERT(sys && sys->valid);
+    sys->disk_ready = ready;
+    sys->disk_read_sector = read_sector;
+    sys->disk_write_sector = write_sector;
+    sys->disk_sector_id = sector_id;
+    sys->disk_user_data = user_data;
+}
+
+void zx_notify_disk_changed(zx_t* sys) {
+    CHIPS_ASSERT(sys && sys->valid);
+    memset(&sys->plus3_fdc, 0, sizeof(sys->plus3_fdc));
+}
+
 static void _zx_init_memory_map(zx_t* sys) {
     mem_init(&sys->mem);
     if (sys->type == ZX_TYPE_128 || sys->type == ZX_TYPE_PLUS3) {
@@ -1429,6 +1770,11 @@ uint32_t zx_save_snapshot(zx_t* sys, zx_t* dst) {
     dst->tape_callback = 0;
     dst->tape_load_trap = 0;
     dst->tape_user_data = 0;
+    dst->disk_ready = 0;
+    dst->disk_read_sector = 0;
+    dst->disk_write_sector = 0;
+    dst->disk_sector_id = 0;
+    dst->disk_user_data = 0;
     chips_debug_snapshot_onsave(&dst->debug);
     chips_audio_callback_snapshot_onsave(&dst->audio.callback);
     ay38910_snapshot_onsave(&dst->ay);
@@ -1446,6 +1792,11 @@ bool zx_load_snapshot(zx_t* sys, uint32_t version, zx_t* src) {
     im.tape_callback = sys->tape_callback;
     im.tape_load_trap = sys->tape_load_trap;
     im.tape_user_data = sys->tape_user_data;
+    im.disk_ready = sys->disk_ready;
+    im.disk_read_sector = sys->disk_read_sector;
+    im.disk_write_sector = sys->disk_write_sector;
+    im.disk_sector_id = sys->disk_sector_id;
+    im.disk_user_data = sys->disk_user_data;
     chips_debug_snapshot_onload(&im.debug, &sys->debug);
     chips_audio_callback_snapshot_onload(&im.audio.callback, &sys->audio.callback);
     ay38910_snapshot_onload(&im.ay, &sys->ay);

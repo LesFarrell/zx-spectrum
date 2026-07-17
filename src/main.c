@@ -15,6 +15,7 @@
 
 #include "spectrum.h"
 #include "tape.h"
+#include "disk.h"
 #include <Scintilla.h>
 
 typedef struct KeyMap {
@@ -53,6 +54,7 @@ enum {
     APP_MENU_FILE_STOP_TAPE = 1005,
     APP_MENU_FILE_AUTOLOAD_TAPES = 1006,
     APP_MENU_FILE_FAST_TAPE_LOADING = 1008,
+    APP_MENU_DISK_EJECT = 1010,
     APP_MENU_SOUND_MUTE = 1101,
     APP_MENU_TOOLS_ASSEMBLER = 1301,
     APP_MENU_TOOLS_DEBUGGER = 1302,
@@ -335,6 +337,7 @@ struct AppState {
     ControllerState controller;
     AutoTypeState auto_type;
     TapePlayer tape;
+    DskImage disk;
     DebugState debug;
     int active_key_codes[256];
     uint32_t tape_input_reads_this_frame;
@@ -416,6 +419,7 @@ static bool app_parse_number(const char *text, int *value);
 static double app_model_frame_duration_ms(SpectrumModel model);
 static void app_tick_emulator(AppState *app);
 static bool app_load_tape_file(HWND hwnd, AppState *app, const char *path, char *error_buffer, size_t error_buffer_size);
+static bool app_load_disk_file(HWND hwnd, AppState *app, const char *path, char *error_buffer, size_t error_buffer_size);
 static bool app_apply_loaded_tape(HWND hwnd, AppState *app, TapePlayer *loaded_tape, char *error_buffer, size_t error_buffer_size);
 static bool app_load_snapshot_file(HWND hwnd, AppState *app, const char *path, char *error_buffer, size_t error_buffer_size);
 static bool app_apply_loaded_snapshot(HWND hwnd, AppState *app, AppSnapshotLoadJob *job, char *error_buffer, size_t error_buffer_size);
@@ -456,6 +460,7 @@ static void app_save_fast_tape_loading(bool enabled);
 static void app_save_sound_muted(bool muted);
 static void app_update_model_menu(HWND hwnd, SpectrumModel model);
 static void app_update_sound_menu(HWND hwnd, bool muted);
+static void app_update_disk_menu(HWND hwnd, bool inserted);
 static void app_audio_callback(const float *samples, int num_samples, void *user_data);
 static void app_debug_refresh_window(AppState *app);
 static void app_assembler_refresh_window(AppState *app);
@@ -583,11 +588,12 @@ static HMENU app_create_menu(void) {
     HMENU menu_bar = CreateMenu();
     HMENU file_menu = CreatePopupMenu();
     HMENU tape_menu = CreatePopupMenu();
+    HMENU disk_menu = CreatePopupMenu();
     HMENU machine_menu = CreatePopupMenu();
     HMENU sound_menu = CreatePopupMenu();
     HMENU tools_menu = CreatePopupMenu();
 
-    if (menu_bar == NULL || file_menu == NULL || tape_menu == NULL || machine_menu == NULL ||
+    if (menu_bar == NULL || file_menu == NULL || tape_menu == NULL || disk_menu == NULL || machine_menu == NULL ||
         sound_menu == NULL || tools_menu == NULL) {
         if (tools_menu != NULL) {
             DestroyMenu(tools_menu);
@@ -597,6 +603,9 @@ static HMENU app_create_menu(void) {
         }
         if (machine_menu != NULL) {
             DestroyMenu(machine_menu);
+        }
+        if (disk_menu != NULL) {
+            DestroyMenu(disk_menu);
         }
         if (tape_menu != NULL) {
             DestroyMenu(tape_menu);
@@ -610,7 +619,7 @@ static HMENU app_create_menu(void) {
         return NULL;
     }
 
-    AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_OPEN_SNAPSHOT, "&Open Tape/Snapshot...\tCtrl+O");
+    AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_OPEN_SNAPSHOT, "&Open Media/Snapshot...\tCtrl+O");
     AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_RESET, "&Reset\tCtrl+R");
     AppendMenuA(file_menu, MF_SEPARATOR, 0, NULL);
     AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_EXIT, "E&xit\tAlt+F4");
@@ -618,6 +627,7 @@ static HMENU app_create_menu(void) {
     AppendMenuA(tape_menu, MF_STRING, APP_MENU_FILE_STOP_TAPE, "S&top Tape\tF4");
     AppendMenuA(tape_menu, MF_STRING, APP_MENU_FILE_AUTOLOAD_TAPES, "&Auto-load Tapes On Open");
     AppendMenuA(tape_menu, MF_STRING, APP_MENU_FILE_FAST_TAPE_LOADING, "Use &Fast Tape Loading");
+    AppendMenuA(disk_menu, MF_STRING, APP_MENU_DISK_EJECT, "&Eject Disk");
     AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_48K, "&48K\tCtrl+1");
     AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_128K, "&128K\tCtrl+2");
     AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_PLUS3, "+&3\tCtrl+3");
@@ -627,6 +637,7 @@ static HMENU app_create_menu(void) {
     AppendMenuA(tools_menu, MF_STRING, APP_MENU_TOOLS_POKE, "&Poke...\tCtrl+Shift+P");
     AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)file_menu, "&File");
     AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)tape_menu, "&Tape");
+    AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)disk_menu, "&Disk");
     AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)machine_menu, "&Machine");
     AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)sound_menu, "&Sound");
     AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)tools_menu, "&Tools");
@@ -643,6 +654,18 @@ static void app_update_sound_menu(HWND hwnd, bool muted) {
         menu,
         APP_MENU_SOUND_MUTE,
         MF_BYCOMMAND | (muted ? MF_CHECKED : MF_UNCHECKED)
+    );
+}
+
+static void app_update_disk_menu(HWND hwnd, bool inserted) {
+    HMENU menu = GetMenu(hwnd);
+    if (menu == NULL) {
+        return;
+    }
+    EnableMenuItem(
+        menu,
+        APP_MENU_DISK_EJECT,
+        MF_BYCOMMAND | (inserted ? MF_ENABLED : MF_GRAYED)
     );
 }
 
@@ -1367,6 +1390,81 @@ static bool app_load_tape_file(
     return true;
 }
 
+static bool app_confirm_discard_disk_changes(HWND hwnd, const AppState *app, const char *action) {
+    char message[320];
+    if (app == NULL || !app->disk.inserted || !app->disk.dirty) {
+        return true;
+    }
+    snprintf(
+        message,
+        sizeof(message),
+        "Changes made to the inserted disk are only in memory and have not been written to the DSK file.\n\n%s anyway?",
+        action);
+    return MessageBoxA(
+        hwnd,
+        message,
+        "Unsaved Disk Changes",
+        MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES;
+}
+
+/* Inserts a parsed DSK as drive A:, switches to +3 hardware when needed, and
+   resets into the ROM Loader so bootable game disks start automatically. */
+static bool app_load_disk_file(
+    HWND hwnd,
+    AppState *app,
+    const char *path,
+    char *error_buffer,
+    size_t error_buffer_size)
+{
+    DskImage loaded;
+    dsk_init(&loaded);
+    if (!dsk_load_file(&loaded, path, error_buffer, error_buffer_size)) {
+        return false;
+    }
+
+    app_autotype_clear(app);
+    app_release_all_keys(app);
+    app_audio_flush(app);
+    app_stop_tape(app);
+    if (app->spec.model != SPECTRUM_MODEL_PLUS3) {
+        const RomSet *set = app_rom_set_for_model_const(&app->roms, SPECTRUM_MODEL_PLUS3);
+        if (!app_load_model_roms(
+                app,
+                SPECTRUM_MODEL_PLUS3,
+                set,
+                error_buffer,
+                error_buffer_size)) {
+            dsk_discard(&loaded);
+            return false;
+        }
+        app_save_model(SPECTRUM_MODEL_PLUS3);
+    }
+
+    dsk_discard(&app->disk);
+    app->disk = loaded;
+    spectrum_notify_disk_changed(&app->spec);
+    spectrum_reset(&app->spec);
+    app_sync_tape_stop_mode(app);
+    tape_rewind(&app->tape, (uint32_t)app->spec.machine.freq_hz);
+    app_save_model(SPECTRUM_MODEL_PLUS3);
+    if (app_start_autotype(app, L"\r")) {
+        app->auto_type.cooldown_frames = APP_AUTOTYPE_BOOT_DELAY_FRAMES;
+    }
+
+    app_update_title(hwnd, &app->spec);
+    app_update_model_menu(hwnd, app->spec.model);
+    app_update_disk_menu(hwnd, true);
+    app_debug_machine_changed(app);
+    InvalidateRect(hwnd, NULL, FALSE);
+    return true;
+}
+
+static void app_eject_disk(HWND hwnd, AppState *app) {
+    dsk_discard(&app->disk);
+    spectrum_notify_disk_changed(&app->spec);
+    app_update_disk_menu(hwnd, false);
+}
+
 /* Starts an asynchronous snapshot file read/validation job and returns
    immediately so the UI thread stays responsive while disk work completes. */
 static bool app_load_snapshot_file(
@@ -1965,8 +2063,9 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                         ofn.lStructSize = sizeof(ofn);
                         ofn.hwndOwner = hwnd;
                         ofn.lpstrFilter =
-                            "ZX Spectrum Files (*.tap;*.tzx;*.z80;*.sna;*.szx)\0*.tap;*.tzx;*.z80;*.sna;*.szx\0"
+                            "ZX Spectrum Files (*.tap;*.tzx;*.dsk;*.z80;*.sna;*.szx)\0*.tap;*.tzx;*.dsk;*.z80;*.sna;*.szx\0"
                             "Tape Images (*.tap;*.tzx)\0*.tap;*.tzx\0"
+                            "Spectrum +3 Disks (*.dsk)\0*.dsk\0"
                             "ZX Spectrum Snapshots (*.z80;*.sna;*.szx)\0*.z80;*.sna;*.szx\0"
                             "All Files (*.*)\0*.*\0";
                         ofn.lpstrFile = path;
@@ -1976,6 +2075,15 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
 
                         if (GetOpenFileNameA(&ofn)) {
                             extension = strrchr(path, '.');
+                            if (extension != NULL && _stricmp(extension, ".dsk") == 0) {
+                                if (!app_confirm_discard_disk_changes(hwnd, app, "Insert another disk")) {
+                                    return 0;
+                                }
+                                if (!app_load_disk_file(hwnd, app, path, error_buffer, sizeof(error_buffer))) {
+                                    app_show_error(error_buffer);
+                                }
+                                return 0;
+                            }
                             if (extension != NULL &&
                                 (_stricmp(extension, ".tap") == 0 || _stricmp(extension, ".tzx") == 0)) {
                                 if (!app_load_tape_file(hwnd, app, path, error_buffer, sizeof(error_buffer))) {
@@ -1993,10 +2101,15 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                                 return 0;
                             }
 
-                            app_show_error("Unsupported file type. Open a .tap, .tzx, .z80, .sna, or .szx file.");
+                            app_show_error("Unsupported file type. Open a .tap, .tzx, .dsk, .z80, .sna, or .szx file.");
                         }
                         return 0;
                     }
+                    case APP_MENU_DISK_EJECT:
+                        if (app_confirm_discard_disk_changes(hwnd, app, "Eject the disk")) {
+                            app_eject_disk(hwnd, app);
+                        }
+                        return 0;
                     case APP_MENU_FILE_PLAY_TAPE:
                         app_play_tape(app);
                         return 0;
@@ -2094,6 +2207,9 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
             }
             return 0;
         case WM_CLOSE:
+            if (app != NULL && !app_confirm_discard_disk_changes(hwnd, app, "Exit the emulator")) {
+                return 0;
+            }
             if (app != NULL && app->debug.assembler_hwnd != NULL) {
                 HWND assembler_hwnd = app->debug.assembler_hwnd;
                 SendMessageA(assembler_hwnd, WM_CLOSE, 0, 0);
@@ -2462,6 +2578,13 @@ static bool app_load_model_roms(
     );
     spectrum_configure_tape_input(&app->spec, app_tape_input_callback, app);
     spectrum_configure_tape_load_trap(&app->spec, app_tape_fast_load_trap, app);
+    spectrum_configure_disk(
+        &app->spec,
+        dsk_drive_ready,
+        dsk_read_sector,
+        dsk_write_sector,
+        dsk_get_sector_id,
+        &app->disk);
     if (!spectrum_load_roms(
             &app->spec,
             set->rom_a,
@@ -2760,6 +2883,7 @@ int main(int argc, char **argv) {
         has_saved_fast_tape_loading ? saved_fast_tape_loading : true;
     app.audio.muted = has_saved_sound_muted ? saved_sound_muted : false;
     tape_init(&app.tape);
+    dsk_init(&app.disk);
     app_audio_init(&app);
     app_controller_init(&app);
 
@@ -2859,6 +2983,7 @@ int main(int argc, char **argv) {
     app_update_title(hwnd, &app.spec);
     app_update_model_menu(hwnd, app.spec.model);
     app_update_sound_menu(hwnd, app.audio.muted);
+    app_update_disk_menu(hwnd, app.disk.inserted);
     app_update_tape_menu(
         hwnd,
         app.tape_autoload_enabled,
@@ -2908,6 +3033,7 @@ int main(int argc, char **argv) {
     app_controller_shutdown(&app);
     app_audio_shutdown(&app);
     tape_discard(&app.tape);
+    dsk_discard(&app.disk);
     app_debug_free_storage(&app);
     return 0;
 }

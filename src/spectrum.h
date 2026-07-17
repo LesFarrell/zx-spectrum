@@ -40,6 +40,11 @@ typedef struct Spectrum {
     zx_tape_input_callback_t tape_callback;
     zx_tape_load_trap_callback_t tape_load_trap;
     void *tape_user_data;
+    zx_disk_ready_callback_t disk_ready;
+    zx_disk_read_sector_callback_t disk_read_sector;
+    zx_disk_write_sector_callback_t disk_write_sector;
+    zx_disk_sector_id_callback_t disk_sector_id;
+    void *disk_user_data;
     int rom48_index;
 
     uint8_t rom[4][0x4000];
@@ -86,6 +91,19 @@ void spectrum_configure_tape_load_trap(
     zx_tape_load_trap_callback_t callback,
     void *user_data
 );
+
+/* Wires application-owned +3 disk media into the uPD765 controller. */
+void spectrum_configure_disk(
+    Spectrum *spec,
+    zx_disk_ready_callback_t ready,
+    zx_disk_read_sector_callback_t read_sector,
+    zx_disk_write_sector_callback_t write_sector,
+    zx_disk_sector_id_callback_t sector_id,
+    void *user_data
+);
+
+/* Resets any active +3 controller command after media insertion/ejection. */
+void spectrum_notify_disk_changed(Spectrum *spec);
 
 /* Resets the embedded machine back to power-on state and refreshes the cached
    Win32 framebuffer from the emulator's display buffer. */

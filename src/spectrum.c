@@ -220,6 +220,11 @@ static void spectrum_init_machine(Spectrum *spec)
     desc.tape.callback = spec->tape_callback;
     desc.tape.load_trap = spec->tape_load_trap;
     desc.tape.user_data = spec->tape_user_data;
+    desc.disk.ready = spec->disk_ready;
+    desc.disk.read_sector = spec->disk_read_sector;
+    desc.disk.write_sector = spec->disk_write_sector;
+    desc.disk.sector_id = spec->disk_sector_id;
+    desc.disk.user_data = spec->disk_user_data;
     if (spec->model == SPECTRUM_MODEL_PLUS3)
     {
         desc.roms.zxplus3_0.ptr = spec->rom[0];
@@ -346,6 +351,39 @@ void spectrum_configure_tape_load_trap(
     if (spec->machine_ready)
     {
         zx_set_tape_load_trap(&spec->machine, callback, user_data);
+    }
+}
+
+void spectrum_configure_disk(
+    Spectrum *spec,
+    zx_disk_ready_callback_t ready,
+    zx_disk_read_sector_callback_t read_sector,
+    zx_disk_write_sector_callback_t write_sector,
+    zx_disk_sector_id_callback_t sector_id,
+    void *user_data)
+{
+    spec->disk_ready = ready;
+    spec->disk_read_sector = read_sector;
+    spec->disk_write_sector = write_sector;
+    spec->disk_sector_id = sector_id;
+    spec->disk_user_data = user_data;
+    if (spec->machine_ready)
+    {
+        zx_set_disk_callbacks(
+            &spec->machine,
+            ready,
+            read_sector,
+            write_sector,
+            sector_id,
+            user_data);
+    }
+}
+
+void spectrum_notify_disk_changed(Spectrum *spec)
+{
+    if (spec->machine_ready)
+    {
+        zx_notify_disk_changed(&spec->machine);
     }
 }
 

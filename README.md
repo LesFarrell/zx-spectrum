@@ -7,7 +7,7 @@ Small ZX Spectrum emulator in C for Windows. It uses the Win32 API for display, 
 - 48K model
 - 128K model with ROM switching and RAM paging through port `0x7FFD`
 - Spectrum +3 model with four ROM banks, `0x7FFD`/`0x1FFD` paging,
-  all-RAM modes, AY audio, and an empty-drive uPD765 controller response
+  all-RAM modes, AY audio, and uPD765 floppy-controller emulation
 - ULA screen rendering with border and flash attributes
 - Memory-side ULA contention timing for 48K and 128K RAM accesses
 - Keyboard matrix input
@@ -17,6 +17,8 @@ Small ZX Spectrum emulator in C for Windows. It uses the Win32 API for display, 
 - `.tap` tape loading
 - `.tzx` v1.20 tape loading, including direct recording, RLE CSW,
   generalized data, and loop/jump/call/select control flow
+- Standard and extended `.dsk` disk images for the Spectrum +3, including
+  sector reads, catalogs, bootable disks, and in-memory sector writes
 - `.z80` snapshot loading for 48K and 128K snapshots
 - `.sna` snapshot loading for 48K and 128K snapshots
 - `.szx` ZX-State snapshot loading for original 48K and 128K machines,
@@ -31,8 +33,8 @@ Small ZX Spectrum emulator in C for Windows. It uses the Win32 API for display, 
 - Non-48K/128K `.z80` snapshot models
 - SZX machine variants other than the original 48K and 128K models; SZX
   peripheral blocks are skipped while the core machine state is restored
-- Spectrum +3 disk images and floppy data transfer; the +3 currently boots
-  into BASIC and reports that no disk is inserted
+- Creating or formatting DSK tracks, and saving in-memory disk changes back
+  to the source `.dsk` file
 
 ## Build
 
@@ -89,7 +91,11 @@ Spectrum +3 with one combined 64 KB ROM:
 
 ## Menu
 
-- `File -> Open Tape/Snapshot...` opens `.tap`, `.tzx`, `.z80`, `.sna`, or `.szx` files
+- `File -> Open Media/Snapshot...` opens `.tap`, `.tzx`, `.dsk`, `.z80`, `.sna`, or `.szx` files
+- Opening a `.dsk` inserts it as +3 drive `A:`, switches to the +3 model,
+  and starts the ROM Loader so bootable disks run automatically
+- `Disk -> Eject Disk` removes the current DSK; sector writes remain in
+  memory only, and the emulator warns before discarding modified media
 - `File -> Auto-load Tapes On Open` toggles whether opening a tape starts loading automatically
 - With auto-load on, opening a tape inspects the tape and chooses `48 BASIC` or the `128K` tape loader automatically
 - With auto-load off, opening a tape just inserts and rewinds it for manual loading
