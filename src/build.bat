@@ -20,11 +20,14 @@ zig cc ^
     -I..\third_party\scintilla\include ^
     main.c ^
     spectrum.c ^
+    szx_inflate.c ^
+    disk.c ^
     tape.c ^
     zxspectrum-res.o ^
     -lgdi32 ^
     -lcomdlg32 ^
     -lcomctl32 ^
+    -lshell32 ^
     -luser32 ^
     -lwinmm ^
     -Wl,/subsystem:windows ^
@@ -33,5 +36,7 @@ zig cc ^
 if not errorlevel 1 copy /y "..\third_party\scintilla\bin\Scintilla.dll" "Scintilla.dll" >nul
 
 set "BUILD_RESULT=%errorlevel%"
+if exist "zxspectrum-res.o" del /q "zxspectrum-res.o"
+if exist "zx-spectrum.pdb" del /q "zx-spectrum.pdb"
 popd
 exit /b %BUILD_RESULT%
