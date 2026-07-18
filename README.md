@@ -9,6 +9,8 @@ Small ZX Spectrum emulator in C for Windows. It uses the Win32 API for display, 
 - Spectrum +3 model with four ROM banks, `0x7FFD`/`0x1FFD` paging,
   all-RAM modes, AY audio, and uPD765 floppy-controller emulation
 - ULA screen rendering with border and flash attributes
+- Standard ULAplus 64-colour palette mode on ports `0xBF3B`/`0xFF3B`,
+  including scanline palette changes and colour-register readback
 - Memory-side ULA contention timing for 48K and 128K RAM accesses
 - Keyboard matrix input
 - Kempston joystick input from an XInput-compatible controller
@@ -22,7 +24,8 @@ Small ZX Spectrum emulator in C for Windows. It uses the Win32 API for display, 
 - `.z80` snapshot loading for 48K and 128K snapshots
 - `.sna` snapshot loading for 48K and 128K snapshots
 - `.szx` ZX-State snapshot loading for original 48K and 128K machines,
-  including zlib-compressed RAM pages, 128K paging, and AY state
+  including zlib-compressed RAM pages, 128K paging, AY state, and ULAplus
+  `PLTT` palette state
 
 ## Not implemented
 
@@ -30,6 +33,7 @@ Small ZX Spectrum emulator in C for Windows. It uses the Win32 API for display, 
   blocks (the first select option is used automatically)
 - 128K SNA snapshots captured with the TR-DOS ROM paged in
 - Full ULA I/O contention timing
+- Optional ULAplus Timex hi-colour and hi-resolution video modes
 - Non-48K/128K `.z80` snapshot models
 - SZX machine variants other than the original 48K and 128K models; SZX
   peripheral blocks are skipped while the core machine state is restored
@@ -92,6 +96,8 @@ Spectrum +3 with one combined 64 KB ROM:
 ## Menu
 
 - `File -> Open Media/Snapshot...` opens `.tap`, `.tzx`, `.dsk`, `.z80`, `.sna`, or `.szx` files
+- Drag one supported tape, disk, or snapshot file onto the emulator window to
+  load it through the same media handling
 - Opening a `.dsk` inserts it as +3 drive `A:`, switches to the +3 model,
   and starts the ROM Loader so bootable disks run automatically
 - `Disk -> Eject Disk` removes the current DSK; sector writes remain in

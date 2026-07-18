@@ -3,6 +3,7 @@
 #include <commdlg.h>
 #include <commctrl.h>
 #include <mmsystem.h>
+#include <shellapi.h>
 #include <xinput.h>
 
 #include <stdbool.h>
@@ -422,6 +423,7 @@ static bool app_load_tape_file(HWND hwnd, AppState *app, const char *path, char 
 static bool app_load_disk_file(HWND hwnd, AppState *app, const char *path, char *error_buffer, size_t error_buffer_size);
 static bool app_apply_loaded_tape(HWND hwnd, AppState *app, TapePlayer *loaded_tape, char *error_buffer, size_t error_buffer_size);
 static bool app_load_snapshot_file(HWND hwnd, AppState *app, const char *path, char *error_buffer, size_t error_buffer_size);
+static bool app_load_media_path(HWND hwnd, AppState *app, const char *path, char *error_buffer, size_t error_buffer_size);
 static bool app_apply_loaded_snapshot(HWND hwnd, AppState *app, AppSnapshotLoadJob *job, char *error_buffer, size_t error_buffer_size);
 static void app_play_tape(AppState *app);
 static void app_stop_tape(AppState *app);
@@ -1502,6 +1504,58 @@ static bool app_load_snapshot_file(
     return true;
 }
 
+/* Routes a media path through the same loaders used by the Open dialog. */
+static bool app_load_media_path(
+    HWND hwnd,
+    AppState *app,
+    const char *path,
+    char *error_buffer,
+    size_t error_buffer_size
+) {
+    const char *extension = strrchr(path, '.');
+
+    if (extension != NULL && _stricmp(extension, ".dsk") == 0) {
+        if (!app_confirm_discard_disk_changes(hwnd, app, "Insert another disk")) {
+            return true;
+        }
+        return app_load_disk_file(
+            hwnd,
+            app,
+            path,
+            error_buffer,
+            error_buffer_size);
+    }
+
+    if (extension != NULL &&
+        (_stricmp(extension, ".tap") == 0 ||
+         _stricmp(extension, ".tzx") == 0)) {
+        return app_load_tape_file(
+            hwnd,
+            app,
+            path,
+            error_buffer,
+            error_buffer_size);
+    }
+
+    if (extension != NULL &&
+        (_stricmp(extension, ".z80") == 0 ||
+         _stricmp(extension, ".sna") == 0 ||
+         _stricmp(extension, ".szx") == 0)) {
+        return app_load_snapshot_file(
+            hwnd,
+            app,
+            path,
+            error_buffer,
+            error_buffer_size);
+    }
+
+    snprintf(
+        error_buffer,
+        error_buffer_size,
+        "Unsupported file type. Open or drop a .tap, .tzx, .dsk, .z80, .sna, or .szx file.");
+    return false;
+}
+
 /* Inserts an already decoded TAP/TZX image, then either auto-starts a standard
    ROM load or leaves the tape inserted for manual control depending on user
    preference. This runs on the main thread after background file decode ends. */
@@ -1923,6 +1977,55 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
             SetWindowLongPtrA(hwnd, GWLP_USERDATA, (LONG_PTR)create->lpCreateParams);
             return TRUE;
         }
+        case WM_CREATE:
+            DragAcceptFiles(hwnd, TRUE);
+            return 0;
+        case WM_DROPFILES: {
+            HDROP drop = (HDROP)wparam;
+            char path[MAX_PATH];
+            char error_buffer[256];
+            const UINT file_count = DragQueryFileA(drop, 0xFFFFFFFFu, NULL, 0);
+            bool path_ready = false;
+
+            ZeroMemory(path, sizeof(path));
+            ZeroMemory(error_buffer, sizeof(error_buffer));
+            if (file_count != 1) {
+                snprintf(
+                    error_buffer,
+                    sizeof(error_buffer),
+                    "Drop one supported media file at a time.");
+            } else {
+                const UINT path_length = DragQueryFileA(drop, 0, NULL, 0);
+                if (path_length == 0 || path_length >= sizeof(path)) {
+                    snprintf(
+                        error_buffer,
+                        sizeof(error_buffer),
+                        "The dropped file path is too long.");
+                } else if (DragQueryFileA(drop, 0, path, sizeof(path)) == 0) {
+                    snprintf(
+                        error_buffer,
+                        sizeof(error_buffer),
+                        "Could not read the dropped file path.");
+                } else {
+                    path_ready = true;
+                }
+            }
+            DragFinish(drop);
+
+            if (app != NULL && path_ready) {
+                if (!app_load_media_path(
+                        hwnd,
+                        app,
+                        path,
+                        error_buffer,
+                        sizeof(error_buffer))) {
+                    app_show_error(error_buffer);
+                }
+            } else if (error_buffer[0] != '\0') {
+                app_show_error(error_buffer);
+            }
+            return 0;
+        }
         case WM_SETCURSOR:
             if (LOWORD(lparam) == HTCLIENT) {
                 SetCursor(LoadCursorA(NULL, IDC_ARROW));
@@ -2062,10 +2165,10 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                         OPENFILENAMEA ofn;
                         char path[MAX_PATH];
                         char error_buffer[256];
-                        const char *extension;
 
                         ZeroMemory(&ofn, sizeof(ofn));
                         ZeroMemory(path, sizeof(path));
+                        ZeroMemory(error_buffer, sizeof(error_buffer));
                         ofn.lStructSize = sizeof(ofn);
                         ofn.hwndOwner = hwnd;
                         ofn.lpstrFilter =
@@ -2076,38 +2179,22 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                             "All Files (*.*)\0*.*\0";
                         ofn.lpstrFile = path;
                         ofn.nMaxFile = MAX_PATH;
-                        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+                        ofn.Flags =
+                            OFN_FILEMUSTEXIST |
+                            OFN_PATHMUSTEXIST |
+                            OFN_HIDEREADONLY |
+                            OFN_NOCHANGEDIR;
                         ofn.lpstrDefExt = "tap";
 
                         if (GetOpenFileNameA(&ofn)) {
-                            extension = strrchr(path, '.');
-                            if (extension != NULL && _stricmp(extension, ".dsk") == 0) {
-                                if (!app_confirm_discard_disk_changes(hwnd, app, "Insert another disk")) {
-                                    return 0;
-                                }
-                                if (!app_load_disk_file(hwnd, app, path, error_buffer, sizeof(error_buffer))) {
-                                    app_show_error(error_buffer);
-                                }
-                                return 0;
+                            if (!app_load_media_path(
+                                    hwnd,
+                                    app,
+                                    path,
+                                    error_buffer,
+                                    sizeof(error_buffer))) {
+                                app_show_error(error_buffer);
                             }
-                            if (extension != NULL &&
-                                (_stricmp(extension, ".tap") == 0 || _stricmp(extension, ".tzx") == 0)) {
-                                if (!app_load_tape_file(hwnd, app, path, error_buffer, sizeof(error_buffer))) {
-                                    app_show_error(error_buffer);
-                                }
-                                return 0;
-                            }
-
-                            if (extension != NULL &&
-                                (_stricmp(extension, ".z80") == 0 || _stricmp(extension, ".sna") == 0 ||
-                                 _stricmp(extension, ".szx") == 0)) {
-                                if (!app_load_snapshot_file(hwnd, app, path, error_buffer, sizeof(error_buffer))) {
-                                    app_show_error(error_buffer);
-                                }
-                                return 0;
-                            }
-
-                            app_show_error("Unsupported file type. Open a .tap, .tzx, .dsk, .z80, .sna, or .szx file.");
                         }
                         return 0;
                     }
@@ -2226,6 +2313,7 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
             DestroyWindow(hwnd);
             return 0;
         case WM_DESTROY:
+            DragAcceptFiles(hwnd, FALSE);
             if (app != NULL) {
                 app_set_modal_loop_timer(app, hwnd, false);
                 if (app->debug.debugger_hwnd != NULL) {
@@ -2537,13 +2625,38 @@ static bool app_rom_set_is_available(const RomSet *set) {
 /* Stores one or two ROM paths into a model-specific bundle, clearing the
    record first so stale secondary paths cannot leak between models. */
 static void app_rom_set_set_paths(RomSet *set, const char *rom_a, const char *rom_b) {
+    char absolute_path[MAX_PATH];
+    DWORD path_length;
+
     ZeroMemory(set, sizeof(*set));
     if (rom_a != NULL && rom_a[0] != '\0') {
-        snprintf(set->rom_a, sizeof(set->rom_a), "%s", rom_a);
+        path_length = GetFullPathNameA(
+            rom_a,
+            (DWORD)sizeof(absolute_path),
+            absolute_path,
+            NULL);
+        snprintf(
+            set->rom_a,
+            sizeof(set->rom_a),
+            "%s",
+            path_length > 0 && path_length < sizeof(absolute_path)
+                ? absolute_path
+                : rom_a);
         set->has_rom_a = true;
     }
     if (rom_b != NULL && rom_b[0] != '\0') {
-        snprintf(set->rom_b, sizeof(set->rom_b), "%s", rom_b);
+        path_length = GetFullPathNameA(
+            rom_b,
+            (DWORD)sizeof(absolute_path),
+            absolute_path,
+            NULL);
+        snprintf(
+            set->rom_b,
+            sizeof(set->rom_b),
+            "%s",
+            path_length > 0 && path_length < sizeof(absolute_path)
+                ? absolute_path
+                : rom_b);
         set->has_rom_b = true;
     }
 }

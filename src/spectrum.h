@@ -109,10 +109,6 @@ void spectrum_notify_disk_changed(Spectrum *spec);
    Win32 framebuffer from the emulator's display buffer. */
 void spectrum_reset(Spectrum *spec);
 
-/* Runs the emulator for approximately one 50 Hz frame and updates the cached
-   32-bit framebuffer that the frontend blits to the window. */
-void spectrum_run_frame(Spectrum *spec);
-
 /* Copies the emulator's indexed framebuffer into the wrapper's 32-bit RGBA
    framebuffer using the palette provided by the chips display descriptor. */
 void spectrum_render_frame(Spectrum *spec);
@@ -152,14 +148,6 @@ bool spectrum_load_snapshot_sna_data(
     size_t error_buffer_size
 );
 
-/* Reads and restores a 48K or 128K SNA snapshot file. */
-bool spectrum_load_snapshot_sna(
-    Spectrum *spec,
-    const char *snapshot_path,
-    char *error_buffer,
-    size_t error_buffer_size
-);
-
 /* Detects a ZX-State container for an original 48K or 128K machine. */
 bool spectrum_detect_snapshot_szx_model_data(
     const uint8_t *data,
@@ -176,30 +164,12 @@ bool spectrum_load_snapshot_szx_data(
     size_t error_buffer_size
 );
 
-/* Reads and restores a 48K or 128K ZX-State snapshot file. */
-bool spectrum_load_snapshot_szx(
-    Spectrum *spec,
-    const char *snapshot_path,
-    char *error_buffer,
-    size_t error_buffer_size
-);
-
 /* Loads a `.z80` snapshot payload that is already resident in memory into the
    wrapped machine, rebuilding to the encoded model when necessary. */
 bool spectrum_load_snapshot_z80_data(
     Spectrum *spec,
     const uint8_t *data,
     size_t data_size,
-    char *error_buffer,
-    size_t error_buffer_size
-);
-
-/* Loads a `.z80` snapshot file into the currently wrapped machine, rebuilding
-   the 48K or 128K backend first when the snapshot format requires a different
-   model than the one that is currently active. */
-bool spectrum_load_snapshot_z80(
-    Spectrum *spec,
-    const char *snapshot_path,
     char *error_buffer,
     size_t error_buffer_size
 );

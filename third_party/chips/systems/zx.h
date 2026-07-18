@@ -69,7 +69,7 @@ extern "C" {
 #endif
 
 // bump this whenever the zx_t struct layout changes
-#define ZX_SNAPSHOT_VERSION (0x0005)
+#define ZX_SNAPSHOT_VERSION (0x0006)
 
 #define ZX_MAX_AUDIO_SAMPLES (1024)      // max number of audio samples in internal sample buffer
 #define ZX_DEFAULT_AUDIO_SAMPLES (128)   // default number of samples in internal sample buffer
@@ -79,6 +79,8 @@ extern "C" {
 #define ZX_DISPLAY_WIDTH (320)
 #define ZX_DISPLAY_HEIGHT (256)
 #define ZX_PLUS3_MAX_SECTOR_SIZE (8192)
+#define ZX_ULAPLUS_PALETTE_SIZE (64)
+#define ZX_ULAPLUS_MAX_SCANLINE_EVENTS (64)
 
 // ZX Spectrum models
 typedef enum {
@@ -195,6 +197,22 @@ typedef struct {
     uint8_t last_fe_out;        // last out value to 0xFE port
     uint8_t blink_counter;      // incremented on each vblank
     uint8_t border_color;
+    uint8_t ulaplus_register;
+    uint8_t ulaplus_mode;
+    uint8_t ulaplus_palette[ZX_ULAPLUS_PALETTE_SIZE];
+    uint32_t ulaplus_colors[256];
+    bool ulaplus_enabled;
+    uint8_t ulaplus_line_palette[ZX_ULAPLUS_PALETTE_SIZE];
+    bool ulaplus_line_enabled;
+    bool ulaplus_scanline_enabled[ZX_FRAMEBUFFER_HEIGHT];
+    struct {
+        uint16_t tstate;
+        uint8_t register_index;
+        uint8_t value;
+    } ulaplus_line_events[ZX_ULAPLUS_MAX_SCANLINE_EVENTS];
+    uint8_t ulaplus_line_event_count;
+    bool ulaplus_io_cycle_active;
+    uint8_t ulaplus_io_wait_remaining;
     int frame_scan_lines;
     int top_border_scanlines;
     int scanline_period;
@@ -266,6 +284,8 @@ void zx_discard(zx_t* sys);
 void zx_reset(zx_t* sys);
 // query information about display requirements, can be called with nullptr
 chips_display_info_t zx_display_info(zx_t* sys);
+// resolve one indexed framebuffer pixel to the colour active on its scanline
+uint32_t zx_display_color(const zx_t* sys, int y, uint8_t color_index);
 // run ZX Spectrum instance for a given number of microseconds, return number of ticks
 uint32_t zx_exec(zx_t* sys, uint32_t micro_seconds);
 // send a key-down event
@@ -322,6 +342,136 @@ static bool _zx_should_apply_memory_contention(zx_t* sys, uint64_t pins);
 #define _ZX_48K_FREQUENCY (3500000)
 #define _ZX_128_FREQUENCY (3546894)
 
+static const uint32_t _zx_standard_palette[16] = {
+    0xFF000000,     // std black
+    0xFFD70000,     // std blue
+    0xFF0000D7,     // std red
+    0xFFD700D7,     // std magenta
+    0xFF00D700,     // std green
+    0xFFD7D700,     // std cyan
+    0xFF00D7D7,     // std yellow
+    0xFFD7D7D7,     // std white
+    0xFF000000,     // bright black
+    0xFFFF0000,     // bright blue
+    0xFF0000FF,     // bright red
+    0xFFFF00FF,     // bright magenta
+    0xFF00FF00,     // bright green
+    0xFFFFFF00,     // bright cyan
+    0xFF00FFFF,     // bright yellow
+    0xFFFFFFFF,     // bright white
+};
+
+/* The standard Spectrum colours expressed in the official ULAplus G3R3B2
+   format. Keeping a useful reset palette avoids a black display if software
+   enables palette mode before replacing every entry. */
+static const uint8_t _zx_ulaplus_default_palette[ZX_ULAPLUS_PALETTE_SIZE] = {
+    0x00, 0x02, 0x18, 0x1B, 0xC0, 0xC3, 0xD8, 0xDB,
+    0x00, 0x02, 0x18, 0x1B, 0xC0, 0xC3, 0xD8, 0xDB,
+    0x00, 0x03, 0x1C, 0x1F, 0xE0, 0xE3, 0xFC, 0xFF,
+    0x00, 0x03, 0x1C, 0x1F, 0xE0, 0xE3, 0xFC, 0xFF,
+    0xDB, 0xD8, 0xC3, 0xC0, 0x1B, 0x18, 0x02, 0x00,
+    0xDB, 0xD8, 0xC3, 0xC0, 0x1B, 0x18, 0x02, 0x00,
+    0xFF, 0xFC, 0xE3, 0xE0, 0x1F, 0x1C, 0x03, 0x00,
+    0xFF, 0xFC, 0xE3, 0xE0, 0x1F, 0x1C, 0x03, 0x00,
+};
+
+static uint32_t _zx_ulaplus_decode_color(uint8_t color) {
+    const uint8_t green3 = color >> 5;
+    const uint8_t red3 = (color >> 2) & 7;
+    const uint8_t blue2 = color & 3;
+    const uint8_t blue3 = (uint8_t)((blue2 << 1) | (blue2 & 1));
+    const uint8_t red8 = (uint8_t)((red3 << 5) | (red3 << 2) | (red3 & 3));
+    const uint8_t green8 = (uint8_t)((green3 << 5) | (green3 << 2) | (green3 & 3));
+    const uint8_t blue8 = (uint8_t)((blue3 << 5) | (blue3 << 2) | (blue3 & 3));
+    return 0xFF000000u |
+        ((uint32_t)blue8 << 16) |
+        ((uint32_t)green8 << 8) |
+        red8;
+}
+
+static void _zx_ulaplus_begin_scanline(zx_t* sys) {
+    memcpy(
+        sys->ulaplus_line_palette,
+        sys->ulaplus_palette,
+        sizeof(sys->ulaplus_line_palette));
+    sys->ulaplus_line_enabled = sys->ulaplus_enabled;
+    sys->ulaplus_line_event_count = 0;
+}
+
+static void _zx_ulaplus_reset(zx_t* sys) {
+    sys->ulaplus_register = 0;
+    sys->ulaplus_mode = 0;
+    sys->ulaplus_enabled = false;
+    sys->ulaplus_io_cycle_active = false;
+    sys->ulaplus_io_wait_remaining = 0;
+    memcpy(
+        sys->ulaplus_palette,
+        _zx_ulaplus_default_palette,
+        sizeof(sys->ulaplus_palette));
+    memset(
+        sys->ulaplus_scanline_enabled,
+        0,
+        sizeof(sys->ulaplus_scanline_enabled));
+    _zx_ulaplus_begin_scanline(sys);
+}
+
+static void _zx_ulaplus_record_event(
+    zx_t* sys,
+    uint8_t register_index,
+    uint8_t value)
+{
+    uint16_t line_tstate = 0;
+    if (sys->scanline_period > 0) {
+        int elapsed = sys->scanline_period - sys->scanline_counter;
+        if (elapsed < 0) {
+            elapsed = 0;
+        }
+        else if (elapsed >= sys->scanline_period) {
+            elapsed = sys->scanline_period - 1;
+        }
+        line_tstate = (uint16_t)elapsed;
+    }
+
+    if (sys->ulaplus_line_event_count > 0) {
+        const uint8_t previous = (uint8_t)(sys->ulaplus_line_event_count - 1);
+        if ((sys->ulaplus_line_events[previous].register_index == register_index) &&
+            (sys->ulaplus_line_events[previous].value == value)) {
+            return;
+        }
+    }
+    if (sys->ulaplus_line_event_count < ZX_ULAPLUS_MAX_SCANLINE_EVENTS) {
+        const uint8_t event = sys->ulaplus_line_event_count++;
+        sys->ulaplus_line_events[event].tstate = line_tstate;
+        sys->ulaplus_line_events[event].register_index = register_index;
+        sys->ulaplus_line_events[event].value = value;
+    }
+}
+
+static void _zx_ulaplus_write_data(zx_t* sys, uint8_t data) {
+    const uint8_t group = sys->ulaplus_register >> 6;
+    if (group == 0) {
+        const uint8_t palette_index = sys->ulaplus_register & 0x3F;
+        _zx_ulaplus_record_event(sys, palette_index, data);
+        sys->ulaplus_palette[palette_index] = data;
+    }
+    else if (group == 1) {
+        _zx_ulaplus_record_event(sys, ZX_ULAPLUS_PALETTE_SIZE, data);
+        sys->ulaplus_mode = data;
+        sys->ulaplus_enabled = (data & 1) != 0;
+    }
+}
+
+static uint8_t _zx_ulaplus_read_data(const zx_t* sys) {
+    const uint8_t group = sys->ulaplus_register >> 6;
+    if (group == 0) {
+        return sys->ulaplus_palette[sys->ulaplus_register & 0x3F];
+    }
+    if (group == 1) {
+        return sys->ulaplus_mode;
+    }
+    return 0xFF;
+}
+
 void zx_init(zx_t* sys, const zx_desc_t* desc) {
     CHIPS_ASSERT(sys && desc);
     if (desc->debug.callback.func) { CHIPS_ASSERT(desc->debug.stopped); }
@@ -346,6 +496,10 @@ void zx_init(zx_t* sys, const zx_desc_t* desc) {
 
     // initalize the hardware
     sys->border_color = 0;
+    for (unsigned color = 0; color < 256; color++) {
+        sys->ulaplus_colors[color] = _zx_ulaplus_decode_color((uint8_t)color);
+    }
+    _zx_ulaplus_reset(sys);
     if (ZX_TYPE_128 == sys->type) {
         CHIPS_ASSERT(desc->roms.zx128_0.ptr && (desc->roms.zx128_0.size == 0x4000));
         CHIPS_ASSERT(desc->roms.zx128_1.ptr && (desc->roms.zx128_1.size == 0x4000));
@@ -422,6 +576,7 @@ void zx_reset(zx_t* sys) {
     sys->scanline_counter = sys->scanline_period;
     sys->scanline_y = 0;
     sys->blink_counter = 0;
+    _zx_ulaplus_reset(sys);
     if (sys->type == ZX_TYPE_48K) {
         sys->display_ram_bank = 0;
     }
@@ -460,10 +615,53 @@ static bool _zx_decode_scanline(zx_t* sys) {
         uint8_t* dst = &sys->fb[y * ZX_FRAMEBUFFER_WIDTH];
         const uint8_t* vidmem_bank = sys->ram[sys->display_ram_bank];
         const bool blink = 0 != (sys->blink_counter & 0x10);
+        uint8_t line_palette[ZX_ULAPLUS_PALETTE_SIZE];
+        uint8_t event_index = 0;
+        bool palette_enabled = sys->ulaplus_line_enabled;
+        bool resolved_color_line = palette_enabled;
+        memcpy(line_palette, sys->ulaplus_line_palette, sizeof(line_palette));
+        for (uint8_t event = 0; event < sys->ulaplus_line_event_count; event++) {
+            if (sys->ulaplus_line_events[event].register_index == ZX_ULAPLUS_PALETTE_SIZE) {
+                resolved_color_line = true;
+                break;
+            }
+        }
+        sys->ulaplus_scanline_enabled[y] = resolved_color_line;
+
+#define _ZX_APPLY_ULAPLUS_EVENTS(tstate_) do { \
+            while ((event_index < sys->ulaplus_line_event_count) && \
+                   (sys->ulaplus_line_events[event_index].tstate <= (tstate_))) { \
+                const uint8_t event_register = \
+                    sys->ulaplus_line_events[event_index].register_index; \
+                const uint8_t event_value = \
+                    sys->ulaplus_line_events[event_index].value; \
+                if (event_register < ZX_ULAPLUS_PALETTE_SIZE) { \
+                    line_palette[event_register] = event_value; \
+                } \
+                else { \
+                    palette_enabled = (event_value & 1) != 0; \
+                } \
+                event_index++; \
+            } \
+        } while (0)
+
+#define _ZX_RESOLVE_PIXEL(std_index_, ulaplus_index_) \
+            (resolved_color_line \
+                ? (palette_enabled \
+                    ? line_palette[(ulaplus_index_) & 0x3F] \
+                    : _zx_ulaplus_default_palette[(std_index_) & 0x0F]) \
+                : (std_index_))
+
         if ((y < 32) || (y >= 224)) {
             // upper/lower border
             for (int x = 0; x < ZX_DISPLAY_WIDTH; x++) {
-                *dst++ = sys->border_color;
+                /* The cropped display begins eight t-states into the
+                   hardware line; the full left border is 24 t-states. */
+                const uint16_t tstate = (uint16_t)(8 + (x >> 1));
+                _ZX_APPLY_ULAPLUS_EVENTS(tstate);
+                *dst++ = _ZX_RESOLVE_PIXEL(
+                    sys->border_color,
+                    (uint8_t)(8 + (sys->border_color & 7)));
             }
         }
         else {
@@ -477,7 +675,10 @@ static bool _zx_decode_scanline(zx_t* sys) {
 
             // left border
             for (int x = 0; x < (4*8); x++) {
-                *dst++ = sys->border_color;
+                _ZX_APPLY_ULAPLUS_EVENTS((uint16_t)(8 + (x >> 1)));
+                *dst++ = _ZX_RESOLVE_PIXEL(
+                    sys->border_color,
+                    (uint8_t)(8 + (sys->border_color & 7)));
             }
 
             // valid 256x192 vidmem area
@@ -490,32 +691,48 @@ static bool _zx_decode_scanline(zx_t* sys) {
                 const uint8_t clr = vidmem_bank[clr_offset];
 
                 // foreground and background color
-                uint8_t fg, bg;
+                uint8_t std_fg, std_bg;
+                uint8_t ulaplus_fg, ulaplus_bg;
+                const uint8_t clut = (clr >> 6) * 16;
+                ulaplus_fg = clut | (clr & 7);
+                ulaplus_bg = clut | 8 | ((clr >> 3) & 7);
                 if ((clr & (1<<7)) && blink) {
-                    fg = (clr>>3) & 7;
-                    bg = clr & 7;
+                    std_fg = (clr>>3) & 7;
+                    std_bg = clr & 7;
                 }
                 else {
-                    fg = clr & 7;
-                    bg = (clr>>3) & 7;
+                    std_fg = clr & 7;
+                    std_bg = (clr>>3) & 7;
                 }
                 // color bit 6: standard vs bright
-                fg |= (clr & (1<<6)) >> 3;
-                bg |= (clr & (1<<6)) >> 3;
+                std_fg |= (clr & (1<<6)) >> 3;
+                std_bg |= (clr & (1<<6)) >> 3;
 
                 for (int px = 7; px >=0; px--) {
-                    *dst++ = pix & (1<<px) ? fg : bg;
+                    const uint16_t screen_x = (uint16_t)((x * 8) + (7 - px));
+                    _ZX_APPLY_ULAPLUS_EVENTS(
+                        (uint16_t)(24 + (screen_x >> 1)));
+                    *dst++ = pix & (1<<px)
+                        ? _ZX_RESOLVE_PIXEL(std_fg, ulaplus_fg)
+                        : _ZX_RESOLVE_PIXEL(std_bg, ulaplus_bg);
                 }
             }
 
             // right border
             for (int x = 0; x < (4*8); x++) {
-                *dst++ = sys->border_color;
+                _ZX_APPLY_ULAPLUS_EVENTS((uint16_t)(152 + (x >> 1)));
+                *dst++ = _ZX_RESOLVE_PIXEL(
+                    sys->border_color,
+                    (uint8_t)(8 + (sys->border_color & 7)));
             }
         }
+
+#undef _ZX_RESOLVE_PIXEL
+#undef _ZX_APPLY_ULAPLUS_EVENTS
     }
 
-    if (sys->scanline_y++ >= sys->frame_scan_lines) {
+    _zx_ulaplus_begin_scanline(sys);
+    if (++sys->scanline_y >= sys->frame_scan_lines) {
         // start new frame, request vblank interrupt
         sys->scanline_y = 0;
         sys->blink_counter++;
@@ -1269,19 +1486,37 @@ static bool _zx_is_contended_addr(zx_t* sys, uint16_t addr) {
     return false;
 }
 
-/* Ferranti ULA machines can be stalled whenever a contended address is on the
-   bus. */
+/* Ferranti ULA machines stall accesses to contended RAM while fetching the
+   active display. */
 static bool _zx_should_apply_memory_contention(zx_t* sys, uint64_t pins) {
-    if (!_zx_is_contended_addr(sys, Z80_GET_ADDR(pins))) {
-        return false;
-    }
-    return 0 == (pins & Z80_IORQ);
+    return (pins & Z80_MREQ) && _zx_is_contended_addr(sys, Z80_GET_ADDR(pins));
 }
 
 static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
     bool new_frame = false;
 
-    if (_zx_contention_delay(sys) > 0 && _zx_should_apply_memory_contention(sys, pins)) {
+    const bool ulaplus_io_cycle =
+        (pins & Z80_IORQ) &&
+        ((Z80_GET_ADDR(pins) == 0xBF3B) || (Z80_GET_ADDR(pins) == 0xFF3B));
+    /* ULAplus I/O uses the same bus-contention slots as the ULA. Keep the
+       complete delay after chips' Z80 temporarily drops IORQ while repeating
+       its WAIT sampling state. */
+    if (!ulaplus_io_cycle && (sys->ulaplus_io_wait_remaining == 0)) {
+        sys->ulaplus_io_cycle_active = false;
+    }
+    else if (!sys->ulaplus_io_cycle_active) {
+        sys->ulaplus_io_cycle_active = true;
+        sys->ulaplus_io_wait_remaining =
+            _zx_contention_delay(sys);
+    }
+
+    if (sys->ulaplus_io_cycle_active &&
+        (sys->ulaplus_io_wait_remaining > 0)) {
+        pins |= Z80_WAIT;
+        sys->ulaplus_io_wait_remaining--;
+    }
+    else if (!ulaplus_io_cycle && _zx_contention_delay(sys) > 0 &&
+        _zx_should_apply_memory_contention(sys, pins)) {
         pins |= Z80_WAIT;
     }
     else {
@@ -1330,6 +1565,7 @@ static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
         }
     }
     else if ((pins & Z80_IORQ) && !(pins & Z80_M1)) {
+        const uint16_t io_addr = Z80_GET_ADDR(pins);
         if ((pins & Z80_A0) == 0) {
             /* Spectrum ULA (...............0)
                 Bits 5 and 7 as read by INning from Port 0xfe are always one
@@ -1360,6 +1596,17 @@ static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
                 sys->border_color = data & 7;
                 sys->last_fe_out = data;
                 beeper_set(&sys->beeper, 0 != (data & (1<<4)));
+            }
+        }
+        else if ((io_addr == 0xBF3B) && (pins & Z80_WR)) {
+            sys->ulaplus_register = Z80_GET_DATA(pins);
+        }
+        else if (io_addr == 0xFF3B) {
+            if (pins & Z80_RD) {
+                Z80_SET_DATA(pins, _zx_ulaplus_read_data(sys));
+            }
+            else if (pins & Z80_WR) {
+                _zx_ulaplus_write_data(sys, Z80_GET_DATA(pins));
             }
         }
         else if ((pins & Z80_WR) && (sys->type == ZX_TYPE_PLUS3) &&
@@ -1913,25 +2160,16 @@ bool zx_quickload(zx_t* sys, chips_range_t data) {
     return true;
 }
 
+uint32_t zx_display_color(const zx_t* sys, int y, uint8_t color_index) {
+    CHIPS_ASSERT(sys && sys->valid);
+    CHIPS_ASSERT((y >= 0) && (y < ZX_FRAMEBUFFER_HEIGHT));
+    if (sys->ulaplus_scanline_enabled[y]) {
+        return sys->ulaplus_colors[color_index];
+    }
+    return _zx_standard_palette[color_index & 0x0F];
+}
+
 chips_display_info_t zx_display_info(zx_t* sys) {
-    static const uint32_t palette[16] = {
-        0xFF000000,     // std black
-        0xFFD70000,     // std blue
-        0xFF0000D7,     // std red
-        0xFFD700D7,     // std magenta
-        0xFF00D700,     // std green
-        0xFFD7D700,     // std cyan
-        0xFF00D7D7,     // std yellow
-        0xFFD7D7D7,     // std white
-        0xFF000000,     // bright black
-        0xFFFF0000,     // bright blue
-        0xFF0000FF,     // bright red
-        0xFFFF00FF,     // bright magenta
-        0xFF00FF00,     // bright green
-        0xFFFFFF00,     // bright cyan
-        0xFF00FFFF,     // bright yellow
-        0xFFFFFFFF,     // bright white
-    };
     const chips_display_info_t res = {
         .frame = {
             .dim = {
@@ -1951,8 +2189,8 @@ chips_display_info_t zx_display_info(zx_t* sys) {
             .height = ZX_DISPLAY_HEIGHT,
         },
         .palette = {
-            .ptr = (void*)palette,
-            .size = sizeof(palette),
+            .ptr = (void*)_zx_standard_palette,
+            .size = sizeof(_zx_standard_palette),
         }
     };
     CHIPS_ASSERT(((sys == 0) && (res.frame.buffer.ptr == 0)) || ((sys != 0) && (res.frame.buffer.ptr != 0)));

@@ -1540,7 +1540,11 @@ static bool app_assembler_load_source(HWND hwnd, AppState *app, char *status_buf
         "All Files (*.*)\0*.*\0";
     ofn.lpstrFile = path;
     ofn.nMaxFile = MAX_PATH;
-    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+    ofn.Flags =
+        OFN_FILEMUSTEXIST |
+        OFN_PATHMUSTEXIST |
+        OFN_HIDEREADONLY |
+        OFN_NOCHANGEDIR;
     ofn.lpstrDefExt = "asm";
 
     if (!GetOpenFileNameA(&ofn)) {
@@ -1654,7 +1658,7 @@ static bool app_assembler_save_source_as(HWND hwnd, AppState *app, char *status_
         "All Files (*.*)\0*.*\0";
     ofn.lpstrFile = path;
     ofn.nMaxFile = MAX_PATH;
-    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
     ofn.lpstrDefExt = "asm";
 
     if (!GetSaveFileNameA(&ofn)) {
@@ -1750,7 +1754,7 @@ static bool app_assembler_export_tap(HWND hwnd, AppState *app, char *status_buff
         "All Files (*.*)\0*.*\0";
     ofn.lpstrFile = path;
     ofn.nMaxFile = MAX_PATH;
-    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
     ofn.lpstrDefExt = "tap";
 
     if (!GetSaveFileNameA(&ofn)) {

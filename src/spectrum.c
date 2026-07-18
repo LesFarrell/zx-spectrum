@@ -19,8 +19,6 @@ enum
 {
     ZX_HOST_KEY_CAPS_SHIFT = 1,
     ZX_HOST_KEY_SYMBOL_SHIFT = 2,
-    ZX_48K_FRAME_US = 19968,
-    ZX_128K_FRAME_US = 19992,
     SNA_HEADER_SIZE = 27,
     SNA_RAM_BANK_SIZE = 0x4000,
     SNA_48K_SIZE = SNA_HEADER_SIZE + (3 * SNA_RAM_BANK_SIZE),
@@ -85,50 +83,6 @@ static bool spectrum_load_file_exact(const char *path, uint8_t *buffer, size_t m
     {
         *actual_size = (size_t)size;
     }
-    return true;
-}
-
-/* Reads an entire file into a freshly allocated heap buffer so container
-   formats such as `.z80` snapshots can be passed intact to the chips loader. */
-static bool spectrum_load_file_all(const char *path, uint8_t **buffer, size_t *size)
-{
-    FILE *file = fopen(path, "rb");
-    uint8_t *data = NULL;
-
-    if (file == NULL)
-    {
-        return false;
-    }
-    if (fseek(file, 0, SEEK_END) != 0)
-    {
-        fclose(file);
-        return false;
-    }
-
-    long file_size = ftell(file);
-    if (file_size <= 0)
-    {
-        fclose(file);
-        return false;
-    }
-    rewind(file);
-
-    data = (uint8_t *)malloc((size_t)file_size);
-    if (data == NULL)
-    {
-        fclose(file);
-        return false;
-    }
-    if (fread(data, 1, (size_t)file_size, file) != (size_t)file_size)
-    {
-        free(data);
-        fclose(file);
-        return false;
-    }
-    fclose(file);
-
-    *buffer = data;
-    *size = (size_t)file_size;
     return true;
 }
 
@@ -503,7 +457,6 @@ void spectrum_render_frame(Spectrum *spec)
     }
 
     const uint8_t *src = (const uint8_t *)spec->display.frame.buffer.ptr;
-    const uint32_t *palette = (const uint32_t *)spec->display.palette.ptr;
     const int pitch = spec->display.frame.dim.width;
 
     for (int y = 0; y < ZX_SCREEN_HEIGHT; ++y)
@@ -512,35 +465,13 @@ void spectrum_render_frame(Spectrum *spec)
         uint32_t *dst_row = &spec->framebuffer[y * ZX_SCREEN_WIDTH];
         for (int x = 0; x < ZX_SCREEN_WIDTH; ++x)
         {
-            uint32_t color = palette[src_row[x] & 0x0F];
+            uint32_t color = zx_display_color(&spec->machine, y, src_row[x]);
             dst_row[x] =
                 ((color & 0x000000FFu) << 16) |
                 (color & 0x0000FF00u) |
                 ((color & 0x00FF0000u) >> 16);
         }
     }
-}
-
-/* Advances the machine by about one 50 Hz frame and then refreshes the cached
-   frontend framebuffer from the emulator's current display buffer. */
-void spectrum_run_frame(Spectrum *spec)
-{
-    uint32_t frame_us;
-
-    if (!spec->machine_ready)
-    {
-        return;
-    }
-    if (spec->model == SPECTRUM_MODEL_48K)
-    {
-        frame_us = ZX_48K_FRAME_US;
-    }
-    else
-    {
-        frame_us = ZX_128K_FRAME_US;
-    }
-    zx_exec(&spec->machine, frame_us);
-    spectrum_render_frame(spec);
 }
 
 /* Delivers a host key press to the embedded chips keyboard handler when the
@@ -659,6 +590,7 @@ bool spectrum_load_snapshot_sna_data(
             return false;
         }
     }
+    _zx_ulaplus_reset(&spec->machine);
 
     if (snapshot_model == SPECTRUM_MODEL_48K)
     {
@@ -709,40 +641,16 @@ bool spectrum_load_snapshot_sna_data(
     return true;
 }
 
-bool spectrum_load_snapshot_sna(
-    Spectrum *spec,
-    const char *snapshot_path,
-    char *error_buffer,
-    size_t error_buffer_size)
-{
-    uint8_t *data = NULL;
-    size_t data_size = 0;
-    bool ok;
-
-    if (!spectrum_load_file_all(snapshot_path, &data, &data_size))
-    {
-        snprintf(error_buffer, error_buffer_size, "Could not read snapshot file: %s", snapshot_path);
-        return false;
-    }
-    ok = spectrum_load_snapshot_sna_data(spec, data, data_size, error_buffer, error_buffer_size);
-    if (!ok && error_buffer[0] != '\0')
-    {
-        char message[256];
-        snprintf(message, sizeof(message), "%s: %s", error_buffer, snapshot_path);
-        snprintf(error_buffer, error_buffer_size, "%s", message);
-    }
-    free(data);
-    return ok;
-}
-
 enum {
     SZX_HEADER_SIZE = 8,
     SZX_BLOCK_HEADER_SIZE = 8,
     SZX_Z80R_SIZE = 37,
     SZX_SPCR_SIZE = 8,
     SZX_AY_SIZE = 18,
+    SZX_PLTT_SIZE = 67,
     SZX_PAGE_SIZE = 0x4000,
-    SZX_RAMP_COMPRESSED = 1
+    SZX_RAMP_COMPRESSED = 1,
+    SZX_PLTT_ENABLED = 1
 };
 
 typedef struct SpectrumSzxState {
@@ -750,11 +658,15 @@ typedef struct SpectrumSzxState {
     uint8_t z80[SZX_Z80R_SIZE];
     uint8_t spcr[SZX_SPCR_SIZE];
     uint8_t ay[SZX_AY_SIZE];
+    uint8_t ulaplus_palette[ZX_ULAPLUS_PALETTE_SIZE];
+    uint8_t ulaplus_register;
     uint8_t *pages[8];
     uint8_t page_mask;
     bool has_z80;
     bool has_spcr;
     bool has_ay;
+    bool has_ulaplus;
+    bool ulaplus_enabled;
 } SpectrumSzxState;
 
 bool spectrum_detect_snapshot_szx_model_data(
@@ -857,6 +769,22 @@ static bool spectrum_parse_szx(
             }
             memcpy(state->ay, payload, sizeof(state->ay));
             state->has_ay = true;
+        }
+        else if (memcmp(header, "PLTT", 4) == 0)
+        {
+            if (state->has_ulaplus || payload_size != SZX_PLTT_SIZE ||
+                (payload[0] & ~SZX_PLTT_ENABLED) != 0)
+            {
+                snprintf(error_buffer, error_buffer_size, "Invalid or duplicate SZX PLTT block.");
+                goto fail;
+            }
+            state->ulaplus_enabled = (payload[0] & SZX_PLTT_ENABLED) != 0;
+            state->ulaplus_register = payload[1];
+            memcpy(
+                state->ulaplus_palette,
+                payload + 2,
+                sizeof(state->ulaplus_palette));
+            state->has_ulaplus = true;
         }
         else if (memcmp(header, "RAMP", 4) == 0)
         {
@@ -1038,6 +966,18 @@ bool spectrum_load_snapshot_szx_data(
             ay38910_set_addr_latch(&spec->machine.ay, state.ay[1] & 0x0Fu);
         }
     }
+    _zx_ulaplus_reset(&spec->machine);
+    if (state.has_ulaplus)
+    {
+        spec->machine.ulaplus_register = state.ulaplus_register;
+        spec->machine.ulaplus_enabled = state.ulaplus_enabled;
+        spec->machine.ulaplus_mode = state.ulaplus_enabled ? 1 : 0;
+        memcpy(
+            spec->machine.ulaplus_palette,
+            state.ulaplus_palette,
+            sizeof(spec->machine.ulaplus_palette));
+        _zx_ulaplus_begin_scanline(&spec->machine);
+    }
     spectrum_restore_szx_cpu(&spec->machine, state.z80);
     spectrum_restore_szx_timing(&spec->machine, state.z80);
     spec->machine.border_color = state.spcr[0] & 0x07u;
@@ -1046,31 +986,6 @@ bool spectrum_load_snapshot_szx_data(
     spectrum_discard_szx_state(&state);
     spectrum_render_frame(spec);
     return true;
-}
-
-bool spectrum_load_snapshot_szx(
-    Spectrum *spec,
-    const char *snapshot_path,
-    char *error_buffer,
-    size_t error_buffer_size)
-{
-    uint8_t *data = NULL;
-    size_t data_size = 0;
-    bool ok;
-    if (!spectrum_load_file_all(snapshot_path, &data, &data_size))
-    {
-        snprintf(error_buffer, error_buffer_size, "Could not read snapshot file: %s", snapshot_path);
-        return false;
-    }
-    ok = spectrum_load_snapshot_szx_data(spec, data, data_size, error_buffer, error_buffer_size);
-    if (!ok && error_buffer[0] != '\0')
-    {
-        char message[256];
-        snprintf(message, sizeof(message), "%s: %s", error_buffer, snapshot_path);
-        snprintf(error_buffer, error_buffer_size, "%s", message);
-    }
-    free(data);
-    return ok;
 }
 
 /* Loads a `.z80` snapshot file, switches the backend model when necessary,
@@ -1109,33 +1024,7 @@ bool spectrum_load_snapshot_z80_data(
         return false;
     }
 
+    _zx_ulaplus_reset(&spec->machine);
     spectrum_render_frame(spec);
     return true;
-}
-
-bool spectrum_load_snapshot_z80(
-    Spectrum *spec,
-    const char *snapshot_path,
-    char *error_buffer,
-    size_t error_buffer_size)
-{
-    uint8_t *data = NULL;
-    size_t data_size = 0;
-    bool ok = false;
-
-    if (!spectrum_load_file_all(snapshot_path, &data, &data_size))
-    {
-        snprintf(error_buffer, error_buffer_size, "Could not read snapshot file: %s", snapshot_path);
-        return false;
-    }
-
-    ok = spectrum_load_snapshot_z80_data(spec, data, data_size, error_buffer, error_buffer_size);
-    if (!ok && error_buffer[0] != '\0')
-    {
-        char message[256];
-        snprintf(message, sizeof(message), "%s: %s", error_buffer, snapshot_path);
-        snprintf(error_buffer, error_buffer_size, "%s", message);
-    }
-    free(data);
-    return ok;
 }
