@@ -399,7 +399,15 @@ bool dsk_get_sector_id(
     if (track == NULL || track->sector_count == 0) {
         return false;
     }
-    sector = &track->sectors[index % track->sector_count];
+    /*
+        The controller uses a failed lookup to detect the index hole and wrap
+        to the first sector.  Returning a modulo-indexed sector here hid the
+        physical end of a track and made Read ID drift independently forever.
+    */
+    if (index >= track->sector_count) {
+        return false;
+    }
+    sector = &track->sectors[index];
     if (out_c != NULL) {
         *out_c = sector->c;
     }

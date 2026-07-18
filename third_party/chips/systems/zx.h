@@ -241,8 +241,14 @@ typedef struct {
         uint8_t transfer_eot;
         uint8_t transfer_st1;
         uint8_t transfer_st2;
+        uint8_t last_bad_c;
+        uint8_t last_bad_h;
+        uint8_t last_bad_r;
+        uint8_t last_bad_n;
+        uint8_t bad_sector_repeats;
         uint32_t transfer_size;
         uint32_t transfer_pos;
+        uint32_t data_ready_tick;
         uint8_t transfer[ZX_PLUS3_MAX_SECTOR_SIZE];
         bool interrupt_pending;
     } plus3_fdc;
@@ -614,16 +620,25 @@ static bool _zx_plus3_disk_ready(const zx_t* sys, uint8_t drive) {
     return sys->disk_ready != 0 && sys->disk_ready(sys->disk_user_data, drive);
 }
 
+static bool _zx_plus3_fdc_data_ready(const zx_t* sys) {
+    return (int32_t)(sys->tick_count - sys->plus3_fdc.data_ready_tick) >= 0;
+}
+
+static uint32_t _zx_plus3_fdc_byte_ticks(const zx_t* sys) {
+    const uint32_t ticks = (uint32_t)(sys->freq_hz / 31250);
+    return ticks != 0 ? ticks : 1;
+}
+
 /* Reports the uPD765 phase through RQM, DIO, non-DMA, and busy bits. */
 static uint8_t _zx_plus3_fdc_status(const zx_t* sys) {
     if (sys->plus3_fdc.result_index < sys->plus3_fdc.result_count) {
         return 0xD0; /* RQM | DIO | controller busy */
     }
     if (sys->plus3_fdc.transfer_mode == _ZX_PLUS3_FDC_TRANSFER_READ) {
-        return 0xF0; /* RQM | DIO | non-DMA | controller busy */
+        return (uint8_t)(_zx_plus3_fdc_data_ready(sys) ? 0xF0 : 0x70);
     }
     if (sys->plus3_fdc.transfer_mode == _ZX_PLUS3_FDC_TRANSFER_WRITE) {
-        return 0xB0; /* RQM | non-DMA | controller busy */
+        return (uint8_t)(_zx_plus3_fdc_data_ready(sys) ? 0xB0 : 0x30);
     }
     if (sys->plus3_fdc.param_count < sys->plus3_fdc.param_expected) {
         return 0x90; /* RQM | controller busy */
@@ -645,6 +660,95 @@ static void _zx_plus3_fdc_set_results(
     sys->plus3_fdc.transfer_mode = _ZX_PLUS3_FDC_TRANSFER_NONE;
     sys->plus3_fdc.transfer_pos = 0;
     sys->plus3_fdc.transfer_size = 0;
+}
+
+/*
+    Enumerate a track in descriptor order.  dsk_get_sector_id() returns false
+    at the index hole, allowing the controller to keep Read ID and data
+    commands on one shared rotational position.
+*/
+static uint8_t _zx_plus3_fdc_sector_count(
+    zx_t* sys,
+    uint8_t drive,
+    uint8_t cylinder,
+    uint8_t head)
+{
+    uint8_t count = 0;
+    if (sys->disk_sector_id == 0) {
+        return 0;
+    }
+    while (count != 0xFF &&
+           sys->disk_sector_id(
+               sys->disk_user_data, drive, cylinder, head, count,
+               0, 0, 0, 0, 0, 0)) {
+        count++;
+    }
+    return count;
+}
+
+static bool _zx_plus3_fdc_next_id(
+    zx_t* sys,
+    uint8_t drive,
+    uint8_t cylinder,
+    uint8_t head,
+    uint8_t* c,
+    uint8_t* h,
+    uint8_t* r,
+    uint8_t* n,
+    uint8_t* st1,
+    uint8_t* st2)
+{
+    const uint8_t count =
+        _zx_plus3_fdc_sector_count(sys, drive, cylinder, head);
+    if (count == 0) {
+        return false;
+    }
+    uint8_t index = sys->plus3_fdc.id_index[drive][head];
+    if (index >= count) {
+        index = 0;
+    }
+    if (!sys->disk_sector_id(
+            sys->disk_user_data, drive, cylinder, head, index,
+            c, h, r, n, st1, st2)) {
+        return false;
+    }
+    sys->plus3_fdc.id_index[drive][head] =
+        (uint8_t)((index + 1) < count ? index + 1 : 0);
+    return true;
+}
+
+static void _zx_plus3_fdc_follow_sector(
+    zx_t* sys,
+    uint8_t drive,
+    uint8_t cylinder,
+    uint8_t head,
+    uint8_t r,
+    uint8_t n)
+{
+    const uint8_t count =
+        _zx_plus3_fdc_sector_count(sys, drive, cylinder, head);
+    if (count == 0) {
+        return;
+    }
+    uint8_t start = sys->plus3_fdc.id_index[drive][head];
+    if (start >= count) {
+        start = 0;
+    }
+    for (uint8_t offset = 0; offset < count; offset++) {
+        const uint8_t index = (uint8_t)((start + offset) % count);
+        uint8_t id_c = 0;
+        uint8_t id_h = 0;
+        uint8_t id_r = 0;
+        uint8_t id_n = 0;
+        if (sys->disk_sector_id(
+                sys->disk_user_data, drive, cylinder, head, index,
+                &id_c, &id_h, &id_r, &id_n, 0, 0) &&
+            id_c == cylinder && id_h == head && id_r == r && id_n == n) {
+            sys->plus3_fdc.id_index[drive][head] =
+                (uint8_t)((index + 1) < count ? index + 1 : 0);
+            return;
+        }
+    }
 }
 
 static void _zx_plus3_fdc_finish_data(zx_t* sys, uint8_t st0, uint8_t st1, uint8_t st2) {
@@ -689,10 +793,59 @@ static bool _zx_plus3_fdc_load_read_sector(zx_t* sys) {
         return false;
     }
 
+    const bool sector_deleted = (st2 & 0x40) != 0;
+    const bool wants_deleted = (sys->plus3_fdc.command & 0x1F) == 0x0C;
+    if (sector_deleted == wants_deleted) {
+        /* A matching data-address mark is not an error for this command. */
+        st2 &= (uint8_t)~0x40;
+    }
+    else {
+        /* Control Mark: Read Data and Read Deleted Data saw the other mark. */
+        st2 |= 0x40;
+    }
+
+    /*
+        A bad data CRC can be the on-disk representation of weak bits.  EDSK
+        has no weak-bit encoding for a normal-sized sector, so vary repeated
+        reads in the same deterministic pattern used by established +3
+        emulators.  Speedlock loaders depend on the read not being identical.
+    */
+    if ((st1 & 0x20) != 0 && (st2 & 0x20) != 0) {
+        if (sys->plus3_fdc.last_bad_c == sys->plus3_fdc.transfer_c &&
+            sys->plus3_fdc.last_bad_h == sys->plus3_fdc.transfer_h &&
+            sys->plus3_fdc.last_bad_r == sys->plus3_fdc.transfer_r &&
+            sys->plus3_fdc.last_bad_n == sys->plus3_fdc.transfer_n) {
+            if (sys->plus3_fdc.bad_sector_repeats != 0xFF) {
+                sys->plus3_fdc.bad_sector_repeats++;
+            }
+        }
+        else {
+            sys->plus3_fdc.last_bad_c = sys->plus3_fdc.transfer_c;
+            sys->plus3_fdc.last_bad_h = sys->plus3_fdc.transfer_h;
+            sys->plus3_fdc.last_bad_r = sys->plus3_fdc.transfer_r;
+            sys->plus3_fdc.last_bad_n = sys->plus3_fdc.transfer_n;
+            sys->plus3_fdc.bad_sector_repeats = 0;
+        }
+        if (sys->plus3_fdc.bad_sector_repeats != 0) {
+            for (uint32_t offset = 28; offset < data_size; offset += 29) {
+                sys->plus3_fdc.transfer[offset] ^= (uint8_t)(offset + 1);
+            }
+        }
+    }
+
+    _zx_plus3_fdc_follow_sector(
+        sys,
+        drive,
+        sys->plus3_fdc.transfer_c,
+        sys->plus3_fdc.transfer_h,
+        sys->plus3_fdc.transfer_r,
+        sys->plus3_fdc.transfer_n);
     sys->plus3_fdc.transfer_st1 = st1;
     sys->plus3_fdc.transfer_st2 = st2;
     sys->plus3_fdc.transfer_size = data_size;
     sys->plus3_fdc.transfer_pos = 0;
+    sys->plus3_fdc.data_ready_tick =
+        sys->tick_count + _zx_plus3_fdc_byte_ticks(sys);
     sys->plus3_fdc.transfer_mode = _ZX_PLUS3_FDC_TRANSFER_READ;
     return true;
 }
@@ -722,10 +875,26 @@ static void _zx_plus3_fdc_complete_sector(zx_t* sys, bool writing) {
         }
     }
 
+    /*
+        CRC, missing-address-mark, and control-mark conditions terminate after
+        the affected sector has been transferred.  Continuing silently into
+        the next sector loses the protection status Batman deliberately uses.
+    */
+    if ((sys->plus3_fdc.transfer_st1 | sys->plus3_fdc.transfer_st2) != 0) {
+        _zx_plus3_fdc_finish_data(
+            sys,
+            (uint8_t)(0x40 | head_drive),
+            sys->plus3_fdc.transfer_st1,
+            sys->plus3_fdc.transfer_st2);
+        return;
+    }
+
     if (sys->plus3_fdc.transfer_r < sys->plus3_fdc.transfer_eot) {
         sys->plus3_fdc.transfer_r++;
         if (writing) {
             sys->plus3_fdc.transfer_pos = 0;
+            sys->plus3_fdc.data_ready_tick =
+                sys->tick_count + _zx_plus3_fdc_byte_ticks(sys);
             sys->plus3_fdc.transfer_mode = _ZX_PLUS3_FDC_TRANSFER_WRITE;
         }
         else {
@@ -740,6 +909,8 @@ static void _zx_plus3_fdc_complete_sector(zx_t* sys, bool writing) {
         sys->plus3_fdc.transfer_r = sys->plus3_fdc.params[3];
         if (writing) {
             sys->plus3_fdc.transfer_pos = 0;
+            sys->plus3_fdc.data_ready_tick =
+                sys->tick_count + _zx_plus3_fdc_byte_ticks(sys);
             sys->plus3_fdc.transfer_mode = _ZX_PLUS3_FDC_TRANSFER_WRITE;
         }
         else {
@@ -748,13 +919,12 @@ static void _zx_plus3_fdc_complete_sector(zx_t* sys, bool writing) {
         return;
     }
 
+    /*
+        Reaching EOT without a terminal-count input ends a non-DMA +3
+        transfer with End Of Cylinder, as on a real uPD765.
+    */
     _zx_plus3_fdc_finish_data(
-        sys,
-        (uint8_t)(((sys->plus3_fdc.transfer_st1 | sys->plus3_fdc.transfer_st2) != 0
-            ? 0x40
-            : 0x00) | head_drive),
-        sys->plus3_fdc.transfer_st1,
-        sys->plus3_fdc.transfer_st2);
+        sys, (uint8_t)(0x40 | head_drive), 0x80, 0);
 }
 
 static uint32_t _zx_plus3_fdc_requested_size(const zx_t* sys) {
@@ -792,6 +962,8 @@ static void _zx_plus3_fdc_begin_data(zx_t* sys, bool writing) {
         }
         sys->plus3_fdc.transfer_size = size;
         sys->plus3_fdc.transfer_pos = 0;
+        sys->plus3_fdc.data_ready_tick =
+            sys->tick_count + _zx_plus3_fdc_byte_ticks(sys);
         sys->plus3_fdc.transfer_mode = _ZX_PLUS3_FDC_TRANSFER_WRITE;
     }
     else {
@@ -884,13 +1056,8 @@ static void _zx_plus3_fdc_execute(zx_t* sys) {
                 sys->plus3_fdc.transfer_n = 0;
                 _zx_plus3_fdc_finish_data(sys, (uint8_t)(0x48 | head_drive), 0, 0);
             }
-            else if (sys->disk_sector_id == 0 ||
-                     !sys->disk_sector_id(
-                         sys->disk_user_data,
-                         drive,
-                         c,
-                         h,
-                         sys->plus3_fdc.id_index[drive][h]++,
+            else if (!_zx_plus3_fdc_next_id(
+                         sys, drive, c, h,
                          &c, &h, &r, &n, &st1, &st2)) {
                 sys->plus3_fdc.transfer_c = c;
                 sys->plus3_fdc.transfer_h = h;
@@ -899,6 +1066,15 @@ static void _zx_plus3_fdc_execute(zx_t* sys) {
                 _zx_plus3_fdc_finish_data(sys, (uint8_t)(0x40 | head_drive), 0x04, 0);
             }
             else {
+                /*
+                    Read ID examines the ID field only.  EDSK stores data-field
+                    CRC and deleted-mark information beside the descriptor;
+                    neither belongs in a successful Read ID result.
+                */
+                if ((st2 & 0x20) != 0) {
+                    st1 &= (uint8_t)~0x20;
+                }
+                st2 &= (uint8_t)~0x60;
                 sys->plus3_fdc.transfer_c = c;
                 sys->plus3_fdc.transfer_h = h;
                 sys->plus3_fdc.transfer_r = r;
@@ -960,7 +1136,12 @@ static void _zx_plus3_fdc_write(zx_t* sys, uint8_t data) {
         return;
     }
     if (sys->plus3_fdc.transfer_mode == _ZX_PLUS3_FDC_TRANSFER_WRITE) {
+        if (!_zx_plus3_fdc_data_ready(sys)) {
+            return;
+        }
         sys->plus3_fdc.transfer[sys->plus3_fdc.transfer_pos++] = data;
+        sys->plus3_fdc.data_ready_tick =
+            sys->tick_count + _zx_plus3_fdc_byte_ticks(sys);
         if (sys->plus3_fdc.transfer_pos == sys->plus3_fdc.transfer_size) {
             _zx_plus3_fdc_complete_sector(sys, true);
         }
@@ -986,7 +1167,12 @@ static uint8_t _zx_plus3_fdc_read(zx_t* sys) {
     uint8_t data = 0xFF;
     if (sys->plus3_fdc.transfer_mode == _ZX_PLUS3_FDC_TRANSFER_READ &&
         sys->plus3_fdc.transfer_pos < sys->plus3_fdc.transfer_size) {
+        if (!_zx_plus3_fdc_data_ready(sys)) {
+            return data;
+        }
         data = sys->plus3_fdc.transfer[sys->plus3_fdc.transfer_pos++];
+        sys->plus3_fdc.data_ready_tick =
+            sys->tick_count + _zx_plus3_fdc_byte_ticks(sys);
         if (sys->plus3_fdc.transfer_pos == sys->plus3_fdc.transfer_size) {
             _zx_plus3_fdc_complete_sector(sys, false);
         }
@@ -1102,6 +1288,15 @@ static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
         pins &= ~Z80_WAIT;
     }
     pins = z80_tick(&sys->cpu, pins);
+    /*
+        The Spectrum does not place a peripheral-supplied opcode on the data
+        bus during interrupt acknowledge.  Model the resulting 0xFF bus value
+        explicitly; leaving stale data from the preceding bus cycle makes IM2
+        jump through an effectively random vector.
+    */
+    if ((pins & (Z80_M1 | Z80_IORQ)) == (Z80_M1 | Z80_IORQ)) {
+        Z80_SET_DATA(pins, 0xFF);
+    }
 
     // video decoding and vblank interrupt
     if (--sys->scanline_counter <= 0) {
@@ -1134,7 +1329,7 @@ static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
             mem_wr(&sys->mem, addr, Z80_GET_DATA(pins));
         }
     }
-    else if (pins & Z80_IORQ) {
+    else if ((pins & Z80_IORQ) && !(pins & Z80_M1)) {
         if ((pins & Z80_A0) == 0) {
             /* Spectrum ULA (...............0)
                 Bits 5 and 7 as read by INning from Port 0xfe are always one

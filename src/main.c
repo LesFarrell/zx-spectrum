@@ -1923,6 +1923,12 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
             SetWindowLongPtrA(hwnd, GWLP_USERDATA, (LONG_PTR)create->lpCreateParams);
             return TRUE;
         }
+        case WM_SETCURSOR:
+            if (LOWORD(lparam) == HTCLIENT) {
+                SetCursor(LoadCursorA(NULL, IDC_ARROW));
+                return TRUE;
+            }
+            break;
         case WM_KEYDOWN:
         case WM_SYSKEYDOWN:
             if (app != NULL) {
@@ -2991,6 +2997,21 @@ int main(int argc, char **argv) {
     );
     app.running = true;
     app_debug_machine_changed(&app);
+
+    /* The shell keeps the Working in Background cursor active until a GUI
+       process makes its first GetMessage call. The emulator normally uses
+       PeekMessage so it can keep stepping frames while the queue is empty;
+       retrieve one harmless posted message here to complete that startup
+       handshake without changing the non-blocking main loop. */
+    {
+        MSG startup_message;
+        if (PostMessageA(hwnd, WM_NULL, 0, 0) &&
+            GetMessageA(&startup_message, NULL, 0, 0) > 0) {
+            TranslateMessage(&startup_message);
+            DispatchMessageA(&startup_message);
+        }
+    }
+    QueryPerformanceCounter(&app.last_tick);
 
     while (app.running) {
         MSG msg;
