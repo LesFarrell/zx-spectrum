@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <malloc.h>
 
 enum
 {
@@ -32,12 +33,27 @@ static uint16_t spectrum_read_u16(const uint8_t *data)
     return (uint16_t)(data[0] | (data[1] << 8));
 }
 
+static void spectrum_write_u16(uint8_t *data, uint16_t value)
+{
+    data[0] = (uint8_t)value;
+    data[1] = (uint8_t)(value >> 8);
+}
+
 static uint32_t spectrum_read_u32(const uint8_t *data)
 {
     return (uint32_t)data[0] |
         ((uint32_t)data[1] << 8) |
         ((uint32_t)data[2] << 16) |
         ((uint32_t)data[3] << 24);
+}
+
+static bool spectrum_snapshot_model_compatible(
+    SpectrumModel snapshot_model,
+    SpectrumModel current_model)
+{
+    return snapshot_model == current_model ||
+        (snapshot_model == SPECTRUM_MODEL_128K &&
+         current_model == SPECTRUM_MODEL_PLUS2);
 }
 
 /* Reads a ROM file into the provided buffer, rejects files larger than the
@@ -157,7 +173,12 @@ static void spectrum_init_machine(Spectrum *spec)
     {
         desc.type = ZX_TYPE_PLUS3;
     }
-    else if (spec->model == SPECTRUM_MODEL_128K)
+    else if (spec->model == SPECTRUM_MODEL_PLUS2A)
+    {
+        desc.type = ZX_TYPE_PLUS2A;
+    }
+    else if (spec->model == SPECTRUM_MODEL_128K ||
+             spec->model == SPECTRUM_MODEL_PLUS2)
     {
         desc.type = ZX_TYPE_128;
     }
@@ -179,7 +200,20 @@ static void spectrum_init_machine(Spectrum *spec)
     desc.disk.write_sector = spec->disk_write_sector;
     desc.disk.sector_id = spec->disk_sector_id;
     desc.disk.user_data = spec->disk_user_data;
-    if (spec->model == SPECTRUM_MODEL_PLUS3)
+    desc.interface1.enabled =
+        spec->interface1_rom_loaded &&
+        spec->model != SPECTRUM_MODEL_PLUS2A &&
+        spec->model != SPECTRUM_MODEL_PLUS3;
+    desc.interface1.rom.ptr = spec->interface1_rom;
+    desc.interface1.rom.size = sizeof(spec->interface1_rom);
+    desc.interface1.ready = spec->microdrive_ready;
+    desc.interface1.write_protected = spec->microdrive_write_protected;
+    desc.interface1.length = spec->microdrive_length;
+    desc.interface1.read = spec->microdrive_read;
+    desc.interface1.write = spec->microdrive_write;
+    desc.interface1.user_data = spec->microdrive_user_data;
+    if (spec->model == SPECTRUM_MODEL_PLUS2A ||
+        spec->model == SPECTRUM_MODEL_PLUS3)
     {
         desc.roms.zxplus3_0.ptr = spec->rom[0];
         desc.roms.zxplus3_0.size = sizeof(spec->rom[0]);
@@ -190,7 +224,8 @@ static void spectrum_init_machine(Spectrum *spec)
         desc.roms.zxplus3_3.ptr = spec->rom[3];
         desc.roms.zxplus3_3.size = sizeof(spec->rom[3]);
     }
-    else if (spec->model == SPECTRUM_MODEL_128K)
+    else if (spec->model == SPECTRUM_MODEL_128K ||
+             spec->model == SPECTRUM_MODEL_PLUS2)
     {
         desc.roms.zx128_0.ptr = spec->rom[0];
         desc.roms.zx128_0.size = sizeof(spec->rom[0]);
@@ -227,7 +262,8 @@ static bool spectrum_rebuild_for_model(
         snprintf(error_buffer, error_buffer_size, "No base ROM is loaded.");
         return false;
     }
-    if (model == SPECTRUM_MODEL_128K && !spec->rom_loaded[1])
+    if ((model == SPECTRUM_MODEL_128K || model == SPECTRUM_MODEL_PLUS2) &&
+        !spec->rom_loaded[1])
     {
         snprintf(
             error_buffer,
@@ -235,13 +271,13 @@ static bool spectrum_rebuild_for_model(
             "This machine needs 128K ROMs, but only a 48K ROM is available.");
         return false;
     }
-    if (model == SPECTRUM_MODEL_PLUS3 &&
+    if ((model == SPECTRUM_MODEL_PLUS2A || model == SPECTRUM_MODEL_PLUS3) &&
         (!spec->rom_loaded[1] || !spec->rom_loaded[2] || !spec->rom_loaded[3]))
     {
         snprintf(
             error_buffer,
             error_buffer_size,
-            "This machine needs the four +3 ROM banks, but they are not all available.");
+            "This machine needs four +2A/+3 ROM banks, but they are not all available.");
         return false;
     }
 
@@ -333,12 +369,57 @@ void spectrum_configure_disk(
     }
 }
 
+void spectrum_configure_interface1(
+    Spectrum *spec,
+    zx_microdrive_ready_callback_t ready,
+    zx_microdrive_write_protected_callback_t write_protected,
+    zx_microdrive_length_callback_t length,
+    zx_microdrive_read_callback_t read,
+    zx_microdrive_write_callback_t write,
+    void *user_data)
+{
+    spec->microdrive_ready = ready;
+    spec->microdrive_write_protected = write_protected;
+    spec->microdrive_length = length;
+    spec->microdrive_read = read;
+    spec->microdrive_write = write;
+    spec->microdrive_user_data = user_data;
+}
+
 void spectrum_notify_disk_changed(Spectrum *spec)
 {
     if (spec->machine_ready)
     {
         zx_notify_disk_changed(&spec->machine);
     }
+}
+
+bool spectrum_load_interface1_rom(
+    Spectrum *spec,
+    const char *rom_path,
+    char *error_buffer,
+    size_t error_buffer_size)
+{
+    size_t file_size = 0;
+
+    spec->interface1_rom_loaded = false;
+    if (rom_path == NULL || rom_path[0] == '\0') {
+        return true;
+    }
+    if (!spectrum_load_file_exact(
+            rom_path,
+            spec->interface1_rom,
+            sizeof(spec->interface1_rom),
+            &file_size)) {
+        snprintf(error_buffer, error_buffer_size, "Could not load Interface 1 ROM: %s", rom_path);
+        return false;
+    }
+    if (file_size != sizeof(spec->interface1_rom)) {
+        snprintf(error_buffer, error_buffer_size, "Interface 1 ROM must be exactly 8 KB: %s", rom_path);
+        return false;
+    }
+    spec->interface1_rom_loaded = true;
+    return true;
 }
 
 /* Loads ROM data from disk, validates whether it matches the requested 48K,
@@ -375,7 +456,9 @@ bool spectrum_load_roms(
             spec->rom_loaded[1] = true;
             spec->rom48_index = 1;
         }
-        else if (file_size == 0x10000 && spec->model == SPECTRUM_MODEL_PLUS3)
+        else if (file_size == 0x10000 &&
+                 (spec->model == SPECTRUM_MODEL_PLUS2A ||
+                  spec->model == SPECTRUM_MODEL_PLUS3))
         {
             for (size_t bank = 0; bank < 4; ++bank)
             {
@@ -388,8 +471,9 @@ bool spectrum_load_roms(
             snprintf(
                 error_buffer,
                 error_buffer_size,
-                spec->model == SPECTRUM_MODEL_PLUS3
-                    ? "+3 mode needs one combined 64 KB ROM: %s"
+                (spec->model == SPECTRUM_MODEL_PLUS2A ||
+                 spec->model == SPECTRUM_MODEL_PLUS3)
+                    ? "+2A/+3 mode needs one combined 64 KB ROM: %s"
                     : "ROM file must be 16 KB or 32 KB: %s",
                 rom_path_a);
             return false;
@@ -413,19 +497,22 @@ bool spectrum_load_roms(
         spec->rom48_index = 1;
     }
 
-    if (spec->model == SPECTRUM_MODEL_128K && !spec->rom_loaded[1])
+    if ((spec->model == SPECTRUM_MODEL_128K ||
+         spec->model == SPECTRUM_MODEL_PLUS2) &&
+        !spec->rom_loaded[1])
     {
         snprintf(
             error_buffer,
             error_buffer_size,
-            "128K mode needs either a combined 32 KB ROM or two 16 KB ROMs.");
+            "128K/+2 mode needs either a combined 32 KB ROM or two 16 KB ROMs.");
         return false;
     }
-    if (spec->model == SPECTRUM_MODEL_PLUS3 &&
+    if ((spec->model == SPECTRUM_MODEL_PLUS2A ||
+         spec->model == SPECTRUM_MODEL_PLUS3) &&
         (!spec->rom_loaded[0] || !spec->rom_loaded[1] ||
          !spec->rom_loaded[2] || !spec->rom_loaded[3]))
     {
-        snprintf(error_buffer, error_buffer_size, "+3 mode needs one combined 64 KB ROM.");
+        snprintf(error_buffer, error_buffer_size, "+2A/+3 mode needs one combined 64 KB ROM.");
         return false;
     }
 
@@ -507,6 +594,172 @@ void spectrum_set_joystick_mask(Spectrum *spec, uint8_t mask)
     zx_joystick(&spec->machine, mask);
 }
 
+static void spectrum_store_sna_registers(
+    const zx_t *machine,
+    uint8_t *header,
+    uint16_t stack_pointer)
+{
+    header[0] = machine->cpu.i;
+    spectrum_write_u16(&header[1], machine->cpu.hl2);
+    spectrum_write_u16(&header[3], machine->cpu.de2);
+    spectrum_write_u16(&header[5], machine->cpu.bc2);
+    spectrum_write_u16(&header[7], machine->cpu.af2);
+    spectrum_write_u16(&header[9], machine->cpu.hl);
+    spectrum_write_u16(&header[11], machine->cpu.de);
+    spectrum_write_u16(&header[13], machine->cpu.bc);
+    spectrum_write_u16(&header[15], machine->cpu.iy);
+    spectrum_write_u16(&header[17], machine->cpu.ix);
+    header[19] = machine->cpu.iff2 ? 0x04 : 0;
+    header[20] = machine->cpu.r;
+    spectrum_write_u16(&header[21], machine->cpu.af);
+    spectrum_write_u16(&header[23], stack_pointer);
+    header[25] = machine->cpu.im;
+    header[26] = machine->border_color & 0x07u;
+}
+
+bool spectrum_save_snapshot_sna_file(
+    Spectrum *spec,
+    const char *path,
+    char *error_buffer,
+    size_t error_buffer_size)
+{
+    zx_t *machine;
+    zx_t *restore_state;
+    uint32_t restore_version;
+    uint16_t program_counter;
+    uint8_t *data;
+    size_t data_size;
+    size_t offset;
+    uint8_t paged_bank;
+    FILE *file;
+    bool ok;
+
+    if (spec == NULL || !spec->machine_ready || path == NULL || path[0] == '\0') {
+        snprintf(error_buffer, error_buffer_size, "No running machine or snapshot path is available.");
+        return false;
+    }
+    if (spec->model == SPECTRUM_MODEL_PLUS2A ||
+        spec->model == SPECTRUM_MODEL_PLUS3) {
+        snprintf(
+            error_buffer,
+            error_buffer_size,
+            "SNA saving currently supports 48K, 128K, and +2 machines.");
+        return false;
+    }
+
+    restore_state = (zx_t *)_aligned_malloc(sizeof(*restore_state), _Alignof(zx_t));
+    if (restore_state == NULL) {
+        snprintf(error_buffer, error_buffer_size, "Out of memory while preparing the snapshot.");
+        return false;
+    }
+    restore_version = zx_save_snapshot(&spec->machine, restore_state);
+    machine = &spec->machine;
+    for (unsigned ticks = 0; ticks < 128 && !z80_opdone(&machine->cpu); ++ticks) {
+        machine->pins = _zx_tick(machine, machine->pins);
+    }
+    program_counter = z80_opdone(&machine->cpu)
+        ? Z80_GET_ADDR(machine->pins)
+        : machine->cpu.pc;
+    paged_bank = machine->last_mem_config & 0x07u;
+    data_size = spec->model == SPECTRUM_MODEL_48K
+        ? SNA_48K_SIZE
+        : ((paged_bank == 2 || paged_bank == 5)
+            ? SNA_128K_DUPLICATE_BANK_SIZE
+            : SNA_128K_SIZE);
+    data = (uint8_t *)calloc(1, data_size);
+    if (data == NULL) {
+        (void)zx_load_snapshot(&spec->machine, restore_version, restore_state);
+        _aligned_free(restore_state);
+        snprintf(error_buffer, error_buffer_size, "Out of memory while creating the snapshot.");
+        return false;
+    }
+
+    if (spec->model == SPECTRUM_MODEL_48K) {
+        uint16_t saved_sp;
+        size_t stack_offset;
+
+        if (machine->cpu.sp < 0x4002u) {
+            free(data);
+            (void)zx_load_snapshot(&spec->machine, restore_version, restore_state);
+            _aligned_free(restore_state);
+            snprintf(
+                error_buffer,
+                error_buffer_size,
+                "The current stack is in ROM and cannot be represented by a 48K SNA file.");
+            return false;
+        }
+        saved_sp = (uint16_t)(machine->cpu.sp - 2u);
+        spectrum_store_sna_registers(machine, data, saved_sp);
+        memcpy(&data[SNA_HEADER_SIZE], machine->ram[0], SNA_RAM_BANK_SIZE);
+        memcpy(&data[SNA_HEADER_SIZE + SNA_RAM_BANK_SIZE], machine->ram[1], SNA_RAM_BANK_SIZE);
+        memcpy(&data[SNA_HEADER_SIZE + (2 * SNA_RAM_BANK_SIZE)], machine->ram[2], SNA_RAM_BANK_SIZE);
+        stack_offset = SNA_HEADER_SIZE + (size_t)(saved_sp - 0x4000u);
+        spectrum_write_u16(&data[stack_offset], program_counter);
+    }
+    else {
+        spectrum_store_sna_registers(machine, data, machine->cpu.sp);
+        memcpy(&data[SNA_HEADER_SIZE], machine->ram[5], SNA_RAM_BANK_SIZE);
+        memcpy(&data[SNA_HEADER_SIZE + SNA_RAM_BANK_SIZE], machine->ram[2], SNA_RAM_BANK_SIZE);
+        memcpy(&data[SNA_HEADER_SIZE + (2 * SNA_RAM_BANK_SIZE)], machine->ram[paged_bank], SNA_RAM_BANK_SIZE);
+        spectrum_write_u16(&data[SNA_48K_SIZE], program_counter);
+        data[SNA_48K_SIZE + 2u] = machine->last_mem_config;
+        data[SNA_48K_SIZE + 3u] = 0;
+        offset = SNA_128K_BASE_SIZE;
+        for (uint8_t bank = 0; bank < 8; ++bank) {
+            if (bank == 5 || bank == 2 || bank == paged_bank) {
+                continue;
+            }
+            memcpy(&data[offset], machine->ram[bank], SNA_RAM_BANK_SIZE);
+            offset += SNA_RAM_BANK_SIZE;
+        }
+    }
+    (void)zx_load_snapshot(&spec->machine, restore_version, restore_state);
+    _aligned_free(restore_state);
+
+    file = fopen(path, "wb");
+    if (file == NULL) {
+        free(data);
+        snprintf(error_buffer, error_buffer_size, "Could not open the snapshot file for writing.");
+        return false;
+    }
+    ok = fwrite(data, 1, data_size, file) == data_size;
+    if (fclose(file) != 0) {
+        ok = false;
+    }
+    free(data);
+    if (!ok) {
+        snprintf(error_buffer, error_buffer_size, "Could not save the complete snapshot file.");
+        return false;
+    }
+    return true;
+}
+
+bool spectrum_save_runtime_state(
+    Spectrum *spec,
+    zx_t *state,
+    uint32_t *version)
+{
+    if (spec == NULL || state == NULL || version == NULL || !spec->machine_ready) {
+        return false;
+    }
+    *version = zx_save_snapshot(&spec->machine, state);
+    return true;
+}
+
+bool spectrum_load_runtime_state(
+    Spectrum *spec,
+    SpectrumModel model,
+    zx_t *state,
+    uint32_t version)
+{
+    if (spec == NULL || state == NULL || !spec->machine_ready || spec->model != model ||
+        !zx_load_snapshot(&spec->machine, version, state)) {
+        return false;
+    }
+    spectrum_render_frame(spec);
+    return true;
+}
+
 static void spectrum_restore_sna_registers(zx_t *machine, const uint8_t *header)
 {
     z80_reset(&machine->cpu);
@@ -583,7 +836,7 @@ bool spectrum_load_snapshot_sna_data(
         }
     }
 
-    if (snapshot_model != spec->model)
+    if (!spectrum_snapshot_model_compatible(snapshot_model, spec->model))
     {
         if (!spectrum_rebuild_for_model(spec, snapshot_model, error_buffer, error_buffer_size))
         {
@@ -935,7 +1188,7 @@ bool spectrum_load_snapshot_szx_data(
     {
         return false;
     }
-    if (state.model != spec->model &&
+    if (!spectrum_snapshot_model_compatible(state.model, spec->model) &&
         !spectrum_rebuild_for_model(spec, state.model, error_buffer, error_buffer_size))
     {
         spectrum_discard_szx_state(&state);
@@ -1006,7 +1259,7 @@ bool spectrum_load_snapshot_z80_data(
         return false;
     }
 
-    if (snapshot_model != spec->model)
+    if (!spectrum_snapshot_model_compatible(snapshot_model, spec->model))
     {
         if (!spectrum_rebuild_for_model(spec, snapshot_model, error_buffer, error_buffer_size))
         {

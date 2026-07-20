@@ -4,9 +4,12 @@ tmp-ui-check/
 src/*.tzx
 src/*.z80
 src/*.tap
+src/*.mdr
 src/*.o
 src/*.res
 src/*.pdb
 src/*.exe
 src/Scintilla.dll
 src/plus3.rom
+src/plus2.rom
+src/plus2a.rom

@@ -22,7 +22,9 @@ enum {
 typedef enum SpectrumModel {
     SPECTRUM_MODEL_48K = 0,
     SPECTRUM_MODEL_128K = 1,
-    SPECTRUM_MODEL_PLUS3 = 2
+    SPECTRUM_MODEL_PLUS2 = 2,
+    SPECTRUM_MODEL_PLUS2A = 3,
+    SPECTRUM_MODEL_PLUS3 = 4
 } SpectrumModel;
 
 /* Holds the selected machine model, loaded ROM images, the embedded chips
@@ -45,10 +47,18 @@ typedef struct Spectrum {
     zx_disk_write_sector_callback_t disk_write_sector;
     zx_disk_sector_id_callback_t disk_sector_id;
     void *disk_user_data;
+    zx_microdrive_ready_callback_t microdrive_ready;
+    zx_microdrive_write_protected_callback_t microdrive_write_protected;
+    zx_microdrive_length_callback_t microdrive_length;
+    zx_microdrive_read_callback_t microdrive_read;
+    zx_microdrive_write_callback_t microdrive_write;
+    void *microdrive_user_data;
     int rom48_index;
 
     uint8_t rom[4][0x4000];
     bool rom_loaded[4];
+    uint8_t interface1_rom[ZX_INTERFACE1_ROM_SIZE];
+    bool interface1_rom_loaded;
 
     uint32_t framebuffer[ZX_SCREEN_WIDTH * ZX_SCREEN_HEIGHT];
 } Spectrum;
@@ -63,6 +73,15 @@ bool spectrum_load_roms(
     Spectrum *spec,
     const char *rom_path_a,
     const char *rom_path_b,
+    char *error_buffer,
+    size_t error_buffer_size
+);
+
+/* Loads the optional 8 KB Interface 1 shadow ROM used by 48K and 128K
+   machines. The peripheral remains disabled if no image is configured. */
+bool spectrum_load_interface1_rom(
+    Spectrum *spec,
+    const char *rom_path,
     char *error_buffer,
     size_t error_buffer_size
 );
@@ -102,6 +121,17 @@ void spectrum_configure_disk(
     void *user_data
 );
 
+/* Wires the eight emulated Microdrive cartridge slots into Interface 1. */
+void spectrum_configure_interface1(
+    Spectrum *spec,
+    zx_microdrive_ready_callback_t ready,
+    zx_microdrive_write_protected_callback_t write_protected,
+    zx_microdrive_length_callback_t length,
+    zx_microdrive_read_callback_t read,
+    zx_microdrive_write_callback_t write,
+    void *user_data
+);
+
 /* Resets any active +3 controller command after media insertion/ejection. */
 void spectrum_notify_disk_changed(Spectrum *spec);
 
@@ -123,6 +153,28 @@ void spectrum_key_up(Spectrum *spec, int key_code);
 
 /* Updates the emulated joystick state mask presented on the Kempston port. */
 void spectrum_set_joystick_mask(Spectrum *spec, uint8_t mask);
+
+/* Saves the current 48K, 128K, or +2 state as a portable SNA file. */
+bool spectrum_save_snapshot_sna_file(
+    Spectrum *spec,
+    const char *path,
+    char *error_buffer,
+    size_t error_buffer_size
+);
+
+/* Captures and restores an in-process core state for bounded rewind history. */
+bool spectrum_save_runtime_state(
+    Spectrum *spec,
+    zx_t *state,
+    uint32_t *version
+);
+
+bool spectrum_load_runtime_state(
+    Spectrum *spec,
+    SpectrumModel model,
+    zx_t *state,
+    uint32_t version
+);
 
 /* Detects the target machine model encoded by a `.z80` snapshot payload that
    has already been read into memory. */

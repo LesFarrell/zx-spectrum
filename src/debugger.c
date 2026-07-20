@@ -892,6 +892,10 @@ static void app_debug_refresh_window(AppState *app) {
     z80_t *cpu;
     const size_t total_points = app->debug.breakpoint_count + app->debug.watchpoint_count;
 
+    if (app->main_hwnd != NULL) {
+        app_update_runtime_menu(app->main_hwnd, app);
+    }
+
     if (total_points > 0 && total_points <= (SIZE_MAX - 12288u) / 24u) {
         buffer_size = 12288u + (total_points * 24u);
         buffer = (char *)malloc(buffer_size);

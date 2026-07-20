@@ -308,6 +308,37 @@ bool dsk_load_file(
     return loaded;
 }
 
+bool dsk_save_file(
+    DskImage *image,
+    char *error_buffer,
+    size_t error_buffer_size)
+{
+    FILE *file;
+    bool ok;
+
+    if (image == NULL || !image->inserted || image->data == NULL ||
+        image->data_size == 0 || image->path[0] == '\0') {
+        snprintf(error_buffer, error_buffer_size, "No disk is inserted.");
+        return false;
+    }
+
+    file = fopen(image->path, "wb");
+    if (file == NULL) {
+        snprintf(error_buffer, error_buffer_size, "Could not open the disk image for writing.");
+        return false;
+    }
+    ok = fwrite(image->data, 1, image->data_size, file) == image->data_size;
+    if (fclose(file) != 0) {
+        ok = false;
+    }
+    if (!ok) {
+        snprintf(error_buffer, error_buffer_size, "Could not save the complete disk image.");
+        return false;
+    }
+    image->dirty = false;
+    return true;
+}
+
 bool dsk_drive_ready(void *user_data, uint8_t drive) {
     DskImage *image = (DskImage *)user_data;
     return drive == 0 && image != NULL && image->inserted;

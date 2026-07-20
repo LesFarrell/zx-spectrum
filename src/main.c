@@ -13,10 +13,12 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <malloc.h>
 
 #include "spectrum.h"
 #include "tape.h"
 #include "disk.h"
+#include "microdrive.h"
 #include <Scintilla.h>
 
 typedef struct KeyMap {
@@ -48,6 +50,9 @@ enum {
     APP_TAPE_WARP_BUDGET_MS = 30,
     APP_TAPE_LOADER_ACTIVE_READS = 32,
     APP_TAPE_LOADER_IDLE_FRAMES = 250,
+    APP_RECENT_MEDIA_COUNT = 8,
+    APP_REWIND_SLOT_COUNT = 30,
+    APP_REWIND_CAPTURE_FRAMES = 50,
     APP_MENU_FILE_OPEN_SNAPSHOT = 1001,
     APP_MENU_FILE_RESET = 1002,
     APP_MENU_FILE_EXIT = 1003,
@@ -55,7 +60,9 @@ enum {
     APP_MENU_FILE_STOP_TAPE = 1005,
     APP_MENU_FILE_AUTOLOAD_TAPES = 1006,
     APP_MENU_FILE_FAST_TAPE_LOADING = 1008,
+    APP_MENU_FILE_SAVE_SNAPSHOT = 1009,
     APP_MENU_DISK_EJECT = 1010,
+    APP_MENU_DISK_SAVE = 1011,
     APP_MENU_SOUND_MUTE = 1101,
     APP_MENU_TOOLS_ASSEMBLER = 1301,
     APP_MENU_TOOLS_DEBUGGER = 1302,
@@ -63,6 +70,27 @@ enum {
     APP_MENU_MACHINE_48K = 1201,
     APP_MENU_MACHINE_128K = 1202,
     APP_MENU_MACHINE_PLUS3 = 1203,
+    APP_MENU_MACHINE_PLUS2 = 1204,
+    APP_MENU_MACHINE_PLUS2A = 1205,
+    APP_MENU_MACHINE_PAUSE = 1210,
+    APP_MENU_MACHINE_SPEED_1X = 1211,
+    APP_MENU_MACHINE_REWIND = 1212,
+    APP_MENU_MACHINE_SPEED_2X = 1213,
+    APP_MENU_MACHINE_SPEED_4X = 1214,
+    APP_MENU_MACHINE_SPEED_8X = 1215,
+    APP_MENU_VIEW_FULLSCREEN = 1250,
+    APP_MENU_VIEW_INTEGER_SCALING = 1251,
+    APP_MENU_MICRODRIVE_INSERT_BASE = 1400,
+    APP_MENU_MICRODRIVE_EJECT_BASE = 1420,
+    APP_MENU_MICRODRIVE_WRITE_PROTECT_BASE = 1440,
+    APP_MENU_MICRODRIVE_NEW_BASE = 1460,
+    APP_MENU_MICRODRIVE_SAVE_BASE = 1480,
+    APP_MENU_INPUT_JOYSTICK_NONE = 1500,
+    APP_MENU_INPUT_JOYSTICK_CURSOR = 1501,
+    APP_MENU_INPUT_JOYSTICK_WASD = 1502,
+    APP_MENU_INPUT_JOYSTICK_QAOP = 1503,
+    APP_MENU_RECENT_MEDIA_BASE = 1520,
+    APP_MENU_RECENT_MEDIA_CLEAR = 1530,
     APP_CTRL_DEBUG_TEXT = 2001,
     APP_CTRL_DEBUG_PAUSE = 2002,
     APP_CTRL_DEBUG_STEP = 2003,
@@ -196,9 +224,34 @@ typedef struct ControllerState {
     AppXInputGetStateFn xinput_get_state;
     DWORD active_user_index;
     uint8_t joystick_mask;
+    uint8_t keyboard_joystick_mask;
     bool available;
     bool connected;
 } ControllerState;
+
+typedef enum KeyboardJoystickPreset {
+    APP_KEYBOARD_JOYSTICK_NONE = 0,
+    APP_KEYBOARD_JOYSTICK_CURSOR,
+    APP_KEYBOARD_JOYSTICK_WASD,
+    APP_KEYBOARD_JOYSTICK_QAOP
+} KeyboardJoystickPreset;
+
+typedef struct RewindState {
+    zx_t *slots;
+    uint32_t versions[APP_REWIND_SLOT_COUNT];
+    SpectrumModel models[APP_REWIND_SLOT_COUNT];
+    size_t next;
+    size_t count;
+    unsigned frames_until_capture;
+} RewindState;
+
+typedef struct VideoBackbuffer {
+    HDC dc;
+    HBITMAP bitmap;
+    HGDIOBJ previous_bitmap;
+    int width;
+    int height;
+} VideoBackbuffer;
 
 typedef struct DebugState {
     HWND debugger_hwnd;
@@ -323,14 +376,20 @@ struct RomSelection {
     SpectrumModel model;
     RomSet rom_48k;
     RomSet rom_128k;
+    RomSet rom_plus2;
+    RomSet rom_plus2a;
     RomSet rom_plus3;
+    char interface1_rom[MAX_PATH];
+    bool has_interface1_rom;
 };
 
 struct AppState {
     Spectrum spec;
     RomSelection roms;
     BITMAPINFO bitmap_info;
+    VideoBackbuffer video_backbuffer;
     HWND main_hwnd;
+    HMENU main_menu;
     LARGE_INTEGER perf_freq;
     LARGE_INTEGER last_tick;
     double emulation_accumulator_ms;
@@ -339,8 +398,14 @@ struct AppState {
     AutoTypeState auto_type;
     TapePlayer tape;
     DskImage disk;
+    MicrodriveBank microdrives;
+    RewindState rewind;
     DebugState debug;
+    WINDOWPLACEMENT window_placement;
+    LONG windowed_style;
     int active_key_codes[256];
+    char recent_media[APP_RECENT_MEDIA_COUNT][MAX_PATH];
+    size_t recent_media_count;
     uint32_t tape_input_reads_this_frame;
     uint32_t tape_loader_idle_frames;
     bool tape_autoload_enabled;
@@ -351,6 +416,10 @@ struct AppState {
     bool tape_auto_stop_armed;
     bool tape_load_in_progress;
     bool snapshot_load_in_progress;
+    KeyboardJoystickPreset keyboard_joystick_preset;
+    unsigned speed_multiplier;
+    bool fullscreen;
+    bool integer_scaling;
     bool running;
     bool modal_loop_timer_active;
 };
@@ -421,6 +490,13 @@ static double app_model_frame_duration_ms(SpectrumModel model);
 static void app_tick_emulator(AppState *app);
 static bool app_load_tape_file(HWND hwnd, AppState *app, const char *path, char *error_buffer, size_t error_buffer_size);
 static bool app_load_disk_file(HWND hwnd, AppState *app, const char *path, char *error_buffer, size_t error_buffer_size);
+static bool app_load_microdrive_file(
+    HWND hwnd,
+    AppState *app,
+    const char *path,
+    int requested_drive,
+    char *error_buffer,
+    size_t error_buffer_size);
 static bool app_apply_loaded_tape(HWND hwnd, AppState *app, TapePlayer *loaded_tape, char *error_buffer, size_t error_buffer_size);
 static bool app_load_snapshot_file(HWND hwnd, AppState *app, const char *path, char *error_buffer, size_t error_buffer_size);
 static bool app_load_media_path(HWND hwnd, AppState *app, const char *path, char *error_buffer, size_t error_buffer_size);
@@ -434,6 +510,8 @@ static void app_set_modal_loop_timer(AppState *app, HWND hwnd, bool enabled);
 static void app_controller_init(AppState *app);
 static void app_controller_shutdown(AppState *app);
 static void app_controller_poll(AppState *app);
+static void app_audio_flush(AppState *app);
+static void app_release_all_keys(AppState *app);
 static bool app_debug_has_breakpoint(const AppState *app, uint16_t address);
 static bool app_debug_reserve_breakpoints(AppState *app, size_t required_count);
 static bool app_debug_has_watchpoint(const AppState *app, uint16_t address);
@@ -460,9 +538,30 @@ static void app_save_model(SpectrumModel model);
 static void app_save_tape_autoload(bool enabled);
 static void app_save_fast_tape_loading(bool enabled);
 static void app_save_sound_muted(bool muted);
+static void app_save_keyboard_joystick(KeyboardJoystickPreset preset);
+static void app_save_speed_multiplier(unsigned multiplier);
 static void app_update_model_menu(HWND hwnd, SpectrumModel model);
 static void app_update_sound_menu(HWND hwnd, bool muted);
 static void app_update_disk_menu(HWND hwnd, bool inserted);
+static void app_update_microdrive_menu(HWND hwnd, const AppState *app);
+static void app_update_runtime_menu(HWND hwnd, const AppState *app);
+static void app_update_input_menu(HWND hwnd, const AppState *app);
+static void app_update_recent_menu(HWND hwnd, const AppState *app);
+static void app_add_recent_media(AppState *app, const char *path);
+static void app_save_recent_media(const AppState *app);
+static void app_rewind_clear(AppState *app);
+static bool app_rewind_init(AppState *app);
+static void app_rewind_discard(AppState *app);
+static void app_rewind_capture(AppState *app);
+static bool app_rewind_seconds(AppState *app, unsigned seconds);
+static void app_set_fullscreen(HWND hwnd, AppState *app, bool enabled);
+static void app_apply_joystick_mask(AppState *app);
+static bool app_video_backbuffer_ensure(
+    AppState *app,
+    HDC reference_dc,
+    int width,
+    int height);
+static void app_video_backbuffer_discard(AppState *app);
 static void app_audio_callback(const float *samples, int num_samples, void *user_data);
 static void app_debug_refresh_window(AppState *app);
 static void app_assembler_refresh_window(AppState *app);
@@ -591,12 +690,20 @@ static HMENU app_create_menu(void) {
     HMENU file_menu = CreatePopupMenu();
     HMENU tape_menu = CreatePopupMenu();
     HMENU disk_menu = CreatePopupMenu();
+    HMENU microdrive_menu = CreatePopupMenu();
     HMENU machine_menu = CreatePopupMenu();
+    HMENU speed_menu = CreatePopupMenu();
+    HMENU view_menu = CreatePopupMenu();
+    HMENU input_menu = CreatePopupMenu();
+    HMENU joystick_menu = CreatePopupMenu();
+    HMENU recent_menu = CreatePopupMenu();
     HMENU sound_menu = CreatePopupMenu();
     HMENU tools_menu = CreatePopupMenu();
 
-    if (menu_bar == NULL || file_menu == NULL || tape_menu == NULL || disk_menu == NULL || machine_menu == NULL ||
-        sound_menu == NULL || tools_menu == NULL) {
+    if (menu_bar == NULL || file_menu == NULL || tape_menu == NULL ||
+        disk_menu == NULL || microdrive_menu == NULL || machine_menu == NULL ||
+        speed_menu == NULL || view_menu == NULL || input_menu == NULL || joystick_menu == NULL ||
+        recent_menu == NULL || sound_menu == NULL || tools_menu == NULL) {
         if (tools_menu != NULL) {
             DestroyMenu(tools_menu);
         }
@@ -605,6 +712,24 @@ static HMENU app_create_menu(void) {
         }
         if (machine_menu != NULL) {
             DestroyMenu(machine_menu);
+        }
+        if (speed_menu != NULL) {
+            DestroyMenu(speed_menu);
+        }
+        if (view_menu != NULL) {
+            DestroyMenu(view_menu);
+        }
+        if (input_menu != NULL) {
+            DestroyMenu(input_menu);
+        }
+        if (joystick_menu != NULL) {
+            DestroyMenu(joystick_menu);
+        }
+        if (recent_menu != NULL) {
+            DestroyMenu(recent_menu);
+        }
+        if (microdrive_menu != NULL) {
+            DestroyMenu(microdrive_menu);
         }
         if (disk_menu != NULL) {
             DestroyMenu(disk_menu);
@@ -622,6 +747,17 @@ static HMENU app_create_menu(void) {
     }
 
     AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_OPEN_SNAPSHOT, "&Open Media/Snapshot...\tCtrl+O");
+    AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_SAVE_SNAPSHOT, "&Save Snapshot...\tCtrl+S");
+    for (int recent = 0; recent < APP_RECENT_MEDIA_COUNT; ++recent) {
+        AppendMenuA(
+            recent_menu,
+            MF_STRING | MF_GRAYED,
+            APP_MENU_RECENT_MEDIA_BASE + recent,
+            "(empty)");
+    }
+    AppendMenuA(recent_menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(recent_menu, MF_STRING, APP_MENU_RECENT_MEDIA_CLEAR, "&Clear Recent Media");
+    AppendMenuA(file_menu, MF_POPUP, (UINT_PTR)recent_menu, "Recent &Media");
     AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_RESET, "&Reset\tCtrl+R");
     AppendMenuA(file_menu, MF_SEPARATOR, 0, NULL);
     AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_EXIT, "E&xit\tAlt+F4");
@@ -629,10 +765,63 @@ static HMENU app_create_menu(void) {
     AppendMenuA(tape_menu, MF_STRING, APP_MENU_FILE_STOP_TAPE, "S&top Tape\tF4");
     AppendMenuA(tape_menu, MF_STRING, APP_MENU_FILE_AUTOLOAD_TAPES, "&Auto-load Tapes On Open");
     AppendMenuA(tape_menu, MF_STRING, APP_MENU_FILE_FAST_TAPE_LOADING, "Use &Fast Tape Loading");
+    AppendMenuA(disk_menu, MF_STRING, APP_MENU_DISK_SAVE, "&Save Disk");
     AppendMenuA(disk_menu, MF_STRING, APP_MENU_DISK_EJECT, "&Eject Disk");
+    for (int drive = 0; drive < MICRODRIVE_COUNT; ++drive) {
+        HMENU drive_menu = CreatePopupMenu();
+        char label[32];
+        if (drive_menu == NULL) {
+            continue;
+        }
+        AppendMenuA(
+            drive_menu,
+            MF_STRING,
+            APP_MENU_MICRODRIVE_NEW_BASE + drive,
+            "&New Empty Cartridge...");
+        AppendMenuA(
+            drive_menu,
+            MF_STRING,
+            APP_MENU_MICRODRIVE_INSERT_BASE + drive,
+            "&Insert Cartridge...");
+        AppendMenuA(drive_menu, MF_SEPARATOR, 0, NULL);
+        AppendMenuA(
+            drive_menu,
+            MF_STRING,
+            APP_MENU_MICRODRIVE_EJECT_BASE + drive,
+            "&Eject Cartridge");
+        AppendMenuA(
+            drive_menu,
+            MF_STRING,
+            APP_MENU_MICRODRIVE_SAVE_BASE + drive,
+            "&Save Cartridge");
+        AppendMenuA(
+            drive_menu,
+            MF_STRING,
+            APP_MENU_MICRODRIVE_WRITE_PROTECT_BASE + drive,
+            "&Write Protected");
+        snprintf(label, sizeof(label), "Drive &%d", drive + 1);
+        AppendMenuA(microdrive_menu, MF_POPUP, (UINT_PTR)drive_menu, label);
+    }
     AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_48K, "&48K\tCtrl+1");
     AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_128K, "&128K\tCtrl+2");
     AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_PLUS3, "+&3\tCtrl+3");
+    AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_PLUS2, "+&2\tCtrl+4");
+    AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_PLUS2A, "+2&A\tCtrl+5");
+    AppendMenuA(machine_menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_PAUSE, "&Pause\tF2");
+    AppendMenuA(speed_menu, MF_STRING, APP_MENU_MACHINE_SPEED_1X, "&1x (Normal)");
+    AppendMenuA(speed_menu, MF_STRING, APP_MENU_MACHINE_SPEED_2X, "&2x");
+    AppendMenuA(speed_menu, MF_STRING, APP_MENU_MACHINE_SPEED_4X, "&4x");
+    AppendMenuA(speed_menu, MF_STRING, APP_MENU_MACHINE_SPEED_8X, "&8x");
+    AppendMenuA(machine_menu, MF_POPUP, (UINT_PTR)speed_menu, "&Speed (F6 cycles)");
+    AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_REWIND, "&Rewind 5 Seconds\tCtrl+Backspace");
+    AppendMenuA(view_menu, MF_STRING, APP_MENU_VIEW_FULLSCREEN, "&Fullscreen\tF11");
+    AppendMenuA(view_menu, MF_STRING, APP_MENU_VIEW_INTEGER_SCALING, "&Integer Scaling");
+    AppendMenuA(joystick_menu, MF_STRING, APP_MENU_INPUT_JOYSTICK_NONE, "&None");
+    AppendMenuA(joystick_menu, MF_STRING, APP_MENU_INPUT_JOYSTICK_CURSOR, "&Cursor Keys + Space");
+    AppendMenuA(joystick_menu, MF_STRING, APP_MENU_INPUT_JOYSTICK_WASD, "&WASD + Space");
+    AppendMenuA(joystick_menu, MF_STRING, APP_MENU_INPUT_JOYSTICK_QAOP, "&QAOP + M");
+    AppendMenuA(input_menu, MF_POPUP, (UINT_PTR)joystick_menu, "&Keyboard Kempston Joystick");
     AppendMenuA(sound_menu, MF_STRING, APP_MENU_SOUND_MUTE, "&Mute Sound\tCtrl+M");
     AppendMenuA(tools_menu, MF_STRING, APP_MENU_TOOLS_ASSEMBLER, "&Assembler...\tCtrl+Shift+A");
     AppendMenuA(tools_menu, MF_STRING, APP_MENU_TOOLS_DEBUGGER, "&Debugger...\tCtrl+Shift+D");
@@ -640,7 +829,10 @@ static HMENU app_create_menu(void) {
     AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)file_menu, "&File");
     AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)tape_menu, "&Tape");
     AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)disk_menu, "&Disk");
+    AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)microdrive_menu, "Micro&drive");
     AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)machine_menu, "&Machine");
+    AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)view_menu, "&View");
+    AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)input_menu, "&Input");
     AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)sound_menu, "&Sound");
     AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)tools_menu, "&Tools");
     return menu_bar;
@@ -669,11 +861,61 @@ static void app_update_disk_menu(HWND hwnd, bool inserted) {
         APP_MENU_DISK_EJECT,
         MF_BYCOMMAND | (inserted ? MF_ENABLED : MF_GRAYED)
     );
+    EnableMenuItem(
+        menu,
+        APP_MENU_DISK_SAVE,
+        MF_BYCOMMAND | (inserted ? MF_ENABLED : MF_GRAYED)
+    );
+}
+
+static void app_update_microdrive_menu(HWND hwnd, const AppState *app) {
+    HMENU menu = GetMenu(hwnd);
+    const bool available =
+        app != NULL &&
+        app->roms.has_interface1_rom &&
+        app->spec.model != SPECTRUM_MODEL_PLUS2A &&
+        app->spec.model != SPECTRUM_MODEL_PLUS3;
+
+    if (menu == NULL || app == NULL) {
+        return;
+    }
+    for (int drive = 0; drive < MICRODRIVE_COUNT; ++drive) {
+        const MicrodriveCartridge *cartridge = &app->microdrives.drives[drive];
+        EnableMenuItem(
+            menu,
+            APP_MENU_MICRODRIVE_NEW_BASE + drive,
+            MF_BYCOMMAND | (available ? MF_ENABLED : MF_GRAYED));
+        EnableMenuItem(
+            menu,
+            APP_MENU_MICRODRIVE_INSERT_BASE + drive,
+            MF_BYCOMMAND | (available ? MF_ENABLED : MF_GRAYED));
+        EnableMenuItem(
+            menu,
+            APP_MENU_MICRODRIVE_EJECT_BASE + drive,
+            MF_BYCOMMAND | (cartridge->inserted ? MF_ENABLED : MF_GRAYED));
+        EnableMenuItem(
+            menu,
+            APP_MENU_MICRODRIVE_SAVE_BASE + drive,
+            MF_BYCOMMAND | (cartridge->inserted ? MF_ENABLED : MF_GRAYED));
+        EnableMenuItem(
+            menu,
+            APP_MENU_MICRODRIVE_WRITE_PROTECT_BASE + drive,
+            MF_BYCOMMAND | (cartridge->inserted ? MF_ENABLED : MF_GRAYED));
+        CheckMenuItem(
+            menu,
+            APP_MENU_MICRODRIVE_WRITE_PROTECT_BASE + drive,
+            MF_BYCOMMAND |
+                (cartridge->inserted && cartridge->write_protected
+                    ? MF_CHECKED
+                    : MF_UNCHECKED));
+    }
 }
 
 static const char *app_model_name(SpectrumModel model) {
     switch (model) {
         case SPECTRUM_MODEL_PLUS3: return "+3";
+        case SPECTRUM_MODEL_PLUS2A: return "+2A";
+        case SPECTRUM_MODEL_PLUS2: return "+2";
         case SPECTRUM_MODEL_128K: return "128K";
         case SPECTRUM_MODEL_48K:
         default:
@@ -684,6 +926,8 @@ static const char *app_model_name(SpectrumModel model) {
 static UINT app_model_menu_id(SpectrumModel model) {
     switch (model) {
         case SPECTRUM_MODEL_PLUS3: return APP_MENU_MACHINE_PLUS3;
+        case SPECTRUM_MODEL_PLUS2A: return APP_MENU_MACHINE_PLUS2A;
+        case SPECTRUM_MODEL_PLUS2: return APP_MENU_MACHINE_PLUS2;
         case SPECTRUM_MODEL_128K: return APP_MENU_MACHINE_128K;
         case SPECTRUM_MODEL_48K:
         default:
@@ -694,6 +938,8 @@ static UINT app_model_menu_id(SpectrumModel model) {
 static const char *app_model_settings_value(SpectrumModel model) {
     switch (model) {
         case SPECTRUM_MODEL_PLUS3: return "plus3";
+        case SPECTRUM_MODEL_PLUS2A: return "plus2a";
+        case SPECTRUM_MODEL_PLUS2: return "plus2";
         case SPECTRUM_MODEL_128K: return "128";
         case SPECTRUM_MODEL_48K:
         default:
@@ -703,6 +949,346 @@ static const char *app_model_settings_value(SpectrumModel model) {
 
 static const char *app_tape_autoload_settings_value(bool enabled) {
     return enabled ? "1" : "0";
+}
+
+static void app_update_runtime_menu(HWND hwnd, const AppState *app) {
+    HMENU menu = GetMenu(hwnd);
+    if (menu == NULL || app == NULL) {
+        return;
+    }
+    CheckMenuItem(
+        menu,
+        APP_MENU_MACHINE_PAUSE,
+        MF_BYCOMMAND | (app->debug.paused ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(menu, APP_MENU_MACHINE_SPEED_1X, MF_BYCOMMAND |
+        (app->speed_multiplier == 1 ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(menu, APP_MENU_MACHINE_SPEED_2X, MF_BYCOMMAND |
+        (app->speed_multiplier == 2 ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(menu, APP_MENU_MACHINE_SPEED_4X, MF_BYCOMMAND |
+        (app->speed_multiplier == 4 ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(menu, APP_MENU_MACHINE_SPEED_8X, MF_BYCOMMAND |
+        (app->speed_multiplier == 8 ? MF_CHECKED : MF_UNCHECKED));
+    EnableMenuItem(
+        menu,
+        APP_MENU_MACHINE_REWIND,
+        MF_BYCOMMAND | (app->rewind.count > 0 ? MF_ENABLED : MF_GRAYED));
+    CheckMenuItem(
+        menu,
+        APP_MENU_VIEW_FULLSCREEN,
+        MF_BYCOMMAND | (app->fullscreen ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(
+        menu,
+        APP_MENU_VIEW_INTEGER_SCALING,
+        MF_BYCOMMAND | (app->integer_scaling ? MF_CHECKED : MF_UNCHECKED));
+}
+
+static void app_update_input_menu(HWND hwnd, const AppState *app) {
+    HMENU menu = GetMenu(hwnd);
+    UINT selected;
+    if (menu == NULL || app == NULL) {
+        return;
+    }
+    selected = APP_MENU_INPUT_JOYSTICK_NONE + (UINT)app->keyboard_joystick_preset;
+    CheckMenuRadioItem(
+        menu,
+        APP_MENU_INPUT_JOYSTICK_NONE,
+        APP_MENU_INPUT_JOYSTICK_QAOP,
+        selected,
+        MF_BYCOMMAND);
+}
+
+static void app_update_recent_menu(HWND hwnd, const AppState *app) {
+    HMENU menu = GetMenu(hwnd);
+    if (menu == NULL || app == NULL) {
+        return;
+    }
+    for (int i = 0; i < APP_RECENT_MEDIA_COUNT; ++i) {
+        char label[MAX_PATH + 16];
+        if ((size_t)i < app->recent_media_count) {
+            snprintf(label, sizeof(label), "&%d %s", i + 1, app->recent_media[i]);
+            ModifyMenuA(
+                menu,
+                APP_MENU_RECENT_MEDIA_BASE + i,
+                MF_BYCOMMAND | MF_STRING,
+                APP_MENU_RECENT_MEDIA_BASE + i,
+                label);
+        } else {
+            ModifyMenuA(
+                menu,
+                APP_MENU_RECENT_MEDIA_BASE + i,
+                MF_BYCOMMAND | MF_STRING | MF_GRAYED,
+                APP_MENU_RECENT_MEDIA_BASE + i,
+                "(empty)");
+        }
+    }
+    EnableMenuItem(
+        menu,
+        APP_MENU_RECENT_MEDIA_CLEAR,
+        MF_BYCOMMAND | (app->recent_media_count > 0 ? MF_ENABLED : MF_GRAYED));
+}
+
+static void app_add_recent_media(AppState *app, const char *path) {
+    char absolute_path[MAX_PATH];
+    const char *stored_path = path;
+    DWORD length;
+    size_t existing = APP_RECENT_MEDIA_COUNT;
+
+    if (app == NULL || path == NULL || path[0] == '\0') {
+        return;
+    }
+    length = GetFullPathNameA(path, MAX_PATH, absolute_path, NULL);
+    if (length > 0 && length < MAX_PATH) {
+        stored_path = absolute_path;
+    }
+    for (size_t i = 0; i < app->recent_media_count; ++i) {
+        if (_stricmp(app->recent_media[i], stored_path) == 0) {
+            existing = i;
+            break;
+        }
+    }
+    if (existing < app->recent_media_count) {
+        for (size_t i = existing; i > 0; --i) {
+            snprintf(app->recent_media[i], MAX_PATH, "%s", app->recent_media[i - 1]);
+        }
+    } else {
+        size_t limit = app->recent_media_count < APP_RECENT_MEDIA_COUNT
+            ? app->recent_media_count
+            : APP_RECENT_MEDIA_COUNT - 1;
+        for (size_t i = limit; i > 0; --i) {
+            snprintf(app->recent_media[i], MAX_PATH, "%s", app->recent_media[i - 1]);
+        }
+        if (app->recent_media_count < APP_RECENT_MEDIA_COUNT) {
+            app->recent_media_count++;
+        }
+    }
+    snprintf(app->recent_media[0], MAX_PATH, "%s", stored_path);
+    app_save_recent_media(app);
+    if (app->main_hwnd != NULL) {
+        app_update_recent_menu(app->main_hwnd, app);
+    }
+}
+
+static bool app_rewind_init(AppState *app) {
+    const size_t allocation_size = APP_REWIND_SLOT_COUNT * sizeof(zx_t);
+    app->rewind.slots = (zx_t *)_aligned_malloc(allocation_size, _Alignof(zx_t));
+    if (app->rewind.slots != NULL) {
+        memset(app->rewind.slots, 0, allocation_size);
+    }
+    app_rewind_clear(app);
+    return app->rewind.slots != NULL;
+}
+
+static void app_rewind_clear(AppState *app) {
+    if (app == NULL) {
+        return;
+    }
+    app->rewind.next = 0;
+    app->rewind.count = 0;
+    app->rewind.frames_until_capture = 1;
+    if (app->main_hwnd != NULL) {
+        app_update_runtime_menu(app->main_hwnd, app);
+    }
+}
+
+static void app_rewind_discard(AppState *app) {
+    if (app == NULL) {
+        return;
+    }
+    _aligned_free(app->rewind.slots);
+    app->rewind.slots = NULL;
+    app_rewind_clear(app);
+}
+
+static void app_rewind_capture(AppState *app) {
+    size_t slot;
+    if (app == NULL || app->rewind.slots == NULL || app->debug.paused) {
+        return;
+    }
+    if (app->rewind.frames_until_capture > 1) {
+        app->rewind.frames_until_capture--;
+        return;
+    }
+    slot = app->rewind.next;
+    if (!spectrum_save_runtime_state(
+            &app->spec,
+            &app->rewind.slots[slot],
+            &app->rewind.versions[slot])) {
+        return;
+    }
+    app->rewind.models[slot] = app->spec.model;
+    app->rewind.next = (slot + 1) % APP_REWIND_SLOT_COUNT;
+    if (app->rewind.count < APP_REWIND_SLOT_COUNT) {
+        app->rewind.count++;
+    }
+    app->rewind.frames_until_capture = APP_REWIND_CAPTURE_FRAMES;
+    if (app->main_hwnd != NULL) {
+        app_update_runtime_menu(app->main_hwnd, app);
+    }
+}
+
+static bool app_rewind_seconds(AppState *app, unsigned seconds) {
+    size_t steps;
+    size_t slot;
+    if (app == NULL || app->rewind.slots == NULL || app->rewind.count == 0) {
+        return false;
+    }
+    steps = seconds < app->rewind.count ? seconds : app->rewind.count;
+    slot = (app->rewind.next + APP_REWIND_SLOT_COUNT - steps) % APP_REWIND_SLOT_COUNT;
+    if (!spectrum_load_runtime_state(
+            &app->spec,
+            app->rewind.models[slot],
+            &app->rewind.slots[slot],
+            app->rewind.versions[slot])) {
+        app_rewind_clear(app);
+        return false;
+    }
+    app->rewind.next = (slot + 1) % APP_REWIND_SLOT_COUNT;
+    app->rewind.count = app->rewind.count - steps + 1;
+    app->rewind.frames_until_capture = APP_REWIND_CAPTURE_FRAMES;
+    app_audio_flush(app);
+    app_release_all_keys(app);
+    app_debug_machine_changed(app);
+    app_update_runtime_menu(app->main_hwnd, app);
+    InvalidateRect(app->main_hwnd, NULL, FALSE);
+    return true;
+}
+
+static void app_set_fullscreen(HWND hwnd, AppState *app, bool enabled) {
+    if (app == NULL || app->fullscreen == enabled) {
+        return;
+    }
+    if (enabled) {
+        MONITORINFO monitor_info;
+        app->window_placement.length = sizeof(app->window_placement);
+        GetWindowPlacement(hwnd, &app->window_placement);
+        app->windowed_style = GetWindowLongA(hwnd, GWL_STYLE);
+        ZeroMemory(&monitor_info, sizeof(monitor_info));
+        monitor_info.cbSize = sizeof(monitor_info);
+        GetMonitorInfoA(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &monitor_info);
+        SetMenu(hwnd, NULL);
+        SetWindowLongA(hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+        SetWindowPos(
+            hwnd,
+            HWND_TOP,
+            monitor_info.rcMonitor.left,
+            monitor_info.rcMonitor.top,
+            monitor_info.rcMonitor.right - monitor_info.rcMonitor.left,
+            monitor_info.rcMonitor.bottom - monitor_info.rcMonitor.top,
+            SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    } else {
+        SetWindowLongA(hwnd, GWL_STYLE, app->windowed_style);
+        SetMenu(hwnd, app->main_menu);
+        SetWindowPlacement(hwnd, &app->window_placement);
+        SetWindowPos(
+            hwnd,
+            NULL,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+    }
+    app->fullscreen = enabled;
+    app_update_runtime_menu(hwnd, app);
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+/* Keeps a client-sized device bitmap selected into a memory DC so a fully
+   scaled frame, including its black bars, can be presented in one operation. */
+static bool app_video_backbuffer_ensure(
+    AppState *app,
+    HDC reference_dc,
+    int width,
+    int height)
+{
+    VideoBackbuffer *backbuffer;
+    HBITMAP bitmap;
+    HGDIOBJ previous;
+
+    if (app == NULL || reference_dc == NULL || width <= 0 || height <= 0) {
+        return false;
+    }
+    backbuffer = &app->video_backbuffer;
+    if (backbuffer->dc != NULL && backbuffer->bitmap != NULL &&
+        backbuffer->width == width && backbuffer->height == height) {
+        return true;
+    }
+    if (backbuffer->bitmap != NULL) {
+        SelectObject(backbuffer->dc, backbuffer->previous_bitmap);
+        DeleteObject(backbuffer->bitmap);
+        backbuffer->bitmap = NULL;
+        backbuffer->previous_bitmap = NULL;
+    }
+    if (backbuffer->dc == NULL) {
+        backbuffer->dc = CreateCompatibleDC(reference_dc);
+        if (backbuffer->dc == NULL) {
+            return false;
+        }
+    }
+    bitmap = CreateCompatibleBitmap(reference_dc, width, height);
+    if (bitmap == NULL) {
+        return false;
+    }
+    previous = SelectObject(backbuffer->dc, bitmap);
+    if (previous == NULL || previous == HGDI_ERROR) {
+        DeleteObject(bitmap);
+        return false;
+    }
+    backbuffer->bitmap = bitmap;
+    backbuffer->previous_bitmap = previous;
+    backbuffer->width = width;
+    backbuffer->height = height;
+    SetStretchBltMode(backbuffer->dc, COLORONCOLOR);
+    return true;
+}
+
+static void app_video_backbuffer_discard(AppState *app) {
+    VideoBackbuffer *backbuffer;
+    if (app == NULL) {
+        return;
+    }
+    backbuffer = &app->video_backbuffer;
+    if (backbuffer->bitmap != NULL) {
+        SelectObject(backbuffer->dc, backbuffer->previous_bitmap);
+        DeleteObject(backbuffer->bitmap);
+    }
+    if (backbuffer->dc != NULL) {
+        DeleteDC(backbuffer->dc);
+    }
+    ZeroMemory(backbuffer, sizeof(*backbuffer));
+}
+
+static void app_apply_joystick_mask(AppState *app) {
+    spectrum_set_joystick_mask(
+        &app->spec,
+        (uint8_t)(app->controller.joystick_mask |
+                  app->controller.keyboard_joystick_mask));
+}
+
+static uint8_t app_keyboard_joystick_bit(
+    KeyboardJoystickPreset preset,
+    UINT vk)
+{
+    if (preset == APP_KEYBOARD_JOYSTICK_CURSOR) {
+        if (vk == VK_LEFT) return ZX_JOYSTICK_LEFT;
+        if (vk == VK_RIGHT) return ZX_JOYSTICK_RIGHT;
+        if (vk == VK_DOWN) return ZX_JOYSTICK_DOWN;
+        if (vk == VK_UP) return ZX_JOYSTICK_UP;
+        if (vk == VK_SPACE) return ZX_JOYSTICK_BTN;
+    } else if (preset == APP_KEYBOARD_JOYSTICK_WASD) {
+        if (vk == 'A') return ZX_JOYSTICK_LEFT;
+        if (vk == 'D') return ZX_JOYSTICK_RIGHT;
+        if (vk == 'S') return ZX_JOYSTICK_DOWN;
+        if (vk == 'W') return ZX_JOYSTICK_UP;
+        if (vk == VK_SPACE) return ZX_JOYSTICK_BTN;
+    } else if (preset == APP_KEYBOARD_JOYSTICK_QAOP) {
+        if (vk == 'O') return ZX_JOYSTICK_LEFT;
+        if (vk == 'P') return ZX_JOYSTICK_RIGHT;
+        if (vk == 'A') return ZX_JOYSTICK_DOWN;
+        if (vk == 'Q') return ZX_JOYSTICK_UP;
+        if (vk == 'M') return ZX_JOYSTICK_BTN;
+    }
+    return 0;
 }
 
 static bool app_draw_flat_button(const DRAWITEMSTRUCT *draw) {
@@ -986,10 +1572,26 @@ static void app_audio_push_samples(AppState *app, const float *samples, int num_
    them in the frontend ring buffer for later waveOut submission. */
 static void app_audio_callback(const float *samples, int num_samples, void *user_data) {
     AppState *app = (AppState *)user_data;
+    float reduced[APP_AUDIO_CALLBACK_SAMPLES];
+    int reduced_count = 0;
+    unsigned multiplier;
+
     if (app == NULL || app->tape_warp_active) {
         return;
     }
-    app_audio_push_samples(app, samples, num_samples);
+    multiplier = app->speed_multiplier > 0 ? app->speed_multiplier : 1;
+    if (multiplier == 1) {
+        app_audio_push_samples(app, samples, num_samples);
+        return;
+    }
+    /* Faster emulation produces proportionally more samples. Decimating the
+       stream keeps waveOut fed at real time while naturally raising pitch. */
+    for (int i = 0;
+         i < num_samples && reduced_count < APP_AUDIO_CALLBACK_SAMPLES;
+         i += (int)multiplier) {
+        reduced[reduced_count++] = samples[i];
+    }
+    app_audio_push_samples(app, reduced, reduced_count);
 }
 
 /* Refills any available waveOut buffers from the ring buffer, padding with
@@ -1219,6 +1821,8 @@ static void app_release_all_keys(AppState *app) {
             app->active_key_codes[i] = 0;
         }
     }
+    app->controller.keyboard_joystick_mask = 0;
+    app_apply_joystick_mask(app);
 }
 
 /* Samples the inserted tape image at the current emulated t-state so ULA
@@ -1392,21 +1996,33 @@ static bool app_load_tape_file(
     return true;
 }
 
-static bool app_confirm_discard_disk_changes(HWND hwnd, const AppState *app, const char *action) {
-    char message[320];
+static bool app_confirm_discard_disk_changes(HWND hwnd, AppState *app, const char *action) {
+    char message[384];
+    char error_buffer[256];
+    int result;
     if (app == NULL || !app->disk.inserted || !app->disk.dirty) {
         return true;
     }
     snprintf(
         message,
         sizeof(message),
-        "Changes made to the inserted disk are only in memory and have not been written to the DSK file.\n\n%s anyway?",
+        "The inserted disk has changed.\n\nSave it to\n%s\nbefore %s?",
+        app->disk.path,
         action);
-    return MessageBoxA(
+    result = MessageBoxA(
         hwnd,
         message,
         "Unsaved Disk Changes",
-        MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES;
+        MB_YESNOCANCEL | MB_ICONWARNING | MB_DEFBUTTON1);
+    if (result == IDCANCEL) {
+        return false;
+    }
+    if (result == IDYES &&
+        !dsk_save_file(&app->disk, error_buffer, sizeof(error_buffer))) {
+        app_show_error(error_buffer);
+        return false;
+    }
+    return true;
 }
 
 /* Inserts a parsed DSK as drive A:, switches to +3 hardware when needed, and
@@ -1455,8 +2071,11 @@ static bool app_load_disk_file(
 
     app_update_title(hwnd, &app->spec);
     app_update_model_menu(hwnd, app->spec.model);
+    app_update_microdrive_menu(hwnd, app);
     app_update_disk_menu(hwnd, true);
     app_debug_machine_changed(app);
+    app_add_recent_media(app, path);
+    app_rewind_clear(app);
     InvalidateRect(hwnd, NULL, FALSE);
     return true;
 }
@@ -1465,6 +2084,193 @@ static void app_eject_disk(HWND hwnd, AppState *app) {
     dsk_discard(&app->disk);
     spectrum_notify_disk_changed(&app->spec);
     app_update_disk_menu(hwnd, false);
+}
+
+static bool app_confirm_microdrive_changes(
+    HWND hwnd,
+    AppState *app,
+    uint8_t drive,
+    const char *action)
+{
+    MicrodriveCartridge *cartridge;
+    char message[384];
+    char error_buffer[320];
+    int result;
+
+    if (app == NULL || drive >= MICRODRIVE_COUNT) {
+        return false;
+    }
+    cartridge = &app->microdrives.drives[drive];
+    if (!cartridge->inserted || !cartridge->dirty) {
+        return true;
+    }
+    snprintf(
+        message,
+        sizeof(message),
+        "The cartridge in Microdrive %u has changed.\n\nSave it to\n%s\nbefore %s?",
+        (unsigned)drive + 1,
+        cartridge->path,
+        action);
+    result = MessageBoxA(
+        hwnd,
+        message,
+        "Unsaved Microdrive Changes",
+        MB_YESNOCANCEL | MB_ICONWARNING | MB_DEFBUTTON1);
+    if (result == IDCANCEL) {
+        return false;
+    }
+    if (result == IDYES &&
+        !microdrive_save(
+            &app->microdrives,
+            drive,
+            error_buffer,
+            sizeof(error_buffer))) {
+        app_show_error(error_buffer);
+        return false;
+    }
+    return true;
+}
+
+static bool app_confirm_all_microdrive_changes(
+    HWND hwnd,
+    AppState *app,
+    const char *action)
+{
+    for (uint8_t drive = 0; drive < MICRODRIVE_COUNT; ++drive) {
+        if (!app_confirm_microdrive_changes(hwnd, app, drive, action)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool app_load_microdrive_file(
+    HWND hwnd,
+    AppState *app,
+    const char *path,
+    int requested_drive,
+    char *error_buffer,
+    size_t error_buffer_size)
+{
+    MicrodriveBank loaded;
+    SpectrumModel interface_model;
+    const RomSet *set;
+    int drive = requested_drive;
+
+    if (!app->roms.has_interface1_rom) {
+        snprintf(
+            error_buffer,
+            error_buffer_size,
+            "Interface 1 ROM is not available. Place Interface1-v2.rom next to the emulator.");
+        return false;
+    }
+    if (drive < 0) {
+        drive = microdrive_first_empty(&app->microdrives);
+    }
+    if (drive < 0 || drive >= MICRODRIVE_COUNT) {
+        snprintf(error_buffer, error_buffer_size, "All eight Microdrives already contain cartridges.");
+        return false;
+    }
+    if (!app_confirm_microdrive_changes(
+            hwnd,
+            app,
+            (uint8_t)drive,
+            "inserting another cartridge")) {
+        return true;
+    }
+
+    microdrive_bank_init(&loaded);
+    if (!microdrive_load_file(
+            &loaded,
+            0,
+            path,
+            error_buffer,
+            error_buffer_size)) {
+        return false;
+    }
+
+    if (app->spec.model == SPECTRUM_MODEL_PLUS2A ||
+        app->spec.model == SPECTRUM_MODEL_PLUS3) {
+        interface_model = app_rom_set_is_available(&app->roms.rom_48k)
+            ? SPECTRUM_MODEL_48K
+            : SPECTRUM_MODEL_128K;
+        set = app_rom_set_for_model_const(&app->roms, interface_model);
+        if (!app_load_model_roms(
+                app,
+                interface_model,
+                set,
+                error_buffer,
+                error_buffer_size)) {
+            microdrive_bank_discard(&loaded);
+            return false;
+        }
+        app_save_model(interface_model);
+        app_update_title(hwnd, &app->spec);
+        app_update_model_menu(hwnd, app->spec.model);
+        app_debug_machine_changed(app);
+    }
+
+    microdrive_eject(&app->microdrives, (uint8_t)drive);
+    app->microdrives.drives[drive] = loaded.drives[0];
+    memset(&loaded.drives[0], 0, sizeof(loaded.drives[0]));
+    microdrive_bank_discard(&loaded);
+    app_update_microdrive_menu(hwnd, app);
+    app_add_recent_media(app, path);
+    return true;
+}
+
+static bool app_create_microdrive_file(
+    HWND hwnd,
+    AppState *app,
+    const char *path,
+    uint8_t drive,
+    char *error_buffer,
+    size_t error_buffer_size)
+{
+    if (!app->roms.has_interface1_rom ||
+        app->spec.model == SPECTRUM_MODEL_PLUS2A ||
+        app->spec.model == SPECTRUM_MODEL_PLUS3) {
+        snprintf(
+            error_buffer,
+            error_buffer_size,
+            "Interface 1 is available on the 48K, 128K, and +2 models.");
+        return false;
+    }
+    if (drive >= MICRODRIVE_COUNT) {
+        snprintf(error_buffer, error_buffer_size, "Invalid Microdrive number.");
+        return false;
+    }
+    if (!app_confirm_microdrive_changes(
+            hwnd,
+            app,
+            drive,
+            "creating a new cartridge")) {
+        return true;
+    }
+    if (!microdrive_create_file(
+            &app->microdrives,
+            drive,
+            path,
+            error_buffer,
+            error_buffer_size)) {
+        return false;
+    }
+    app_update_microdrive_menu(hwnd, app);
+    app_add_recent_media(app, path);
+    return true;
+}
+
+static void app_eject_microdrive(HWND hwnd, AppState *app, uint8_t drive) {
+    if (drive >= MICRODRIVE_COUNT ||
+        !app_confirm_microdrive_changes(
+            hwnd,
+            app,
+            drive,
+            "ejecting it")) {
+        return;
+    }
+    microdrive_eject(&app->microdrives, drive);
+    app_update_microdrive_menu(hwnd, app);
 }
 
 /* Starts an asynchronous snapshot file read/validation job and returns
@@ -1526,6 +2332,16 @@ static bool app_load_media_path(
             error_buffer_size);
     }
 
+    if (extension != NULL && _stricmp(extension, ".mdr") == 0) {
+        return app_load_microdrive_file(
+            hwnd,
+            app,
+            path,
+            -1,
+            error_buffer,
+            error_buffer_size);
+    }
+
     if (extension != NULL &&
         (_stricmp(extension, ".tap") == 0 ||
          _stricmp(extension, ".tzx") == 0)) {
@@ -1552,7 +2368,7 @@ static bool app_load_media_path(
     snprintf(
         error_buffer,
         error_buffer_size,
-        "Unsupported file type. Open or drop a .tap, .tzx, .dsk, .z80, .sna, or .szx file.");
+        "Unsupported file type. Open or drop a .tap, .tzx, .mdr, .dsk, .z80, .sna, or .szx file.");
     return false;
 }
 
@@ -1575,9 +2391,9 @@ static bool app_apply_loaded_tape(
 
     if (app->tape_autoload_enabled) {
         if (autoload_target == TAPE_AUTOLOAD_TARGET_128_MENU) {
-            autoload_model = app->spec.model == SPECTRUM_MODEL_PLUS3
-                ? SPECTRUM_MODEL_PLUS3
-                : SPECTRUM_MODEL_128K;
+            autoload_model = app->spec.model == SPECTRUM_MODEL_48K
+                ? SPECTRUM_MODEL_128K
+                : app->spec.model;
         } else if (autoload_target == TAPE_AUTOLOAD_TARGET_48_BASIC) {
             autoload_model = SPECTRUM_MODEL_48K;
         }
@@ -1592,6 +2408,7 @@ static bool app_apply_loaded_tape(
             }
             app_update_title(hwnd, &app->spec);
             app_update_model_menu(hwnd, app->spec.model);
+            app_update_microdrive_menu(hwnd, app);
         }
         spectrum_reset(&app->spec);
         app_sync_tape_stop_mode(app);
@@ -1626,7 +2443,10 @@ static bool app_apply_loaded_snapshot(
     char *error_buffer,
     size_t error_buffer_size
 ) {
-    const bool model_changed = job->model != app->spec.model;
+    const bool model_changed =
+        job->model != app->spec.model &&
+        !(job->model == SPECTRUM_MODEL_128K &&
+          app->spec.model == SPECTRUM_MODEL_PLUS2);
     const Spectrum previous_spec = app->spec;
 
     app_autotype_clear(app);
@@ -1666,6 +2486,8 @@ static bool app_apply_loaded_snapshot(
     }
     app_update_title(hwnd, &app->spec);
     app_update_model_menu(hwnd, app->spec.model);
+    app_update_microdrive_menu(hwnd, app);
+    app_rewind_clear(app);
     app_debug_machine_changed(app);
     InvalidateRect(hwnd, NULL, FALSE);
     return true;
@@ -1777,6 +2599,7 @@ static void app_switch_model(HWND hwnd, AppState *app, SpectrumModel model) {
     if (app->spec.model == model) {
         app_save_model(model);
         app_update_model_menu(hwnd, model);
+        app_update_microdrive_menu(hwnd, app);
         app_audio_flush(app);
         return;
     }
@@ -1788,6 +2611,7 @@ static void app_switch_model(HWND hwnd, AppState *app, SpectrumModel model) {
     if (!app_load_model_roms(app, model, set, error_buffer, sizeof(error_buffer))) {
         app_show_error(error_buffer);
         app_update_model_menu(hwnd, app->spec.model);
+        app_update_microdrive_menu(hwnd, app);
         return;
     }
     app_sync_tape_stop_mode(app);
@@ -1796,6 +2620,7 @@ static void app_switch_model(HWND hwnd, AppState *app, SpectrumModel model) {
     app_save_model(model);
     app_update_title(hwnd, &app->spec);
     app_update_model_menu(hwnd, app->spec.model);
+    app_update_microdrive_menu(hwnd, app);
     app_debug_machine_changed(app);
     InvalidateRect(hwnd, NULL, FALSE);
 }
@@ -1804,9 +2629,17 @@ static void app_switch_model(HWND hwnd, AppState *app, SpectrumModel model) {
    translated text keys and held game controls both release correctly. */
 static void app_handle_key_down(AppState *app, WPARAM wparam, LPARAM lparam) {
     UINT vk = (UINT)wparam;
+    uint8_t joystick_bit;
     int key_code;
 
     if (vk >= sizeof(app->active_key_codes) / sizeof(app->active_key_codes[0])) {
+        return;
+    }
+
+    joystick_bit = app_keyboard_joystick_bit(app->keyboard_joystick_preset, vk);
+    if (joystick_bit != 0) {
+        app->controller.keyboard_joystick_mask |= joystick_bit;
+        app_apply_joystick_mask(app);
         return;
     }
 
@@ -1827,9 +2660,17 @@ static void app_handle_key_down(AppState *app, WPARAM wparam, LPARAM lparam) {
    that has just been released by Windows. */
 static void app_handle_key_up(AppState *app, WPARAM wparam) {
     UINT vk = (UINT)wparam;
+    uint8_t joystick_bit;
     int key_code;
 
     if (vk >= sizeof(app->active_key_codes) / sizeof(app->active_key_codes[0])) {
+        return;
+    }
+
+    joystick_bit = app_keyboard_joystick_bit(app->keyboard_joystick_preset, vk);
+    if (joystick_bit != 0) {
+        app->controller.keyboard_joystick_mask &= (uint8_t)~joystick_bit;
+        app_apply_joystick_mask(app);
         return;
     }
 
@@ -1845,7 +2686,7 @@ static void app_handle_key_up(AppState *app, WPARAM wparam) {
 /* Returns the real PAL frame duration for the selected Spectrum model so the
    frontend can step 48K and 128K machines at their native rates. */
 static double app_model_frame_duration_ms(SpectrumModel model) {
-    if (model == SPECTRUM_MODEL_128K) {
+    if (model != SPECTRUM_MODEL_48K) {
         return (311.0 * 228.0 * 1000.0) / 3546894.0;
     }
     return (312.0 * 224.0 * 1000.0) / 3500000.0;
@@ -1920,7 +2761,9 @@ static void app_tick_emulator(AppState *app) {
         app_audio_flush(app);
         elapsed_ms = 0.0;
     }
-    app->emulation_accumulator_ms += elapsed_ms;
+
+    app->emulation_accumulator_ms +=
+        elapsed_ms * (double)(app->speed_multiplier > 0 ? app->speed_multiplier : 1);
     if (app->emulation_accumulator_ms > frame_ms * 8.0) {
         app->emulation_accumulator_ms = frame_ms * 8.0;
     }
@@ -1932,6 +2775,7 @@ static void app_tick_emulator(AppState *app) {
             app_run_autotype(app);
             app_debug_run_frame(app, true);
             (void)app_update_tape_loader_activity(app);
+            app_rewind_capture(app);
             app->emulation_accumulator_ms -= frame_ms;
             rendered = true;
             frames_run++;
@@ -2065,6 +2909,12 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                         case 'R':
                             SendMessageA(hwnd, WM_COMMAND, APP_MENU_FILE_RESET, 0);
                             return 0;
+                        case 'S':
+                            SendMessageA(hwnd, WM_COMMAND, APP_MENU_FILE_SAVE_SNAPSHOT, 0);
+                            return 0;
+                        case VK_BACK:
+                            SendMessageA(hwnd, WM_COMMAND, APP_MENU_MACHINE_REWIND, 0);
+                            return 0;
                         case '1':
                         case VK_NUMPAD1:
                             SendMessageA(hwnd, WM_COMMAND, APP_MENU_MACHINE_48K, 0);
@@ -2076,6 +2926,14 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                         case '3':
                         case VK_NUMPAD3:
                             SendMessageA(hwnd, WM_COMMAND, APP_MENU_MACHINE_PLUS3, 0);
+                            return 0;
+                        case '4':
+                        case VK_NUMPAD4:
+                            SendMessageA(hwnd, WM_COMMAND, APP_MENU_MACHINE_PLUS2, 0);
+                            return 0;
+                        case '5':
+                        case VK_NUMPAD5:
+                            SendMessageA(hwnd, WM_COMMAND, APP_MENU_MACHINE_PLUS2A, 0);
                             return 0;
                         default:
                             break;
@@ -2093,6 +2951,31 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                         case VK_F4:
                             SendMessageA(hwnd, WM_COMMAND, APP_MENU_FILE_STOP_TAPE, 0);
                             return 0;
+                        case VK_F2:
+                            SendMessageA(hwnd, WM_COMMAND, APP_MENU_MACHINE_PAUSE, 0);
+                            return 0;
+                        case VK_F6:
+                            if ((lparam & (1u << 30)) == 0) {
+                                UINT speed_command = APP_MENU_MACHINE_SPEED_1X;
+                                if (app->speed_multiplier == 1) {
+                                    speed_command = APP_MENU_MACHINE_SPEED_2X;
+                                } else if (app->speed_multiplier == 2) {
+                                    speed_command = APP_MENU_MACHINE_SPEED_4X;
+                                } else if (app->speed_multiplier == 4) {
+                                    speed_command = APP_MENU_MACHINE_SPEED_8X;
+                                }
+                                SendMessageA(hwnd, WM_COMMAND, speed_command, 0);
+                            }
+                            return 0;
+                        case VK_F11:
+                            SendMessageA(hwnd, WM_COMMAND, APP_MENU_VIEW_FULLSCREEN, 0);
+                            return 0;
+                        case VK_ESCAPE:
+                            if (app->fullscreen) {
+                                app_set_fullscreen(hwnd, app, false);
+                                return 0;
+                            }
+                            break;
                         default:
                             break;
                     }
@@ -2135,6 +3018,8 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                         app_show_error(job->error);
                     } else {
                         tape_init(&job->tape);
+                        app_add_recent_media(app, job->path);
+                        app_rewind_clear(app);
                     }
                     tape_discard(&job->tape);
                     free(job);
@@ -2151,6 +3036,9 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                         app_show_error(job->error);
                     } else if (!app_apply_loaded_snapshot(hwnd, app, job, job->error, sizeof(job->error))) {
                         app_show_error(job->error);
+                    } else {
+                        app_add_recent_media(app, job->path);
+                        app_rewind_clear(app);
                     }
                     free(job->data);
                     free(job);
@@ -2172,8 +3060,9 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                         ofn.lStructSize = sizeof(ofn);
                         ofn.hwndOwner = hwnd;
                         ofn.lpstrFilter =
-                            "ZX Spectrum Files (*.tap;*.tzx;*.dsk;*.z80;*.sna;*.szx)\0*.tap;*.tzx;*.dsk;*.z80;*.sna;*.szx\0"
+                            "ZX Spectrum Files (*.tap;*.tzx;*.mdr;*.dsk;*.z80;*.sna;*.szx)\0*.tap;*.tzx;*.mdr;*.dsk;*.z80;*.sna;*.szx\0"
                             "Tape Images (*.tap;*.tzx)\0*.tap;*.tzx\0"
+                            "Microdrive Cartridges (*.mdr)\0*.mdr\0"
                             "Spectrum +3 Disks (*.dsk)\0*.dsk\0"
                             "ZX Spectrum Snapshots (*.z80;*.sna;*.szx)\0*.z80;*.sna;*.szx\0"
                             "All Files (*.*)\0*.*\0";
@@ -2195,6 +3084,44 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                                     sizeof(error_buffer))) {
                                 app_show_error(error_buffer);
                             }
+                        }
+                        return 0;
+                    }
+                    case APP_MENU_FILE_SAVE_SNAPSHOT: {
+                        OPENFILENAMEA ofn;
+                        char path[MAX_PATH] = "snapshot.sna";
+                        char error_buffer[256];
+                        ZeroMemory(&ofn, sizeof(ofn));
+                        ZeroMemory(error_buffer, sizeof(error_buffer));
+                        ofn.lStructSize = sizeof(ofn);
+                        ofn.hwndOwner = hwnd;
+                        ofn.lpstrFilter =
+                            "SNA Snapshots (*.sna)\0*.sna\0"
+                            "All Files (*.*)\0*.*\0";
+                        ofn.lpstrFile = path;
+                        ofn.nMaxFile = MAX_PATH;
+                        ofn.Flags =
+                            OFN_OVERWRITEPROMPT |
+                            OFN_PATHMUSTEXIST |
+                            OFN_NOCHANGEDIR;
+                        ofn.lpstrDefExt = "sna";
+                        if (GetSaveFileNameA(&ofn) &&
+                            !spectrum_save_snapshot_sna_file(
+                                &app->spec,
+                                path,
+                                error_buffer,
+                                sizeof(error_buffer))) {
+                            app_show_error(error_buffer);
+                        }
+                        return 0;
+                    }
+                    case APP_MENU_DISK_SAVE: {
+                        char error_buffer[256];
+                        if (!dsk_save_file(
+                                &app->disk,
+                                error_buffer,
+                                sizeof(error_buffer))) {
+                            app_show_error(error_buffer);
                         }
                         return 0;
                     }
@@ -2239,6 +3166,7 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                         tape_stop(&app->tape);
                         spectrum_reset(&app->spec);
                         tape_rewind(&app->tape, (uint32_t)app->spec.machine.freq_hz);
+                        app_rewind_clear(app);
                         app_debug_machine_changed(app);
                         InvalidateRect(hwnd, NULL, FALSE);
                         return 0;
@@ -2255,8 +3183,70 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                     case APP_MENU_MACHINE_128K:
                         app_switch_model(hwnd, app, SPECTRUM_MODEL_128K);
                         return 0;
+                    case APP_MENU_MACHINE_PLUS2:
+                        app_switch_model(hwnd, app, SPECTRUM_MODEL_PLUS2);
+                        return 0;
+                    case APP_MENU_MACHINE_PLUS2A:
+                        app_switch_model(hwnd, app, SPECTRUM_MODEL_PLUS2A);
+                        return 0;
                     case APP_MENU_MACHINE_PLUS3:
                         app_switch_model(hwnd, app, SPECTRUM_MODEL_PLUS3);
+                        return 0;
+                    case APP_MENU_MACHINE_PAUSE:
+                        app->debug.paused = !app->debug.paused;
+                        app->emulation_accumulator_ms = 0.0;
+                        app_audio_flush(app);
+                        QueryPerformanceCounter(&app->last_tick);
+                        app_update_runtime_menu(hwnd, app);
+                        app_debug_refresh_window(app);
+                        return 0;
+                    case APP_MENU_MACHINE_SPEED_1X:
+                    case APP_MENU_MACHINE_SPEED_2X:
+                    case APP_MENU_MACHINE_SPEED_4X:
+                    case APP_MENU_MACHINE_SPEED_8X:
+                        if (LOWORD(wparam) == APP_MENU_MACHINE_SPEED_2X) {
+                            app->speed_multiplier = 2;
+                        } else if (LOWORD(wparam) == APP_MENU_MACHINE_SPEED_4X) {
+                            app->speed_multiplier = 4;
+                        } else if (LOWORD(wparam) == APP_MENU_MACHINE_SPEED_8X) {
+                            app->speed_multiplier = 8;
+                        } else {
+                            app->speed_multiplier = 1;
+                        }
+                        app->emulation_accumulator_ms = 0.0;
+                        app_audio_flush(app);
+                        QueryPerformanceCounter(&app->last_tick);
+                        app_save_speed_multiplier(app->speed_multiplier);
+                        app_update_runtime_menu(hwnd, app);
+                        return 0;
+                    case APP_MENU_MACHINE_REWIND:
+                        if (!app_rewind_seconds(app, 5)) {
+                            MessageBeep(MB_ICONINFORMATION);
+                        }
+                        return 0;
+                    case APP_MENU_VIEW_FULLSCREEN:
+                        app_set_fullscreen(hwnd, app, !app->fullscreen);
+                        return 0;
+                    case APP_MENU_VIEW_INTEGER_SCALING:
+                        app->integer_scaling = !app->integer_scaling;
+                        app_update_runtime_menu(hwnd, app);
+                        InvalidateRect(hwnd, NULL, FALSE);
+                        return 0;
+                    case APP_MENU_INPUT_JOYSTICK_NONE:
+                    case APP_MENU_INPUT_JOYSTICK_CURSOR:
+                    case APP_MENU_INPUT_JOYSTICK_WASD:
+                    case APP_MENU_INPUT_JOYSTICK_QAOP:
+                        app_release_all_keys(app);
+                        app->keyboard_joystick_preset = (KeyboardJoystickPreset)(
+                            LOWORD(wparam) - APP_MENU_INPUT_JOYSTICK_NONE);
+                        app_save_keyboard_joystick(app->keyboard_joystick_preset);
+                        app_update_input_menu(hwnd, app);
+                        return 0;
+                    case APP_MENU_RECENT_MEDIA_CLEAR:
+                        ZeroMemory(app->recent_media, sizeof(app->recent_media));
+                        app->recent_media_count = 0;
+                        app_save_recent_media(app);
+                        app_update_recent_menu(hwnd, app);
                         return 0;
                     case APP_MENU_TOOLS_ASSEMBLER:
                         app_open_assembler_window(app);
@@ -2271,22 +3261,185 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                         SendMessageA(hwnd, WM_CLOSE, 0, 0);
                         return 0;
                     default:
+                        if (LOWORD(wparam) >= APP_MENU_RECENT_MEDIA_BASE &&
+                            LOWORD(wparam) < APP_MENU_RECENT_MEDIA_BASE + APP_RECENT_MEDIA_COUNT) {
+                            const size_t index =
+                                LOWORD(wparam) - APP_MENU_RECENT_MEDIA_BASE;
+                            if (index < app->recent_media_count) {
+                                char path[MAX_PATH];
+                                char error_buffer[256];
+                                snprintf(path, sizeof(path), "%s", app->recent_media[index]);
+                                if (!app_load_media_path(
+                                        hwnd,
+                                        app,
+                                        path,
+                                        error_buffer,
+                                        sizeof(error_buffer))) {
+                                    app_show_error(error_buffer);
+                                }
+                            }
+                            return 0;
+                        }
+                        if (LOWORD(wparam) >= APP_MENU_MICRODRIVE_NEW_BASE &&
+                            LOWORD(wparam) < APP_MENU_MICRODRIVE_NEW_BASE + MICRODRIVE_COUNT) {
+                            OPENFILENAMEA ofn;
+                            char path[MAX_PATH];
+                            char error_buffer[256];
+                            const uint8_t drive = (uint8_t)(
+                                LOWORD(wparam) - APP_MENU_MICRODRIVE_NEW_BASE);
+
+                            ZeroMemory(&ofn, sizeof(ofn));
+                            ZeroMemory(path, sizeof(path));
+                            ZeroMemory(error_buffer, sizeof(error_buffer));
+                            snprintf(path, sizeof(path), "microdrive%d.mdr", drive + 1);
+                            ofn.lStructSize = sizeof(ofn);
+                            ofn.hwndOwner = hwnd;
+                            ofn.lpstrFilter =
+                                "Microdrive Cartridges (*.mdr)\0*.mdr\0"
+                                "All Files (*.*)\0*.*\0";
+                            ofn.lpstrFile = path;
+                            ofn.nMaxFile = MAX_PATH;
+                            ofn.Flags =
+                                OFN_OVERWRITEPROMPT |
+                                OFN_PATHMUSTEXIST |
+                                OFN_NOCHANGEDIR;
+                            ofn.lpstrDefExt = "mdr";
+                            if (GetSaveFileNameA(&ofn) &&
+                                !app_create_microdrive_file(
+                                    hwnd,
+                                    app,
+                                    path,
+                                    drive,
+                                    error_buffer,
+                                    sizeof(error_buffer))) {
+                                app_show_error(error_buffer);
+                            }
+                            return 0;
+                        }
+                        if (LOWORD(wparam) >= APP_MENU_MICRODRIVE_INSERT_BASE &&
+                            LOWORD(wparam) < APP_MENU_MICRODRIVE_INSERT_BASE + MICRODRIVE_COUNT) {
+                            OPENFILENAMEA ofn;
+                            char path[MAX_PATH];
+                            char error_buffer[256];
+                            const int drive =
+                                LOWORD(wparam) - APP_MENU_MICRODRIVE_INSERT_BASE;
+
+                            ZeroMemory(&ofn, sizeof(ofn));
+                            ZeroMemory(path, sizeof(path));
+                            ZeroMemory(error_buffer, sizeof(error_buffer));
+                            ofn.lStructSize = sizeof(ofn);
+                            ofn.hwndOwner = hwnd;
+                            ofn.lpstrFilter =
+                                "Microdrive Cartridges (*.mdr)\0*.mdr\0"
+                                "All Files (*.*)\0*.*\0";
+                            ofn.lpstrFile = path;
+                            ofn.nMaxFile = MAX_PATH;
+                            ofn.Flags =
+                                OFN_FILEMUSTEXIST |
+                                OFN_PATHMUSTEXIST |
+                                OFN_HIDEREADONLY |
+                                OFN_NOCHANGEDIR;
+                            ofn.lpstrDefExt = "mdr";
+                            if (GetOpenFileNameA(&ofn) &&
+                                !app_load_microdrive_file(
+                                    hwnd,
+                                    app,
+                                    path,
+                                    drive,
+                                    error_buffer,
+                                    sizeof(error_buffer))) {
+                                app_show_error(error_buffer);
+                            }
+                            return 0;
+                        }
+                        if (LOWORD(wparam) >= APP_MENU_MICRODRIVE_EJECT_BASE &&
+                            LOWORD(wparam) < APP_MENU_MICRODRIVE_EJECT_BASE + MICRODRIVE_COUNT) {
+                            app_eject_microdrive(
+                                hwnd,
+                                app,
+                                (uint8_t)(LOWORD(wparam) - APP_MENU_MICRODRIVE_EJECT_BASE));
+                            return 0;
+                        }
+                        if (LOWORD(wparam) >= APP_MENU_MICRODRIVE_SAVE_BASE &&
+                            LOWORD(wparam) < APP_MENU_MICRODRIVE_SAVE_BASE + MICRODRIVE_COUNT) {
+                            char error_buffer[256];
+                            const uint8_t drive = (uint8_t)(
+                                LOWORD(wparam) - APP_MENU_MICRODRIVE_SAVE_BASE);
+                            if (!microdrive_save(
+                                    &app->microdrives,
+                                    drive,
+                                    error_buffer,
+                                    sizeof(error_buffer))) {
+                                app_show_error(error_buffer);
+                            }
+                            return 0;
+                        }
+                        if (LOWORD(wparam) >= APP_MENU_MICRODRIVE_WRITE_PROTECT_BASE &&
+                            LOWORD(wparam) < APP_MENU_MICRODRIVE_WRITE_PROTECT_BASE + MICRODRIVE_COUNT) {
+                            const uint8_t drive = (uint8_t)(
+                                LOWORD(wparam) - APP_MENU_MICRODRIVE_WRITE_PROTECT_BASE);
+                            MicrodriveCartridge *cartridge = &app->microdrives.drives[drive];
+                            if (cartridge->inserted) {
+                                cartridge->write_protected = !cartridge->write_protected;
+                                cartridge->dirty = true;
+                                app_update_microdrive_menu(hwnd, app);
+                            }
+                            return 0;
+                        }
                         break;
                 }
             }
             break;
+        case WM_ERASEBKGND:
+            /* WM_PAINT covers the complete client through an off-screen
+               buffer, so a separate background erase would visibly flash. */
+            return 1;
         case WM_PAINT:
             if (app != NULL) {
                 PAINTSTRUCT ps;
                 HDC hdc = BeginPaint(hwnd, &ps);
+                HDC draw_dc = hdc;
                 RECT rect;
+                int target_x = 0;
+                int target_y = 0;
+                int target_width;
+                int target_height;
+                bool buffered;
                 GetClientRect(hwnd, &rect);
-                StretchDIBits(
+                target_width = rect.right - rect.left;
+                target_height = rect.bottom - rect.top;
+                buffered = app_video_backbuffer_ensure(
+                    app,
                     hdc,
-                    0,
-                    0,
-                    rect.right - rect.left,
-                    rect.bottom - rect.top,
+                    target_width,
+                    target_height);
+                if (buffered) {
+                    draw_dc = app->video_backbuffer.dc;
+                }
+                PatBlt(draw_dc, 0, 0, target_width, target_height, BLACKNESS);
+                if (app->integer_scaling) {
+                    int scale_x = target_width / ZX_SCREEN_WIDTH;
+                    int scale_y = target_height / ZX_SCREEN_HEIGHT;
+                    int scale = min(scale_x, scale_y);
+                    if (scale > 0) {
+                        target_width = ZX_SCREEN_WIDTH * scale;
+                        target_height = ZX_SCREEN_HEIGHT * scale;
+                    } else {
+                        double fit_x = (double)target_width / ZX_SCREEN_WIDTH;
+                        double fit_y = (double)target_height / ZX_SCREEN_HEIGHT;
+                        double fit = fit_x < fit_y ? fit_x : fit_y;
+                        target_width = (int)(ZX_SCREEN_WIDTH * fit);
+                        target_height = (int)(ZX_SCREEN_HEIGHT * fit);
+                    }
+                    target_x = (rect.right - target_width) / 2;
+                    target_y = (rect.bottom - target_height) / 2;
+                }
+                StretchDIBits(
+                    draw_dc,
+                    target_x,
+                    target_y,
+                    target_width,
+                    target_height,
                     0,
                     0,
                     ZX_SCREEN_WIDTH,
@@ -2296,11 +3449,30 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                     DIB_RGB_COLORS,
                     SRCCOPY
                 );
+                if (buffered) {
+                    BitBlt(
+                        hdc,
+                        0,
+                        0,
+                        rect.right - rect.left,
+                        rect.bottom - rect.top,
+                        draw_dc,
+                        0,
+                        0,
+                        SRCCOPY);
+                }
                 EndPaint(hwnd, &ps);
             }
             return 0;
+        case WM_SIZE:
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
         case WM_CLOSE:
             if (app != NULL && !app_confirm_discard_disk_changes(hwnd, app, "Exit the emulator")) {
+                return 0;
+            }
+            if (app != NULL &&
+                !app_confirm_all_microdrive_changes(hwnd, app, "exiting the emulator")) {
                 return 0;
             }
             if (app != NULL && app->debug.assembler_hwnd != NULL) {
@@ -2315,6 +3487,7 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         case WM_DESTROY:
             DragAcceptFiles(hwnd, FALSE);
             if (app != NULL) {
+                app_video_backbuffer_discard(app);
                 app_set_modal_loop_timer(app, hwnd, false);
                 if (app->debug.debugger_hwnd != NULL) {
                     DestroyWindow(app->debug.debugger_hwnd);
@@ -2354,6 +3527,16 @@ static bool app_parse_args(
             *model_explicit = true;
             continue;
         }
+        if (strcmp(argv[i], "--plus2") == 0 || strcmp(argv[i], "--2") == 0) {
+            *model = SPECTRUM_MODEL_PLUS2;
+            *model_explicit = true;
+            continue;
+        }
+        if (strcmp(argv[i], "--plus2a") == 0 || strcmp(argv[i], "--2a") == 0) {
+            *model = SPECTRUM_MODEL_PLUS2A;
+            *model_explicit = true;
+            continue;
+        }
         if (strcmp(argv[i], "--plus3") == 0 || strcmp(argv[i], "--3") == 0) {
             *model = SPECTRUM_MODEL_PLUS3;
             *model_explicit = true;
@@ -2383,9 +3566,11 @@ static void app_print_usage(void) {
     fprintf(stderr, "  zxspecemu --48  <48k.rom>\n");
     fprintf(stderr, "  zxspecemu --128 <128k-0.rom> <128k-1.rom>\n");
     fprintf(stderr, "  zxspecemu --128 <128k-combined-32k.rom>\n");
+    fprintf(stderr, "  zxspecemu --plus2 <plus2-combined-32k.rom>\n");
+    fprintf(stderr, "  zxspecemu --plus2a <plus2a-combined-64k.rom>\n");
     fprintf(stderr, "  zxspecemu --plus3 <plus3-combined-64k.rom>\n");
     fprintf(stderr, "  zxspecemu\n");
-    fprintf(stderr, "\nAutodetects .\\plus3.rom, .\\128.rom, and .\\48.rom.\n");
+    fprintf(stderr, "\nAutodetects plus3.rom, plus2a.rom, plus2.rom, 128.rom, and 48.rom.\n");
 }
 
 /* Resolves the persisted settings file path, preferring `%APPDATA%` so the
@@ -2422,6 +3607,14 @@ static bool app_load_saved_model(SpectrumModel *model) {
     }
 
     GetPrivateProfileStringA("emulator", "model", "", value, sizeof(value), path);
+    if (strcmp(value, "plus2a") == 0) {
+        *model = SPECTRUM_MODEL_PLUS2A;
+        return true;
+    }
+    if (strcmp(value, "plus2") == 0) {
+        *model = SPECTRUM_MODEL_PLUS2;
+        return true;
+    }
     if (strcmp(value, "plus3") == 0) {
         *model = SPECTRUM_MODEL_PLUS3;
         return true;
@@ -2457,6 +3650,56 @@ static bool app_load_saved_tape_autoload(bool *enabled) {
         return true;
     }
     return false;
+}
+
+static bool app_load_saved_keyboard_joystick(KeyboardJoystickPreset *preset) {
+    char path[MAX_PATH];
+    char value[16];
+    int parsed;
+    if (!app_settings_path(path, sizeof(path))) {
+        return false;
+    }
+    GetPrivateProfileStringA(
+        "emulator",
+        "keyboard_joystick",
+        "",
+        value,
+        sizeof(value),
+        path);
+    parsed = atoi(value);
+    if (parsed < APP_KEYBOARD_JOYSTICK_NONE ||
+        parsed > APP_KEYBOARD_JOYSTICK_QAOP) {
+        return false;
+    }
+    *preset = (KeyboardJoystickPreset)parsed;
+    return value[0] != '\0';
+}
+
+static void app_load_recent_media(AppState *app) {
+    char settings_path[MAX_PATH];
+    if (app == NULL || !app_settings_path(settings_path, sizeof(settings_path))) {
+        return;
+    }
+    for (int i = 0; i < APP_RECENT_MEDIA_COUNT; ++i) {
+        char key[16];
+        char media_path[MAX_PATH];
+        snprintf(key, sizeof(key), "item%d", i);
+        GetPrivateProfileStringA(
+            "recent",
+            key,
+            "",
+            media_path,
+            sizeof(media_path),
+            settings_path);
+        if (media_path[0] != '\0' && app_file_exists(media_path)) {
+            snprintf(
+                app->recent_media[app->recent_media_count],
+                MAX_PATH,
+                "%s",
+                media_path);
+            app->recent_media_count++;
+        }
+    }
 }
 
 static bool app_load_saved_fast_tape_loading(bool *enabled) {
@@ -2496,6 +3739,24 @@ static bool app_load_saved_sound_muted(bool *muted) {
         return true;
     }
     return false;
+}
+
+static bool app_load_saved_speed_multiplier(unsigned *multiplier) {
+    char path[MAX_PATH];
+    char value[16];
+    unsigned parsed;
+
+    if (!app_settings_path(path, sizeof(path))) {
+        return false;
+    }
+    GetPrivateProfileStringA(
+        "emulator", "speed_multiplier", "", value, sizeof(value), path);
+    parsed = (unsigned)strtoul(value, NULL, 10);
+    if (parsed != 1 && parsed != 2 && parsed != 4 && parsed != 8) {
+        return false;
+    }
+    *multiplier = parsed;
+    return true;
 }
 
 /* Persists the user's menu-selected machine preference so future launches
@@ -2555,6 +3816,50 @@ static void app_save_sound_muted(bool muted) {
     );
 }
 
+static void app_save_speed_multiplier(unsigned multiplier) {
+    char path[MAX_PATH];
+    char value[16];
+    if (!app_settings_path(path, sizeof(path))) {
+        return;
+    }
+    snprintf(value, sizeof(value), "%u", multiplier);
+    WritePrivateProfileStringA(
+        "emulator",
+        "speed_multiplier",
+        value,
+        path);
+}
+
+static void app_save_keyboard_joystick(KeyboardJoystickPreset preset) {
+    char path[MAX_PATH];
+    char value[16];
+    if (!app_settings_path(path, sizeof(path))) {
+        return;
+    }
+    snprintf(value, sizeof(value), "%d", (int)preset);
+    WritePrivateProfileStringA(
+        "emulator",
+        "keyboard_joystick",
+        value,
+        path);
+}
+
+static void app_save_recent_media(const AppState *app) {
+    char path[MAX_PATH];
+    if (app == NULL || !app_settings_path(path, sizeof(path))) {
+        return;
+    }
+    for (int i = 0; i < APP_RECENT_MEDIA_COUNT; ++i) {
+        char key[16];
+        snprintf(key, sizeof(key), "item%d", i);
+        WritePrivateProfileStringA(
+            "recent",
+            key,
+            (size_t)i < app->recent_media_count ? app->recent_media[i] : NULL,
+            path);
+    }
+}
+
 /* Loads the persisted last-used assembler source path from the settings file. */
 static bool app_find_rom(char *out_path, size_t out_size, const char *filename) {
     char module_path[MAX_PATH];
@@ -2595,6 +3900,10 @@ static RomSet *app_rom_set_for_model(RomSelection *selection, SpectrumModel mode
     switch (model) {
         case SPECTRUM_MODEL_PLUS3:
             return &selection->rom_plus3;
+        case SPECTRUM_MODEL_PLUS2A:
+            return &selection->rom_plus2a;
+        case SPECTRUM_MODEL_PLUS2:
+            return &selection->rom_plus2;
         case SPECTRUM_MODEL_128K:
             return &selection->rom_128k;
         case SPECTRUM_MODEL_48K:
@@ -2609,6 +3918,10 @@ static const RomSet *app_rom_set_for_model_const(const RomSelection *selection, 
     switch (model) {
         case SPECTRUM_MODEL_PLUS3:
             return &selection->rom_plus3;
+        case SPECTRUM_MODEL_PLUS2A:
+            return &selection->rom_plus2a;
+        case SPECTRUM_MODEL_PLUS2:
+            return &selection->rom_plus2;
         case SPECTRUM_MODEL_128K:
             return &selection->rom_128k;
         case SPECTRUM_MODEL_48K:
@@ -2704,6 +4017,22 @@ static bool app_load_model_roms(
         dsk_write_sector,
         dsk_get_sector_id,
         &app->disk);
+    spectrum_configure_interface1(
+        &app->spec,
+        microdrive_ready,
+        microdrive_write_protected,
+        microdrive_length,
+        microdrive_read_byte,
+        microdrive_write_byte,
+        &app->microdrives);
+    if (!spectrum_load_interface1_rom(
+            &app->spec,
+            app->roms.has_interface1_rom ? app->roms.interface1_rom : NULL,
+            error_buffer,
+            error_buffer_size)) {
+        app->spec = previous_spec;
+        return false;
+    }
     if (!spectrum_load_roms(
             &app->spec,
             set->rom_a,
@@ -2714,7 +4043,7 @@ static bool app_load_model_roms(
         return false;
     }
 
-    spectrum_set_joystick_mask(&app->spec, app->controller.joystick_mask);
+    app_apply_joystick_mask(app);
     return true;
 }
 
@@ -2794,7 +4123,7 @@ static void app_controller_poll(AppState *app) {
         if (!controller->connected) {
             if (controller->joystick_mask != 0) {
                 controller->joystick_mask = 0;
-                spectrum_set_joystick_mask(&app->spec, 0);
+                app_apply_joystick_mask(app);
             }
             return;
         }
@@ -2842,7 +4171,7 @@ static void app_controller_poll(AppState *app) {
 
     if (mask != controller->joystick_mask) {
         controller->joystick_mask = mask;
-        spectrum_set_joystick_mask(&app->spec, mask);
+        app_apply_joystick_mask(app);
     }
 }
 
@@ -2921,6 +4250,10 @@ static bool app_resolve_roms(
 
     ZeroMemory(selection, sizeof(*selection));
     selection->model = model;
+    if (app_find_rom(rom_path, sizeof(rom_path), "Interface1-v2.rom")) {
+        snprintf(selection->interface1_rom, sizeof(selection->interface1_rom), "%s", rom_path);
+        selection->has_interface1_rom = true;
+    }
     if (rom_a != NULL) {
         target_set = app_rom_set_for_model(selection, model);
         app_rom_set_set_paths(target_set, rom_a, rom_b);
@@ -2936,8 +4269,19 @@ static bool app_resolve_roms(
     if (app_find_rom(rom_path, sizeof(rom_path), "128.rom")) {
         app_rom_set_set_paths(&selection->rom_128k, rom_path, NULL);
     }
+    if (app_find_rom(rom_path, sizeof(rom_path), "plus2.rom")) {
+        app_rom_set_set_paths(&selection->rom_plus2, rom_path, NULL);
+    } else if (selection->rom_128k.has_rom_a) {
+        selection->rom_plus2 = selection->rom_128k;
+    }
+    if (app_find_rom(rom_path, sizeof(rom_path), "plus2a.rom")) {
+        app_rom_set_set_paths(&selection->rom_plus2a, rom_path, NULL);
+    }
     if (app_find_rom(rom_path, sizeof(rom_path), "plus3.rom")) {
         app_rom_set_set_paths(&selection->rom_plus3, rom_path, NULL);
+    }
+    if (!selection->rom_plus2a.has_rom_a && selection->rom_plus3.has_rom_a) {
+        selection->rom_plus2a = selection->rom_plus3;
     }
 
     if (model_explicit) {
@@ -2978,19 +4322,27 @@ int main(int argc, char **argv) {
     bool saved_tape_autoload = true;
     bool saved_fast_tape_loading = true;
     bool saved_sound_muted = false;
+    unsigned saved_speed_multiplier = 1;
+    KeyboardJoystickPreset saved_keyboard_joystick = APP_KEYBOARD_JOYSTICK_NONE;
     bool has_saved_model;
     bool has_saved_tape_autoload;
     bool has_saved_fast_tape_loading;
     bool has_saved_sound_muted;
+    bool has_saved_speed_multiplier;
+    bool has_saved_keyboard_joystick;
     INITCOMMONCONTROLSEX common_controls;
     ZeroMemory(&selection, sizeof(selection));
     has_saved_model = app_load_saved_model(&saved_model);
     has_saved_tape_autoload = app_load_saved_tape_autoload(&saved_tape_autoload);
     has_saved_fast_tape_loading = app_load_saved_fast_tape_loading(&saved_fast_tape_loading);
     has_saved_sound_muted = app_load_saved_sound_muted(&saved_sound_muted);
+    has_saved_speed_multiplier =
+        app_load_saved_speed_multiplier(&saved_speed_multiplier);
+    has_saved_keyboard_joystick =
+        app_load_saved_keyboard_joystick(&saved_keyboard_joystick);
     if (!app_resolve_roms(argc, argv, has_saved_model, saved_model, &selection)) {
         app_print_usage();
-        app_show_error("No compatible ROM found. Place plus3.rom, 128.rom, and/or 48.rom next to the EXE or in the repo.");
+        app_show_error("No compatible ROM found. Place a supported 48K, 128K, +2, +2A, or +3 ROM next to the EXE or in the repo.");
         return 1;
     }
 
@@ -3001,8 +4353,17 @@ int main(int argc, char **argv) {
     app.fast_tape_loading_enabled =
         has_saved_fast_tape_loading ? saved_fast_tape_loading : true;
     app.audio.muted = has_saved_sound_muted ? saved_sound_muted : false;
+    app.speed_multiplier = has_saved_speed_multiplier
+        ? saved_speed_multiplier
+        : 1;
+    app.keyboard_joystick_preset = has_saved_keyboard_joystick
+        ? saved_keyboard_joystick
+        : APP_KEYBOARD_JOYSTICK_NONE;
+    app.integer_scaling = true;
+    app_load_recent_media(&app);
     tape_init(&app.tape);
     dsk_init(&app.disk);
+    microdrive_bank_init(&app.microdrives);
     app_audio_init(&app);
     app_controller_init(&app);
 
@@ -3099,10 +4460,17 @@ int main(int argc, char **argv) {
     }
 
     app.main_hwnd = hwnd;
+    app.main_menu = menu;
+    (void)app_rewind_init(&app);
+    app_rewind_capture(&app);
     app_update_title(hwnd, &app.spec);
     app_update_model_menu(hwnd, app.spec.model);
+    app_update_microdrive_menu(hwnd, &app);
     app_update_sound_menu(hwnd, app.audio.muted);
     app_update_disk_menu(hwnd, app.disk.inserted);
+    app_update_runtime_menu(hwnd, &app);
+    app_update_input_menu(hwnd, &app);
+    app_update_recent_menu(hwnd, &app);
     app_update_tape_menu(
         hwnd,
         app.tape_autoload_enabled,
@@ -3168,6 +4536,8 @@ int main(int argc, char **argv) {
     app_audio_shutdown(&app);
     tape_discard(&app.tape);
     dsk_discard(&app.disk);
+    microdrive_bank_discard(&app.microdrives);
+    app_rewind_discard(&app);
     app_debug_free_storage(&app);
     return 0;
 }

@@ -170,7 +170,7 @@ static void app_update_model_menu(HWND hwnd, SpectrumModel model) {
     CheckMenuRadioItem(
         menu,
         APP_MENU_MACHINE_48K,
-        APP_MENU_MACHINE_PLUS3,
+        APP_MENU_MACHINE_PLUS2A,
         app_model_menu_id(model),
         MF_BYCOMMAND
     );

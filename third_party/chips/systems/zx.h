@@ -69,7 +69,7 @@ extern "C" {
 #endif
 
 // bump this whenever the zx_t struct layout changes
-#define ZX_SNAPSHOT_VERSION (0x0006)
+#define ZX_SNAPSHOT_VERSION (0x0007)
 
 #define ZX_MAX_AUDIO_SAMPLES (1024)      // max number of audio samples in internal sample buffer
 #define ZX_DEFAULT_AUDIO_SAMPLES (128)   // default number of samples in internal sample buffer
@@ -81,11 +81,14 @@ extern "C" {
 #define ZX_PLUS3_MAX_SECTOR_SIZE (8192)
 #define ZX_ULAPLUS_PALETTE_SIZE (64)
 #define ZX_ULAPLUS_MAX_SCANLINE_EVENTS (64)
+#define ZX_INTERFACE1_ROM_SIZE (0x2000)
+#define ZX_MICRODRIVE_COUNT (8)
 
 // ZX Spectrum models
 typedef enum {
     ZX_TYPE_48K,
     ZX_TYPE_128,
+    ZX_TYPE_PLUS2A,
     ZX_TYPE_PLUS3,
 } zx_type_t;
 
@@ -140,6 +143,15 @@ typedef bool (*zx_disk_sector_id_callback_t)(
     uint8_t *out_n,
     uint8_t *st1,
     uint8_t *st2);
+typedef bool (*zx_microdrive_ready_callback_t)(void *user_data, uint8_t drive);
+typedef bool (*zx_microdrive_write_protected_callback_t)(void *user_data, uint8_t drive);
+typedef uint32_t (*zx_microdrive_length_callback_t)(void *user_data, uint8_t drive);
+typedef uint8_t (*zx_microdrive_read_callback_t)(void *user_data, uint8_t drive, uint32_t offset);
+typedef void (*zx_microdrive_write_callback_t)(
+    void *user_data,
+    uint8_t drive,
+    uint32_t offset,
+    uint8_t value);
 
 // config parameters for zx_init()
 typedef struct {
@@ -165,6 +177,16 @@ typedef struct {
         zx_disk_sector_id_callback_t sector_id;
         void *user_data;
     } disk;
+    struct {
+        bool enabled;
+        chips_range_t rom;
+        zx_microdrive_ready_callback_t ready;
+        zx_microdrive_write_protected_callback_t write_protected;
+        zx_microdrive_length_callback_t length;
+        zx_microdrive_read_callback_t read;
+        zx_microdrive_write_callback_t write;
+        void *user_data;
+    } interface1;
     // ROM images
     struct {
         // ZX Spectrum 48K
@@ -234,6 +256,26 @@ typedef struct {
     zx_disk_write_sector_callback_t disk_write_sector;
     zx_disk_sector_id_callback_t disk_sector_id;
     void *disk_user_data;
+    bool interface1_enabled;
+    bool interface1_paged;
+    uint8_t interface1_rom[ZX_INTERFACE1_ROM_SIZE];
+    zx_microdrive_ready_callback_t microdrive_ready;
+    zx_microdrive_write_protected_callback_t microdrive_write_protected;
+    zx_microdrive_length_callback_t microdrive_length;
+    zx_microdrive_read_callback_t microdrive_read;
+    zx_microdrive_write_callback_t microdrive_write;
+    void *microdrive_user_data;
+    uint8_t interface1_comms_clock;
+    uint8_t interface1_comms_data;
+    struct {
+        uint32_t head_pos;
+        uint16_t transferred;
+        uint16_t max_bytes;
+        uint8_t last;
+        uint8_t gap;
+        uint8_t sync;
+        bool motor_on;
+    } microdrive[ZX_MICRODRIVE_COUNT];
     struct {
         chips_audio_callback_t callback;
         int num_samples;
@@ -336,6 +378,11 @@ static void _zx_init_keyboard_matrix(zx_t* sys);
 static uint8_t _zx_contention_delay(zx_t* sys);
 static bool _zx_is_contended_addr(zx_t* sys, uint16_t addr);
 static bool _zx_should_apply_memory_contention(zx_t* sys, uint64_t pins);
+static void _zx_interface1_reset(zx_t* sys);
+static void _zx_interface1_page(zx_t* sys);
+static void _zx_interface1_unpage(zx_t* sys);
+static uint8_t _zx_interface1_port_in(zx_t* sys, uint16_t port);
+static void _zx_interface1_port_out(zx_t* sys, uint16_t port, uint8_t value);
 
 #define _ZX_DEFAULT(val,def) (((val) != 0) ? (val) : (def))
 
@@ -493,6 +540,24 @@ void zx_init(zx_t* sys, const zx_desc_t* desc) {
     sys->disk_write_sector = desc->disk.write_sector;
     sys->disk_sector_id = desc->disk.sector_id;
     sys->disk_user_data = desc->disk.user_data;
+    sys->interface1_enabled =
+        desc->interface1.enabled &&
+        desc->type != ZX_TYPE_PLUS2A &&
+        desc->type != ZX_TYPE_PLUS3 &&
+        desc->interface1.rom.ptr != NULL &&
+        desc->interface1.rom.size == ZX_INTERFACE1_ROM_SIZE;
+    sys->microdrive_ready = desc->interface1.ready;
+    sys->microdrive_write_protected = desc->interface1.write_protected;
+    sys->microdrive_length = desc->interface1.length;
+    sys->microdrive_read = desc->interface1.read;
+    sys->microdrive_write = desc->interface1.write;
+    sys->microdrive_user_data = desc->interface1.user_data;
+    if (sys->interface1_enabled) {
+        memcpy(
+            sys->interface1_rom,
+            desc->interface1.rom.ptr,
+            ZX_INTERFACE1_ROM_SIZE);
+    }
 
     // initalize the hardware
     sys->border_color = 0;
@@ -510,7 +575,7 @@ void zx_init(zx_t* sys, const zx_desc_t* desc) {
         sys->top_border_scanlines = 63;
         sys->scanline_period = 228;
     }
-    else if (ZX_TYPE_PLUS3 == sys->type) {
+    else if (ZX_TYPE_PLUS2A == sys->type || ZX_TYPE_PLUS3 == sys->type) {
         CHIPS_ASSERT(desc->roms.zxplus3_0.ptr && (desc->roms.zxplus3_0.size == 0x4000));
         CHIPS_ASSERT(desc->roms.zxplus3_1.ptr && (desc->roms.zxplus3_1.size == 0x4000));
         CHIPS_ASSERT(desc->roms.zxplus3_2.ptr && (desc->roms.zxplus3_2.size == 0x4000));
@@ -551,6 +616,7 @@ void zx_init(zx_t* sys, const zx_desc_t* desc) {
         });
     }
     _zx_init_memory_map(sys);
+    _zx_interface1_reset(sys);
     _zx_init_keyboard_matrix(sys);
 }
 
@@ -587,6 +653,7 @@ void zx_reset(zx_t* sys) {
         memset(&sys->plus3_fdc, 0, sizeof(sys->plus3_fdc));
     }
     _zx_init_memory_map(sys);
+    _zx_interface1_reset(sys);
 }
 
 static bool _zx_decode_scanline(zx_t* sys) {
@@ -768,6 +835,9 @@ static void _zx_update_memory_map_zx128(zx_t* sys, uint8_t data) {
             to the 48k ROM
         */
         sys->memory_paging_disabled = true;
+    }
+    if (sys->interface1_paged) {
+        _zx_interface1_page(sys);
     }
 }
 
@@ -1404,6 +1474,218 @@ static uint8_t _zx_plus3_fdc_read(zx_t* sys) {
     return data;
 }
 
+static bool _zx_microdrive_ready(const zx_t* sys, uint8_t drive) {
+    return sys->microdrive_ready != NULL &&
+        sys->microdrive_ready(sys->microdrive_user_data, drive);
+}
+
+static bool _zx_microdrive_write_protected(const zx_t* sys, uint8_t drive) {
+    return sys->microdrive_write_protected == NULL ||
+        sys->microdrive_write_protected(sys->microdrive_user_data, drive);
+}
+
+static uint32_t _zx_microdrive_length(const zx_t* sys, uint8_t drive) {
+    return sys->microdrive_length != NULL
+        ? sys->microdrive_length(sys->microdrive_user_data, drive)
+        : 0;
+}
+
+static void _zx_microdrive_increment_head(zx_t* sys, uint8_t drive) {
+    const uint32_t length = _zx_microdrive_length(sys, drive);
+    if (length == 0) {
+        sys->microdrive[drive].head_pos = 0;
+        return;
+    }
+    if (++sys->microdrive[drive].head_pos >= length) {
+        sys->microdrive[drive].head_pos = 0;
+    }
+}
+
+/* The Interface 1 ULA exposes only the 15-byte sector header or the following
+   528-byte record at each transfer. Moving between its ports re-arms the
+   byte counter and advances across the physical inter-record gap. */
+static void _zx_microdrives_restart(zx_t* sys) {
+    for (uint8_t drive = 0; drive < ZX_MICRODRIVE_COUNT; ++drive) {
+        const uint32_t length = _zx_microdrive_length(sys, drive);
+        if (length == 0) {
+            sys->microdrive[drive].head_pos = 0;
+            sys->microdrive[drive].max_bytes = 15;
+        }
+        else {
+            while ((sys->microdrive[drive].head_pos % 543u) != 0 &&
+                   (sys->microdrive[drive].head_pos % 543u) != 15u) {
+                _zx_microdrive_increment_head(sys, drive);
+            }
+            sys->microdrive[drive].max_bytes =
+                (sys->microdrive[drive].head_pos % 543u) == 0 ? 15 : 528;
+        }
+        sys->microdrive[drive].transferred = 0;
+    }
+}
+
+static void _zx_interface1_reset(zx_t* sys) {
+    sys->interface1_paged = false;
+    sys->interface1_comms_clock = 0;
+    sys->interface1_comms_data = 0;
+    memset(sys->microdrive, 0, sizeof(sys->microdrive));
+    for (uint8_t drive = 0; drive < ZX_MICRODRIVE_COUNT; ++drive) {
+        sys->microdrive[drive].last = 0xFF;
+        sys->microdrive[drive].gap = 15;
+        sys->microdrive[drive].sync = 15;
+        sys->microdrive[drive].max_bytes = 15;
+    }
+}
+
+static void _zx_interface1_page(zx_t* sys) {
+    if (!sys->interface1_enabled) {
+        return;
+    }
+    sys->interface1_paged = true;
+    mem_map_rom(
+        &sys->mem,
+        0,
+        0x0000,
+        ZX_INTERFACE1_ROM_SIZE,
+        sys->interface1_rom);
+    mem_map_rom(
+        &sys->mem,
+        0,
+        0x2000,
+        ZX_INTERFACE1_ROM_SIZE,
+        sys->interface1_rom);
+}
+
+static void _zx_interface1_unpage(zx_t* sys) {
+    if (!sys->interface1_enabled) {
+        return;
+    }
+    sys->interface1_paged = false;
+    if (sys->type == ZX_TYPE_128) {
+        const uint8_t rom_index = (sys->last_mem_config >> 4) & 1;
+        mem_map_rom(&sys->mem, 0, 0x0000, 0x4000, sys->rom[rom_index]);
+    }
+    else {
+        mem_map_rom(&sys->mem, 0, 0x0000, 0x4000, sys->rom[0]);
+    }
+}
+
+static uint8_t _zx_interface1_data_in(zx_t* sys) {
+    uint8_t result = 0xFF;
+
+    for (uint8_t drive = 0; drive < ZX_MICRODRIVE_COUNT; ++drive) {
+        if (sys->microdrive[drive].motor_on && _zx_microdrive_ready(sys, drive)) {
+            if (sys->microdrive[drive].transferred <
+                    sys->microdrive[drive].max_bytes &&
+                sys->microdrive_read != NULL) {
+                sys->microdrive[drive].last = sys->microdrive_read(
+                    sys->microdrive_user_data,
+                    drive,
+                    sys->microdrive[drive].head_pos);
+                _zx_microdrive_increment_head(sys, drive);
+            }
+            sys->microdrive[drive].transferred++;
+            result &= sys->microdrive[drive].last;
+        }
+    }
+    return result;
+}
+
+static uint8_t _zx_interface1_control_in(zx_t* sys) {
+    uint8_t result = 0xE7;
+
+    for (uint8_t drive = 0; drive < ZX_MICRODRIVE_COUNT; ++drive) {
+        if (sys->microdrive[drive].motor_on && _zx_microdrive_ready(sys, drive)) {
+            if (sys->microdrive[drive].gap > 0) {
+                sys->microdrive[drive].gap--;
+            }
+            else {
+                result &= 0xF9;
+                if (sys->microdrive[drive].sync > 0) {
+                    sys->microdrive[drive].sync--;
+                }
+                else {
+                    sys->microdrive[drive].gap = 15;
+                    sys->microdrive[drive].sync = 15;
+                }
+            }
+            if (_zx_microdrive_write_protected(sys, drive)) {
+                result &= 0xFE;
+            }
+        }
+    }
+    _zx_microdrives_restart(sys);
+    return result;
+}
+
+static void _zx_interface1_data_out(zx_t* sys, uint8_t value) {
+    for (uint8_t drive = 0; drive < ZX_MICRODRIVE_COUNT; ++drive) {
+        if (!sys->microdrive[drive].motor_on ||
+            !_zx_microdrive_ready(sys, drive) ||
+            _zx_microdrive_write_protected(sys, drive)) {
+            continue;
+        }
+        /* Twelve preamble/sync bytes precede every MDR-format record and are
+           decoded by the ULA rather than stored in the cartridge image. */
+        if (sys->microdrive[drive].transferred >= 12 &&
+            sys->microdrive[drive].transferred <
+                (uint16_t)(sys->microdrive[drive].max_bytes + 12) &&
+            sys->microdrive_write != NULL) {
+            sys->microdrive_write(
+                sys->microdrive_user_data,
+                drive,
+                sys->microdrive[drive].head_pos,
+                value);
+            _zx_microdrive_increment_head(sys, drive);
+        }
+        sys->microdrive[drive].transferred++;
+    }
+}
+
+static void _zx_interface1_control_out(zx_t* sys, uint8_t value) {
+    const uint8_t new_clock = (value >> 1) & 1;
+
+    if (sys->interface1_comms_clock && !new_clock) {
+        for (uint8_t drive = ZX_MICRODRIVE_COUNT - 1; drive > 0; --drive) {
+            sys->microdrive[drive].motor_on =
+                sys->microdrive[drive - 1].motor_on;
+        }
+        sys->microdrive[0].motor_on = (value & 1) == 0;
+    }
+    sys->interface1_comms_data = value & 1;
+    sys->interface1_comms_clock = new_clock;
+    _zx_microdrives_restart(sys);
+}
+
+static uint8_t _zx_interface1_port_in(zx_t* sys, uint16_t port) {
+    switch (port & 0x0018) {
+        case 0x0000:
+            return _zx_interface1_data_in(sys);
+        case 0x0008:
+            return _zx_interface1_control_in(sys);
+        case 0x0010:
+            _zx_microdrives_restart(sys);
+            return 0x7E;
+        default:
+            return 0xFF;
+    }
+}
+
+static void _zx_interface1_port_out(zx_t* sys, uint16_t port, uint8_t value) {
+    switch (port & 0x0018) {
+        case 0x0000:
+            _zx_interface1_data_out(sys, value);
+            break;
+        case 0x0008:
+            _zx_interface1_control_out(sys, value);
+            break;
+        case 0x0010:
+            _zx_microdrives_restart(sys);
+            break;
+        default:
+            break;
+    }
+}
+
 /* Returns the current machine's active contention delay for the current
    frame t-state, or zero when the ULA/gate array is not stealing the bus. */
 static uint8_t _zx_contention_delay(zx_t* sys) {
@@ -1423,7 +1705,9 @@ static uint8_t _zx_contention_delay(zx_t* sys) {
         return 0;
     }
 
-    if (sys->type == ZX_TYPE_128 || sys->type == ZX_TYPE_PLUS3) {
+    if (sys->type == ZX_TYPE_128 ||
+        sys->type == ZX_TYPE_PLUS2A ||
+        sys->type == ZX_TYPE_PLUS3) {
         if (t >= 14361) {
             const uint32_t rel = t - 14361;
             if (rel < (192u * 228u)) {
@@ -1456,7 +1740,7 @@ static bool _zx_is_contended_addr(zx_t* sys, uint16_t addr) {
         return false;
     }
 
-    if (sys->type == ZX_TYPE_PLUS3) {
+    if (sys->type == ZX_TYPE_PLUS2A || sys->type == ZX_TYPE_PLUS3) {
         uint8_t bank;
         if (sys->last_plus3_mem_config & 1) {
             static const uint8_t all_ram_banks[4][4] = {
@@ -1558,7 +1842,17 @@ static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
         // FIXME: 'contended memory'
         const uint16_t addr = Z80_GET_ADDR(pins);
         if (pins & Z80_RD) {
+            if (sys->interface1_enabled && (pins & Z80_M1) &&
+                (addr == 0x0008 || addr == 0x1708)) {
+                _zx_interface1_page(sys);
+            }
             Z80_SET_DATA(pins, mem_rd(&sys->mem, addr));
+            /* The RET opcode at 0700h is fetched from the Interface 1 ROM;
+               its operands and return target must then come from the
+               Spectrum's normal memory map. */
+            if (sys->interface1_paged && (pins & Z80_M1) && addr == 0x0700) {
+                _zx_interface1_unpage(sys);
+            }
         }
         else if (pins & Z80_WR) {
             mem_wr(&sys->mem, addr, Z80_GET_DATA(pins));
@@ -1566,7 +1860,16 @@ static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
     }
     else if ((pins & Z80_IORQ) && !(pins & Z80_M1)) {
         const uint16_t io_addr = Z80_GET_ADDR(pins);
-        if ((pins & Z80_A0) == 0) {
+        if (sys->interface1_enabled && (io_addr & 1) != 0 &&
+            (io_addr & 0x0018) != 0x0018) {
+            if (pins & Z80_RD) {
+                Z80_SET_DATA(pins, _zx_interface1_port_in(sys, io_addr));
+            }
+            else if (pins & Z80_WR) {
+                _zx_interface1_port_out(sys, io_addr, Z80_GET_DATA(pins));
+            }
+        }
+        else if ((pins & Z80_A0) == 0) {
             /* Spectrum ULA (...............0)
                 Bits 5 and 7 as read by INning from Port 0xfe are always one
             */
@@ -1609,7 +1912,8 @@ static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
                 _zx_ulaplus_write_data(sys, Z80_GET_DATA(pins));
             }
         }
-        else if ((pins & Z80_WR) && (sys->type == ZX_TYPE_PLUS3) &&
+        else if ((pins & Z80_WR) &&
+                 (sys->type == ZX_TYPE_PLUS2A || sys->type == ZX_TYPE_PLUS3) &&
                  (((Z80_GET_ADDR(pins) & 0xF002) == 0x1000) ||
                   ((Z80_GET_ADDR(pins) & 0xC002) == 0x4000))) {
             _zx_write_memory_control_plus3(
@@ -1872,7 +2176,9 @@ void zx_notify_disk_changed(zx_t* sys) {
 
 static void _zx_init_memory_map(zx_t* sys) {
     mem_init(&sys->mem);
-    if (sys->type == ZX_TYPE_128 || sys->type == ZX_TYPE_PLUS3) {
+    if (sys->type == ZX_TYPE_128 ||
+        sys->type == ZX_TYPE_PLUS2A ||
+        sys->type == ZX_TYPE_PLUS3) {
         mem_map_ram(&sys->mem, 0, 0x4000, 0x4000, sys->ram[5]);
         mem_map_ram(&sys->mem, 0, 0x8000, 0x4000, sys->ram[2]);
         mem_map_ram(&sys->mem, 0, 0xC000, 0x4000, sys->ram[0]);

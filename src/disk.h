@@ -55,6 +55,12 @@ bool dsk_load_file(
     size_t error_buffer_size
 );
 
+bool dsk_save_file(
+    DskImage *image,
+    char *error_buffer,
+    size_t error_buffer_size
+);
+
 bool dsk_drive_ready(void *user_data, uint8_t drive);
 
 bool dsk_read_sector(
