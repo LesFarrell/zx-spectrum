@@ -9,7 +9,7 @@ Small ZX Spectrum emulator in C for Windows. It uses the Win32 API for display, 
 - Spectrum +2 model with 128K-compatible paging and optional dedicated ROM
 - Spectrum +2A model with four ROM banks, `0x7FFD`/`0x1FFD` paging, and
   all-RAM modes without the +3 floppy controller
-- ZX Interface 1 on 48K/128K/+2 machines, with shadow-ROM paging and eight
+- ZX Interface 1 on 48K/128K/+2 machines, with shadow-ROM paging and two
   read/write Microdrives using standard `.mdr` cartridge images
 - Spectrum +3 model with four ROM banks, `0x7FFD`/`0x1FFD` paging,
   all-RAM modes, AY audio, and uPD765 floppy-controller emulation
@@ -18,22 +18,33 @@ Small ZX Spectrum emulator in C for Windows. It uses the Win32 API for display, 
   including scanline palette changes and colour-register readback
 - Memory-side ULA contention timing for 48K and 128K RAM accesses
 - Keyboard matrix input
-- Kempston joystick input from an XInput-compatible controller
-- Configurable keyboard Kempston presets: cursor keys, WASD, or QAOP
+- Selectable Kempston, Sinclair 1, Sinclair 2, and Cursor/Protek/AGF joystick
+  interfaces for keyboard and XInput-compatible controller input, plus the
+  active-low Fuller joystick interface on port `0x7F`
+- Configurable keyboard joystick presets: cursor keys, WASD, or QAOP
+- Optional Kempston mouse using the host mouse over the emulator display
 - 48K beeper sound through the Windows audio device
 - 128K AY sound through the Windows audio device
+- Optional Fuller Audio Box AY on 48K machines, SpecDrum DAC on port `0xDF`,
+  and Covox DAC on port `0xFB`
+- Multiface 1, Multiface 128, and Multiface 3 ROM/RAM paging with software
+  page ports, NMI button, lockout state, and 8 KB or 16 KB RAM modes
 - `.tap` tape loading
-- `.tzx` v1.20 tape loading, including direct recording, RLE CSW,
-  generalized data, and loop/jump/call/select control flow
+- `.tzx` v1.20 tape loading, including direct recording, RLE/Z-RLE CSW,
+  generalized data, loop/jump/call flow, and interactive select blocks
+- `.pzx` v1.x tape loading with pulse, data, pause, browse, extension, and
+  conditional stop blocks, including fast loading for standard data blocks
 - Standard and extended `.dsk` disk images for the Spectrum +3, including
   sector reads, catalogs, bootable disks, sector writes, and saving changes
   back to the source image
-- `.z80` snapshot loading for 48K and 128K snapshots
+- `.z80` snapshot loading for 48K, 128K, +2, +2A, and +3 snapshots
+- `.z80` snapshot saving for 48K, 128K, +2, +2A, and +3 machines
 - `.sna` snapshot loading for 48K and 128K snapshots
 - `.sna` snapshot saving for 48K, 128K, and +2 machines
-- `.szx` ZX-State snapshot loading for original 48K and 128K machines,
-  including zlib-compressed RAM pages, 128K paging, AY state, and ULAplus
-  `PLTT` palette state
+- `.szx` ZX-State snapshot loading for 48K, 128K, +2, +2A, and +3 machines,
+  including zlib-compressed RAM pages, paging, AY, ULAplus `PLTT`, Fuller AY,
+  SpecDrum, Covox, and Multiface state
+- `.scr` screen loading and saving for the currently displayed RAM bank
 - Pause, selectable 1x/2x/4x/8x speed, borderless fullscreen, and centered
   integer display scaling
 - A 30-second in-memory rewind history sampled once per second
@@ -41,17 +52,13 @@ Small ZX Spectrum emulator in C for Windows. It uses the Win32 API for display, 
 
 ## Not implemented
 
-- Z-RLE-compressed CSW blocks and an interactive choice UI for TZX select
-  blocks (the first select option is used automatically)
 - 128K SNA snapshots captured with the TR-DOS ROM paged in
 - Full ULA I/O contention timing
 - Optional ULAplus Timex hi-colour and hi-resolution video modes
-- Non-48K/128K `.z80` snapshot models
-- SZX machine variants other than the original 48K and 128K models; SZX
-  peripheral blocks are skipped while the core machine state is restored
+- SZX machine variants outside the five currently emulated Sinclair models;
+  unrelated peripheral blocks are skipped while core state is restored
 - Creating or formatting DSK tracks
-- Saving +2A/+3 snapshots; their `.sna` layouts are not portable enough to
-  use the 48K/128K writer
+- Saving +2A/+3 snapshots as `.sna`; use the supported `.z80` writer instead
 - Interface 1 RS-232 and Sinclair Network connections, and raw/unformatted
   Microdrive media (standard formatted `.mdr` images are supported)
 
@@ -64,10 +71,15 @@ Small ZX Spectrum emulator in C for Windows. It uses the Win32 API for display, 
 ## Run
 
 With no arguments, the emulator looks for `plus3.rom`, `plus2a.rom`,
-`plus2.rom`, `128.rom`, and `48.rom` in `.\src`. It enables Interface 1 on
-48K/128K/+2 machines when `Interface1-v2.rom` is present. When dedicated +2
+`plus2.rom`, `128.rom`, and `48.rom` in `.\src\roms`. It enables Interface 1 on
+48K/128K/+2 machines when `Interface1-v2.rom` is present there. When dedicated +2
 or +2A ROMs are absent, the 128K or +3 ROM set is used as a compatible
 fallback. It restores the last selected model when its ROM is available.
+
+Optional Multiface ROMs are discovered in the same folder as
+`multiface1.rom`, `multiface128.rom`, and `multiface3.rom`. The matching image
+must be exactly 8 KB; enable it from the Machine menu before pressing its NMI
+button.
 
 ```powershell
 .\src\zx-spectrum.exe
@@ -115,19 +127,25 @@ Spectrum +3 with one combined 64 KB ROM:
 - `Ctrl` maps to `SYMBOL SHIFT`
 - Raw key presses still drive the Spectrum matrix for held keys and games
 - Printable keys use the active Windows keyboard layout, so symbols such as `"` follow the host layout
-- `Input -> Keyboard Kempston Joystick` selects no keyboard joystick, cursor
-  keys plus Space, WASD plus Space, or QAOP plus M; the selection is remembered
+- `Input -> Keyboard Joystick` selects no keyboard joystick, cursor keys plus
+  Space, WASD plus Space, or QAOP plus M
+- `Input -> Joystick Interface` selects Kempston, Sinclair 1, Sinclair 2,
+  Cursor/Protek/AGF, or Fuller; both keyboard presets and controllers use it
+- `Input -> Kempston Mouse` exposes host movement and three buttons through
+  ports `FBDF`, `FFDF`, and `FADF`; input selections are remembered
 
 ## Controller
 
-- An XInput-compatible pad is exposed as a Kempston joystick
+- An XInput-compatible pad is exposed through the selected joystick interface
 - D-pad or left stick maps to directions
 - `A`, `B`, `X`, `Y`, shoulders, or triggers map to fire
 
 ## Menu
 
-- `File -> Open Media/Snapshot...` opens `.tap`, `.tzx`, `.mdr`, `.dsk`, `.z80`, `.sna`, or `.szx` files
-- `File -> Save Snapshot...` writes the current 48K, 128K, or +2 state as `.sna`
+- `File -> Open Media/Snapshot...` opens `.tap`, `.tzx`, `.pzx`, `.mdr`, `.dsk`, `.scr`, `.z80`, `.sna`, or `.szx` files
+- `File -> Save Snapshot...` writes every supported model as `.z80`, or writes
+  48K/128K/+2 machines as `.sna` when that extension is selected
+- `File -> Save Screen...` writes the visible Spectrum screen as a 6912-byte `.scr`
 - `File -> Recent Media` remembers the eight most recently opened media files
 - Drag one supported tape, disk, or snapshot file onto the emulator window to
   load it through the same media handling
@@ -135,7 +153,7 @@ Spectrum +3 with one combined 64 KB ROM:
   and starts the ROM Loader so bootable disks run automatically
 - `Disk -> Save Disk` writes sector changes back to the inserted DSK
 - `Disk -> Eject Disk` offers to save a modified disk before removing it
-- `Microdrive -> Drive 1` through `Drive 8` inserts/ejects `.mdr` cartridges
+- `Microdrive -> Drive 1` and `Drive 2` insert/eject `.mdr` cartridges
   and controls their write-protect state. `New Empty Cartridge...` creates a
   formatted 254-sector image whose cartridge label comes from the filename;
   changed cartridges can be saved explicitly or on eject/exit
@@ -144,8 +162,9 @@ Spectrum +3 with one combined 64 KB ROM:
 - `File -> Auto-load Tapes On Open` toggles whether opening a tape starts loading automatically
 - With auto-load on, opening a tape inspects the tape and chooses `48 BASIC` or the `128K` tape loader automatically
 - With auto-load off, opening a tape just inserts and rewinds it for manual loading
-- Tape and snapshot file reading now run in the background so opening larger `.tap`, `.tzx`, `.z80`, `.sna`, or `.szx` files does not stall the main window
-- Standard ROM `LOAD ""` operations fast-load automatically for `.tap` and standard-block `.tzx` files
+- Tape and snapshot file reading now run in the background so opening larger `.tap`, `.tzx`, `.pzx`, `.z80`, `.sna`, or `.szx` files does not stall the main window
+- Standard ROM `LOAD ""` operations fast-load automatically for `.tap`,
+  standard-block `.tzx`, and standard-data `.pzx` files
 - `Tape -> Use Fast Tape Loading` runs custom and turbo tape loaders as quickly as the host CPU allows, without generating intermediate audio or frames; it is enabled by default
 - Use `F3` or `File -> Play Tape` only for custom loaders or real-time tape playback
 - Press `F4` or use `File -> Stop Tape` to stop real-time playback
@@ -159,14 +178,16 @@ Spectrum +3 with one combined 64 KB ROM:
 - `F11` toggles fullscreen; `Escape` leaves fullscreen
 - `View -> Integer Scaling` keeps the image at a centered whole-number scale
 - `Sound -> Mute Sound` or `Ctrl+M` toggles all emulator audio and remembers the choice between runs
+- The Sound menu also enables Fuller AY, SpecDrum, and Covox; the Machine menu
+  attaches the matching Multiface and `Alt+F5` presses its NMI button
 - `Tools -> Assembler...` opens a small RAM patching assembler with support for common Z80 instructions plus `ORG`, `DB`, `DW`, `DS`/`DEFS`, `INCBIN`, `INCLUDE`, and TAP export
 - `Tools -> Debugger...` opens a separate debugger window with pause, run, single-step, register state, and memory/disassembly views
 - `Tools -> Poke...` opens a small RAM poke tool for writing one or more byte values directly to memory
 
 ## Tests
 
-Run the Interface 1/Microdrive tests and the snapshot-save, rewind-state,
-+2A-paging, and disk-writeback tests with:
+Run the Interface 1/Microdrive tests and the snapshot, screen, input, PZX/TZX,
+peripheral, +2A-paging, and disk-writeback tests with:
 
 ```powershell
 .\src\test_interface1.bat

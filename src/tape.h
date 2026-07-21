@@ -30,6 +30,17 @@ typedef enum TapeAutoloadTarget {
     TAPE_AUTOLOAD_TARGET_128_MENU
 } TapeAutoloadTarget;
 
+typedef int (*TapeSelectCallback)(
+    void *user_data,
+    const char *const *descriptions,
+    size_t count
+);
+
+typedef struct TapeLoadOptions {
+    TapeSelectCallback select;
+    void *user_data;
+} TapeLoadOptions;
+
 typedef struct TapePlayer {
     TapeSegment *segments;
     size_t segment_count;
@@ -55,6 +66,14 @@ bool tape_load_file(
     uint32_t tick_hz,
     char *error_buffer,
     size_t error_buffer_size
+);
+bool tape_load_file_with_options(
+    TapePlayer *player,
+    const char *path,
+    uint32_t tick_hz,
+    char *error_buffer,
+    size_t error_buffer_size,
+    const TapeLoadOptions *options
 );
 void tape_rewind(TapePlayer *player, uint32_t tick_hz);
 void tape_set_stop_mode(TapePlayer *player, bool stop_in_48k_mode);

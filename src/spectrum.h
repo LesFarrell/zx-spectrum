@@ -53,12 +53,23 @@ typedef struct Spectrum {
     zx_microdrive_read_callback_t microdrive_read;
     zx_microdrive_write_callback_t microdrive_write;
     void *microdrive_user_data;
+    zx_joystick_type_t joystick_type;
+    bool kempston_mouse_enabled;
+    bool fuller_audio_enabled;
+    bool specdrum_enabled;
+    bool covox_enabled;
+    bool multiface_enabled;
+    uint8_t mouse_x;
+    uint8_t mouse_y;
+    uint8_t mouse_buttons;
     int rom48_index;
 
     uint8_t rom[4][0x4000];
     bool rom_loaded[4];
     uint8_t interface1_rom[ZX_INTERFACE1_ROM_SIZE];
     bool interface1_rom_loaded;
+    uint8_t multiface_rom[ZX_MULTIFACE_ROM_SIZE];
+    bool multiface_rom_loaded;
 
     uint32_t framebuffer[ZX_SCREEN_WIDTH * ZX_SCREEN_HEIGHT];
 } Spectrum;
@@ -80,6 +91,13 @@ bool spectrum_load_roms(
 /* Loads the optional 8 KB Interface 1 shadow ROM used by 48K and 128K
    machines. The peripheral remains disabled if no image is configured. */
 bool spectrum_load_interface1_rom(
+    Spectrum *spec,
+    const char *rom_path,
+    char *error_buffer,
+    size_t error_buffer_size
+);
+
+bool spectrum_load_multiface_rom(
     Spectrum *spec,
     const char *rom_path,
     char *error_buffer,
@@ -121,7 +139,7 @@ void spectrum_configure_disk(
     void *user_data
 );
 
-/* Wires the eight emulated Microdrive cartridge slots into Interface 1. */
+/* Wires the two emulated Microdrive cartridge slots into Interface 1. */
 void spectrum_configure_interface1(
     Spectrum *spec,
     zx_microdrive_ready_callback_t ready,
@@ -151,11 +169,48 @@ void spectrum_key_down(Spectrum *spec, int key_code);
    mapping configured during machine initialization. */
 void spectrum_key_up(Spectrum *spec, int key_code);
 
-/* Updates the emulated joystick state mask presented on the Kempston port. */
+/* Selects the emulated joystick interface used by host controls. */
+void spectrum_set_joystick_type(Spectrum *spec, zx_joystick_type_t type);
+
+/* Updates the emulated joystick state mask presented through that interface. */
 void spectrum_set_joystick_mask(Spectrum *spec, uint8_t mask);
+
+void spectrum_set_kempston_mouse_enabled(Spectrum *spec, bool enabled);
+void spectrum_set_mouse(Spectrum *spec, uint8_t x, uint8_t y, uint8_t buttons);
+void spectrum_set_expansion_audio(
+    Spectrum *spec,
+    bool fuller_audio,
+    bool specdrum,
+    bool covox
+);
+void spectrum_set_multiface_enabled(Spectrum *spec, bool enabled);
+void spectrum_multiface_nmi(Spectrum *spec);
+
+/* Loads or saves the 6912-byte bitmap/attribute image of the visible screen. */
+bool spectrum_load_screen_scr_data(
+    Spectrum *spec,
+    const uint8_t *data,
+    size_t data_size,
+    char *error_buffer,
+    size_t error_buffer_size
+);
+bool spectrum_save_screen_scr_file(
+    const Spectrum *spec,
+    const char *path,
+    char *error_buffer,
+    size_t error_buffer_size
+);
 
 /* Saves the current 48K, 128K, or +2 state as a portable SNA file. */
 bool spectrum_save_snapshot_sna_file(
+    Spectrum *spec,
+    const char *path,
+    char *error_buffer,
+    size_t error_buffer_size
+);
+
+/* Saves any supported machine as an uncompressed version-3 Z80 snapshot. */
+bool spectrum_save_snapshot_z80_file(
     Spectrum *spec,
     const char *path,
     char *error_buffer,
@@ -200,7 +255,7 @@ bool spectrum_load_snapshot_sna_data(
     size_t error_buffer_size
 );
 
-/* Detects a ZX-State container for an original 48K or 128K machine. */
+/* Detects a ZX-State container for any supported Spectrum model. */
 bool spectrum_detect_snapshot_szx_model_data(
     const uint8_t *data,
     size_t size,

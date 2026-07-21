@@ -69,7 +69,7 @@ extern "C" {
 #endif
 
 // bump this whenever the zx_t struct layout changes
-#define ZX_SNAPSHOT_VERSION (0x0007)
+#define ZX_SNAPSHOT_VERSION (0x0009)
 
 #define ZX_MAX_AUDIO_SAMPLES (1024)      // max number of audio samples in internal sample buffer
 #define ZX_DEFAULT_AUDIO_SAMPLES (128)   // default number of samples in internal sample buffer
@@ -82,7 +82,9 @@ extern "C" {
 #define ZX_ULAPLUS_PALETTE_SIZE (64)
 #define ZX_ULAPLUS_MAX_SCANLINE_EVENTS (64)
 #define ZX_INTERFACE1_ROM_SIZE (0x2000)
-#define ZX_MICRODRIVE_COUNT (8)
+#define ZX_MULTIFACE_ROM_SIZE (0x2000)
+#define ZX_MULTIFACE_RAM_SIZE (0x4000)
+#define ZX_MICRODRIVE_COUNT (2)
 
 // ZX Spectrum models
 typedef enum {
@@ -98,6 +100,8 @@ typedef enum {
     ZX_JOYSTICKTYPE_KEMPSTON,
     ZX_JOYSTICKTYPE_SINCLAIR_1,
     ZX_JOYSTICKTYPE_SINCLAIR_2,
+    ZX_JOYSTICKTYPE_CURSOR,
+    ZX_JOYSTICKTYPE_FULLER,
 } zx_joystick_type_t;
 
 // joystick mask bits
@@ -106,6 +110,10 @@ typedef enum {
 #define ZX_JOYSTICK_DOWN    (1<<2)
 #define ZX_JOYSTICK_UP      (1<<3)
 #define ZX_JOYSTICK_BTN     (1<<4)
+
+#define ZX_MOUSE_RIGHT      (1<<0)
+#define ZX_MOUSE_LEFT       (1<<1)
+#define ZX_MOUSE_MIDDLE     (1<<2)
 
 typedef bool (*zx_tape_input_callback_t)(void *user_data, uint64_t tick_count);
 typedef bool (*zx_tape_load_trap_callback_t)(void *user_data, void *machine);
@@ -187,6 +195,13 @@ typedef struct {
         zx_microdrive_write_callback_t write;
         void *user_data;
     } interface1;
+    struct {
+        bool fuller_audio;
+        bool specdrum;
+        bool covox;
+        bool multiface_enabled;
+        chips_range_t multiface_rom;
+    } expansion;
     // ROM images
     struct {
         // ZX Spectrum 48K
@@ -212,6 +227,15 @@ typedef struct {
     bool memory_paging_disabled;
     uint8_t kbd_joymask;        // joystick mask from keyboard joystick emulation
     uint8_t joy_joymask;        // joystick mask from zx_joystick()
+    uint8_t mouse_x;
+    uint8_t mouse_y;
+    uint8_t mouse_buttons;
+    bool kempston_mouse_enabled;
+    bool fuller_audio_enabled;
+    bool specdrum_enabled;
+    bool covox_enabled;
+    uint8_t specdrum_value;
+    uint8_t covox_value;
     uint32_t tick_count;
     uint32_t frame_tstate;
     uint8_t last_mem_config;    // last out to 0x7FFD
@@ -259,6 +283,14 @@ typedef struct {
     bool interface1_enabled;
     bool interface1_paged;
     uint8_t interface1_rom[ZX_INTERFACE1_ROM_SIZE];
+    bool multiface_enabled;
+    bool multiface_paged;
+    bool multiface_software_lockout;
+    bool multiface_red_button_disabled;
+    bool multiface_16k_ram_mode;
+    uint8_t multiface_nmi_ticks;
+    uint8_t multiface_rom[ZX_MULTIFACE_ROM_SIZE];
+    uint8_t multiface_ram[ZX_MULTIFACE_RAM_SIZE];
     zx_microdrive_ready_callback_t microdrive_ready;
     zx_microdrive_write_protected_callback_t microdrive_write_protected;
     zx_microdrive_length_callback_t microdrive_length;
@@ -340,6 +372,15 @@ void zx_set_joystick_type(zx_t* sys, zx_joystick_type_t type);
 zx_joystick_type_t zx_joystick_type(zx_t* sys);
 // set joystick mask (combination of ZX_JOYSTICK_*)
 void zx_joystick(zx_t* sys, uint8_t mask);
+// enable or disable the Kempston mouse ports
+void zx_set_kempston_mouse_enabled(zx_t* sys, bool enabled);
+// update the Kempston mouse counters and active-high button mask
+void zx_mouse(zx_t* sys, uint8_t x, uint8_t y, uint8_t buttons);
+// configure optional audio peripherals
+void zx_set_expansion_audio(zx_t* sys, bool fuller_audio, bool specdrum, bool covox);
+// enable/disable an already configured Multiface and press its red NMI button
+void zx_set_multiface_enabled(zx_t* sys, bool enabled);
+void zx_multiface_nmi(zx_t* sys);
 // set a callback used for EAR/tape input sampling during ULA reads
 void zx_set_tape_input(zx_t* sys, zx_tape_input_callback_t callback, void *user_data);
 // set a callback used to fast-trap the ROM tape loader for standard blocks
@@ -376,6 +417,7 @@ bool zx_load_snapshot(zx_t* sys, uint32_t version, zx_t* src);
 static void _zx_init_memory_map(zx_t* sys);
 static void _zx_init_keyboard_matrix(zx_t* sys);
 static uint8_t _zx_contention_delay(zx_t* sys);
+static void _zx_multiface_page(zx_t* sys);
 static bool _zx_is_contended_addr(zx_t* sys, uint16_t addr);
 static bool _zx_should_apply_memory_contention(zx_t* sys, uint64_t pins);
 static void _zx_interface1_reset(zx_t* sys);
@@ -558,6 +600,21 @@ void zx_init(zx_t* sys, const zx_desc_t* desc) {
             desc->interface1.rom.ptr,
             ZX_INTERFACE1_ROM_SIZE);
     }
+    sys->fuller_audio_enabled = desc->expansion.fuller_audio;
+    sys->specdrum_enabled = desc->expansion.specdrum;
+    sys->covox_enabled = desc->expansion.covox;
+    sys->specdrum_value = 0x80;
+    sys->covox_value = 0x80;
+    sys->multiface_enabled =
+        desc->expansion.multiface_enabled &&
+        desc->expansion.multiface_rom.ptr != NULL &&
+        desc->expansion.multiface_rom.size == ZX_MULTIFACE_ROM_SIZE;
+    if (sys->multiface_enabled) {
+        memcpy(
+            sys->multiface_rom,
+            desc->expansion.multiface_rom.ptr,
+            ZX_MULTIFACE_ROM_SIZE);
+    }
 
     // initalize the hardware
     sys->border_color = 0;
@@ -607,14 +664,12 @@ void zx_init(zx_t* sys, const zx_desc_t* desc) {
         .sound_hz = audio_hz,
         .base_volume = _ZX_DEFAULT(desc->audio.beeper_volume, 0.25f),
     });
-    if (ZX_TYPE_48K != sys->type) {
-        ay38910_init(&sys->ay, &(ay38910_desc_t){
-            .type = AY38910_TYPE_8912,
-            .tick_hz = (int)sys->freq_hz / 2,
-            .sound_hz = audio_hz,
-            .magnitude = _ZX_DEFAULT(desc->audio.ay_volume, 0.5f)
-        });
-    }
+    ay38910_init(&sys->ay, &(ay38910_desc_t){
+        .type = AY38910_TYPE_8912,
+        .tick_hz = (int)sys->freq_hz / 2,
+        .sound_hz = audio_hz,
+        .magnitude = _ZX_DEFAULT(desc->audio.ay_volume, 0.5f)
+    });
     _zx_init_memory_map(sys);
     _zx_interface1_reset(sys);
     _zx_init_keyboard_matrix(sys);
@@ -629,9 +684,7 @@ void zx_reset(zx_t* sys) {
     CHIPS_ASSERT(sys && sys->valid);
     sys->pins = z80_reset(&sys->cpu);
     beeper_reset(&sys->beeper);
-    if (sys->type != ZX_TYPE_48K) {
-        ay38910_reset(&sys->ay);
-    }
+    ay38910_reset(&sys->ay);
     sys->memory_paging_disabled = false;
     sys->kbd_joymask = 0;
     sys->joy_joymask = 0;
@@ -639,6 +692,11 @@ void zx_reset(zx_t* sys) {
     sys->last_mem_config = 0;
     sys->last_plus3_mem_config = 0;
     sys->last_fe_out = 0;
+    sys->specdrum_value = 0x80;
+    sys->covox_value = 0x80;
+    sys->multiface_paged = false;
+    sys->multiface_software_lockout = false;
+    sys->multiface_nmi_ticks = 0;
     sys->scanline_counter = sys->scanline_period;
     sys->scanline_y = 0;
     sys->blink_counter = 0;
@@ -810,6 +868,23 @@ static bool _zx_decode_scanline(zx_t* sys) {
     }
 }
 
+static void _zx_multiface_page(zx_t* sys) {
+    if (!sys->multiface_enabled) {
+        return;
+    }
+    sys->multiface_paged = true;
+    if (sys->multiface_16k_ram_mode) {
+        mem_map_ram(
+            &sys->mem, 0, 0x0000, ZX_MULTIFACE_RAM_SIZE, sys->multiface_ram);
+    }
+    else {
+        mem_map_rom(
+            &sys->mem, 0, 0x0000, ZX_MULTIFACE_ROM_SIZE, sys->multiface_rom);
+        mem_map_ram(
+            &sys->mem, 0, 0x2000, ZX_MULTIFACE_ROM_SIZE, sys->multiface_ram);
+    }
+}
+
 // ZX128 memory mapping
 static void _zx_update_memory_map_zx128(zx_t* sys, uint8_t data) {
     if (!sys->memory_paging_disabled) {
@@ -838,6 +913,9 @@ static void _zx_update_memory_map_zx128(zx_t* sys, uint8_t data) {
     }
     if (sys->interface1_paged) {
         _zx_interface1_page(sys);
+    }
+    if (sys->multiface_paged) {
+        _zx_multiface_page(sys);
     }
 }
 
@@ -875,6 +953,29 @@ static void _zx_update_memory_map_plus3(zx_t* sys) {
             0xC000,
             0x4000,
             sys->ram[sys->last_mem_config & 0x7]);
+    }
+    if (sys->multiface_paged) {
+        _zx_multiface_page(sys);
+    }
+}
+
+static void _zx_multiface_unpage(zx_t* sys) {
+    if (!sys->multiface_enabled) {
+        return;
+    }
+    sys->multiface_paged = false;
+    if (sys->type == ZX_TYPE_PLUS2A || sys->type == ZX_TYPE_PLUS3) {
+        _zx_update_memory_map_plus3(sys);
+    }
+    else if (sys->type == ZX_TYPE_128) {
+        const uint8_t rom_index = (sys->last_mem_config >> 4) & 1;
+        mem_map_rom(&sys->mem, 0, 0x0000, 0x4000, sys->rom[rom_index]);
+    }
+    else {
+        mem_map_rom(&sys->mem, 0, 0x0000, 0x4000, sys->rom[0]);
+    }
+    if (sys->interface1_paged) {
+        _zx_interface1_page(sys);
     }
 }
 
@@ -1776,6 +1877,29 @@ static bool _zx_should_apply_memory_contention(zx_t* sys, uint64_t pins) {
     return (pins & Z80_MREQ) && _zx_is_contended_addr(sys, Z80_GET_ADDR(pins));
 }
 
+static uint8_t _zx_fuller_joystick_value(const zx_t* sys) {
+    const uint8_t mask = sys->kbd_joymask | sys->joy_joymask;
+    uint8_t data = 0xFF;
+    if (mask & ZX_JOYSTICK_UP)    data &= (uint8_t)~(1u<<0);
+    if (mask & ZX_JOYSTICK_DOWN)  data &= (uint8_t)~(1u<<1);
+    if (mask & ZX_JOYSTICK_LEFT)  data &= (uint8_t)~(1u<<2);
+    if (mask & ZX_JOYSTICK_RIGHT) data &= (uint8_t)~(1u<<3);
+    if (mask & ZX_JOYSTICK_BTN)   data &= (uint8_t)~(1u<<7);
+    return data;
+}
+
+static uint8_t _zx_multiface_page_in_port(const zx_t* sys) {
+    if (sys->type == ZX_TYPE_48K) return 0x9F;
+    if (sys->type == ZX_TYPE_128) return 0xBF;
+    return 0x3F;
+}
+
+static uint8_t _zx_multiface_page_out_port(const zx_t* sys) {
+    if (sys->type == ZX_TYPE_48K) return 0x1F;
+    if (sys->type == ZX_TYPE_128) return 0x3F;
+    return 0xBF;
+}
+
 static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
     bool new_frame = false;
 
@@ -1807,6 +1931,9 @@ static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
         pins &= ~Z80_WAIT;
     }
     pins = z80_tick(&sys->cpu, pins);
+    if (sys->multiface_nmi_ticks > 0 && --sys->multiface_nmi_ticks == 0) {
+        pins &= ~Z80_NMI;
+    }
     /*
         The Spectrum does not place a peripheral-supplied opcode on the data
         bus during interrupt acknowledge.  Model the resulting 0xFF bus value
@@ -1912,6 +2039,20 @@ static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
                 _zx_ulaplus_write_data(sys, Z80_GET_DATA(pins));
             }
         }
+        else if (sys->multiface_enabled && (pins & Z80_RD) &&
+                 (uint8_t)io_addr == _zx_multiface_page_in_port(sys)) {
+            if (!sys->multiface_software_lockout) {
+                _zx_multiface_page(sys);
+            }
+            Z80_SET_DATA(pins, 0xFF);
+        }
+        else if (sys->multiface_enabled && (pins & Z80_WR) &&
+                 (uint8_t)io_addr == _zx_multiface_page_out_port(sys)) {
+            _zx_multiface_unpage(sys);
+            if (sys->type != ZX_TYPE_48K) {
+                sys->multiface_software_lockout = true;
+            }
+        }
         else if ((pins & Z80_WR) &&
                  (sys->type == ZX_TYPE_PLUS2A || sys->type == ZX_TYPE_PLUS3) &&
                  (((Z80_GET_ADDR(pins) & 0xF002) == 0x1000) ||
@@ -1921,10 +2062,23 @@ static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
                 Z80_GET_ADDR(pins),
                 Z80_GET_DATA(pins));
         }
+        else if ((sys->type == ZX_TYPE_PLUS2A) &&
+                 ((Z80_GET_ADDR(pins) & 0xF002) == 0x2000) &&
+                 (pins & Z80_RD)) {
+            /* The +2A shares the +3 ROM, which probes the omitted FDC through
+               its status port. An unconnected data bus reads high, allowing
+               the ROM to detect that no disk controller is present. */
+            Z80_SET_DATA(pins, 0xFF);
+        }
         else if ((sys->type == ZX_TYPE_PLUS3) &&
                  ((Z80_GET_ADDR(pins) & 0xF002) == 0x2000) &&
                  (pins & Z80_RD)) {
             Z80_SET_DATA(pins, _zx_plus3_fdc_status(sys));
+        }
+        else if ((sys->type == ZX_TYPE_PLUS2A) &&
+                 ((Z80_GET_ADDR(pins) & 0xF002) == 0x3000) &&
+                 (pins & Z80_RD)) {
+            Z80_SET_DATA(pins, 0xFF);
         }
         else if ((sys->type == ZX_TYPE_PLUS3) &&
                  ((Z80_GET_ADDR(pins) & 0xF002) == 0x3000)) {
@@ -1941,11 +2095,53 @@ static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
             */
             _zx_update_memory_map_zx128(sys, Z80_GET_DATA(pins));
         }
+        else if (sys->kempston_mouse_enabled && (pins & Z80_RD) &&
+                 (io_addr & 0x15FF) == 0x10DF) {
+            // Kempston mouse buttons are active-low; upper bits are idle-high.
+            Z80_SET_DATA(pins, (uint8_t)(0xFFu ^ (sys->mouse_buttons & 0x07u)));
+        }
+        else if (sys->kempston_mouse_enabled && (pins & Z80_RD) &&
+                 (io_addr & 0x15FF) == 0x11DF) {
+            Z80_SET_DATA(pins, sys->mouse_x);
+        }
+        else if (sys->kempston_mouse_enabled && (pins & Z80_RD) &&
+                 (io_addr & 0x15FF) == 0x15DF) {
+            Z80_SET_DATA(pins, sys->mouse_y);
+        }
+        else if (sys->type == ZX_TYPE_48K && sys->fuller_audio_enabled &&
+                 (uint8_t)io_addr == 0x3F && (pins & Z80_WR)) {
+            ay38910_set_addr_latch(&sys->ay, Z80_GET_DATA(pins));
+        }
+        else if (sys->type == ZX_TYPE_48K && sys->fuller_audio_enabled &&
+                 (uint8_t)io_addr == 0x5F) {
+            if (pins & Z80_RD) {
+                Z80_SET_DATA(pins,
+                    sys->ay.addr < AY38910_NUM_REGISTERS
+                        ? sys->ay.reg[sys->ay.addr]
+                        : 0xFF);
+            }
+            else if (pins & Z80_WR) {
+                ay38910_set_register(
+                    &sys->ay, sys->ay.addr, Z80_GET_DATA(pins));
+            }
+        }
+        else if (sys->specdrum_enabled && (uint8_t)io_addr == 0xDF &&
+                 (pins & Z80_WR)) {
+            sys->specdrum_value = Z80_GET_DATA(pins);
+        }
+        else if (sys->covox_enabled && (uint8_t)io_addr == 0xFB &&
+                 (pins & Z80_WR)) {
+            sys->covox_value = Z80_GET_DATA(pins);
+        }
         else if (((pins & (Z80_A15|Z80_A1)) == Z80_A15) && (sys->type != ZX_TYPE_48K)) {
             // AY-3-8912 access (1*............0.)
             if (pins & Z80_A14) { pins |= AY38910_BC1; }
             if (pins & Z80_WR) { pins |= AY38910_BDIR; }
             pins = ay38910_iorq(&sys->ay, pins) & Z80_PIN_MASK;
+        }
+        else if (sys->joystick_type == ZX_JOYSTICKTYPE_FULLER &&
+                 (pins & Z80_RD) && (uint8_t)io_addr == 0x7F) {
+            Z80_SET_DATA(pins, _zx_fuller_joystick_value(sys));
         }
         else if ((pins & (Z80_RD|Z80_A7|Z80_A6|Z80_A5)) == Z80_RD) {
             // Kempston Joystick (........000.....)
@@ -1962,7 +2158,13 @@ static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
     // tick the beeper
     if (beeper_tick(&sys->beeper)) {
         // new sample ready (if this is not a ZX128, sys->ay.sample will be 0)
-        const float sample = sys->beeper.sample + sys->ay.sample;
+        float sample = sys->beeper.sample + sys->ay.sample;
+        if (sys->specdrum_enabled) {
+            sample += ((float)(int8_t)sys->specdrum_value / 128.0f) * 0.20f;
+        }
+        if (sys->covox_enabled) {
+            sample += ((float)(int)sys->covox_value - 128.0f) / 128.0f * 0.20f;
+        }
         sys->audio.sample_buffer[sys->audio.sample_pos++] = sample;
         if (sys->audio.sample_pos == sys->audio.num_samples) {
             if (sys->audio.callback.func) {
@@ -2018,90 +2220,19 @@ uint32_t zx_exec(zx_t* sys, uint32_t micro_seconds) {
 
 void zx_key_down(zx_t* sys, int key_code) {
     CHIPS_ASSERT(sys && sys->valid);
-    switch (sys->joystick_type) {
-        case ZX_JOYSTICKTYPE_NONE:
-            kbd_key_down(&sys->kbd, key_code);
-            break;
-        case ZX_JOYSTICKTYPE_KEMPSTON:
-            switch (key_code) {
-                case 0x20:  sys->kbd_joymask |= ZX_JOYSTICK_BTN; break;
-                case 0x08:  sys->kbd_joymask |= ZX_JOYSTICK_LEFT; break;
-                case 0x09:  sys->kbd_joymask |= ZX_JOYSTICK_RIGHT; break;
-                case 0x0A:  sys->kbd_joymask |= ZX_JOYSTICK_DOWN; break;
-                case 0x0B:  sys->kbd_joymask |= ZX_JOYSTICK_UP; break;
-                default:    kbd_key_down(&sys->kbd, key_code); break;
-            }
-            break;
-        // the Sinclair joystick ports work as normal keys
-        case ZX_JOYSTICKTYPE_SINCLAIR_1:
-            switch (key_code) {
-                case 0x20:  key_code = '5'; break;    // fire
-                case 0x08:  key_code = '1'; break;    // left
-                case 0x09:  key_code = '2'; break;    // right
-                case 0x0A:  key_code = '3'; break;    // down
-                case 0x0B:  key_code = '4'; break;    // up
-                default: break;
-            }
-            kbd_key_down(&sys->kbd, key_code);
-            break;
-        case ZX_JOYSTICKTYPE_SINCLAIR_2:
-            switch (key_code) {
-                case 0x20:  key_code = '0'; break;    // fire
-                case 0x08:  key_code = '6'; break;    // left
-                case 0x09:  key_code = '7'; break;    // right
-                case 0x0A:  key_code = '8'; break;    // down
-                case 0x0B:  key_code = '9'; break;    // up
-                default: break;
-            }
-            kbd_key_down(&sys->kbd, key_code);
-            break;
-    }
+    kbd_key_down(&sys->kbd, key_code);
 }
 
 void zx_key_up(zx_t* sys, int key_code) {
     CHIPS_ASSERT(sys && sys->valid);
-    switch (sys->joystick_type) {
-        case ZX_JOYSTICKTYPE_NONE:
-            kbd_key_up(&sys->kbd, key_code);
-            break;
-        case ZX_JOYSTICKTYPE_KEMPSTON:
-            switch (key_code) {
-                case 0x20:  sys->kbd_joymask &= ~ZX_JOYSTICK_BTN; break;
-                case 0x08:  sys->kbd_joymask &= ~ZX_JOYSTICK_LEFT; break;
-                case 0x09:  sys->kbd_joymask &= ~ZX_JOYSTICK_RIGHT; break;
-                case 0x0A:  sys->kbd_joymask &= ~ZX_JOYSTICK_DOWN; break;
-                case 0x0B:  sys->kbd_joymask &= ~ZX_JOYSTICK_UP; break;
-                default:    kbd_key_up(&sys->kbd, key_code); break;
-            }
-            break;
-        // the Sinclair joystick ports work as normal keys
-        case ZX_JOYSTICKTYPE_SINCLAIR_1:
-            switch (key_code) {
-                case 0x20:  key_code = '5'; break;    // fire
-                case 0x08:  key_code = '1'; break;    // left
-                case 0x09:  key_code = '2'; break;    // right
-                case 0x0A:  key_code = '3'; break;    // down
-                case 0x0B:  key_code = '4'; break;    // up
-                default: break;
-            }
-            kbd_key_up(&sys->kbd, key_code);
-            break;
-        case ZX_JOYSTICKTYPE_SINCLAIR_2:
-            switch (key_code) {
-                case 0x20:  key_code = '0'; break;    // fire
-                case 0x08:  key_code = '6'; break;    // left
-                case 0x09:  key_code = '7'; break;    // right
-                case 0x0A:  key_code = '8'; break;    // down
-                case 0x0B:  key_code = '9'; break;    // up
-                default: break;
-            }
-            kbd_key_up(&sys->kbd, key_code);
-            break;
-    }
+    kbd_key_up(&sys->kbd, key_code);
 }
 
 void zx_set_joystick_type(zx_t* sys, zx_joystick_type_t type) {
     CHIPS_ASSERT(sys && sys->valid);
+    zx_joystick(sys, 0);
+    sys->kbd_joymask = 0;
+    sys->joy_joymask = 0;
     sys->joystick_type = type;
 }
 
@@ -2136,9 +2267,64 @@ void zx_joystick(zx_t* sys, uint8_t mask) {
         if (mask & ZX_JOYSTICK_UP)    { kbd_key_down(&sys->kbd, '9'); }
         else                          { kbd_key_up(&sys->kbd, '9'); }
     }
+    else if (sys->joystick_type == ZX_JOYSTICKTYPE_CURSOR) {
+        if (mask & ZX_JOYSTICK_BTN)   { kbd_key_down(&sys->kbd, '0'); }
+        else                          { kbd_key_up(&sys->kbd, '0'); }
+        if (mask & ZX_JOYSTICK_LEFT)  { kbd_key_down(&sys->kbd, '5'); }
+        else                          { kbd_key_up(&sys->kbd, '5'); }
+        if (mask & ZX_JOYSTICK_RIGHT) { kbd_key_down(&sys->kbd, '8'); }
+        else                          { kbd_key_up(&sys->kbd, '8'); }
+        if (mask & ZX_JOYSTICK_DOWN)  { kbd_key_down(&sys->kbd, '6'); }
+        else                          { kbd_key_up(&sys->kbd, '6'); }
+        if (mask & ZX_JOYSTICK_UP)    { kbd_key_down(&sys->kbd, '7'); }
+        else                          { kbd_key_up(&sys->kbd, '7'); }
+    }
     else {
         sys->joy_joymask = mask;
     }
+}
+
+void zx_set_kempston_mouse_enabled(zx_t* sys, bool enabled) {
+    CHIPS_ASSERT(sys && sys->valid);
+    sys->kempston_mouse_enabled = enabled;
+}
+
+void zx_mouse(zx_t* sys, uint8_t x, uint8_t y, uint8_t buttons) {
+    CHIPS_ASSERT(sys && sys->valid);
+    sys->mouse_x = x;
+    sys->mouse_y = y;
+    sys->mouse_buttons = buttons & 0x07u;
+}
+
+void zx_set_expansion_audio(zx_t* sys, bool fuller_audio, bool specdrum, bool covox) {
+    CHIPS_ASSERT(sys && sys->valid);
+    sys->fuller_audio_enabled = fuller_audio;
+    sys->specdrum_enabled = specdrum;
+    sys->covox_enabled = covox;
+}
+
+void zx_set_multiface_enabled(zx_t* sys, bool enabled) {
+    CHIPS_ASSERT(sys && sys->valid);
+    if (!enabled && sys->multiface_paged) {
+        _zx_multiface_unpage(sys);
+    }
+    sys->multiface_enabled = enabled;
+    if (!enabled) {
+        sys->multiface_software_lockout = false;
+        sys->multiface_nmi_ticks = 0;
+        sys->pins &= ~Z80_NMI;
+    }
+}
+
+void zx_multiface_nmi(zx_t* sys) {
+    CHIPS_ASSERT(sys && sys->valid);
+    if (!sys->multiface_enabled || sys->multiface_red_button_disabled) {
+        return;
+    }
+    sys->multiface_software_lockout = false;
+    _zx_multiface_page(sys);
+    sys->pins |= Z80_NMI;
+    sys->multiface_nmi_ticks = 1;
 }
 
 void zx_set_tape_input(zx_t* sys, zx_tape_input_callback_t callback, void *user_data) {
@@ -2288,6 +2474,7 @@ typedef struct {
     uint8_t audio[16];
     uint8_t tlow_l;
     uint8_t tlow_h;
+    uint8_t thigh;
     uint8_t spectator_flags;
     uint8_t mgt_rom_paged;
     uint8_t multiface_rom_paged;
@@ -2311,9 +2498,102 @@ static bool _zx_overflow(const uint8_t* ptr, intptr_t num_bytes, const uint8_t* 
     return (ptr + num_bytes) > end_ptr;
 }
 
+typedef enum {
+    _ZX_Z80_MACHINE_INVALID,
+    _ZX_Z80_MACHINE_48K,
+    _ZX_Z80_MACHINE_128K,
+    _ZX_Z80_MACHINE_PLUS2,
+    _ZX_Z80_MACHINE_PLUS2A,
+    _ZX_Z80_MACHINE_PLUS3,
+} _zx_z80_machine_type;
+
+static _zx_z80_machine_type _zx_z80_machine(
+    const _zx_z80_ext_header* ext_hdr,
+    uint16_t ext_hdr_len)
+{
+    _zx_z80_machine_type machine = _ZX_Z80_MACHINE_INVALID;
+    const uint8_t hw_mode = ext_hdr->hw_mode;
+    if (ext_hdr_len == 23) {
+        if (hw_mode <= 1) machine = _ZX_Z80_MACHINE_48K;
+        else if (hw_mode == 3 || hw_mode == 4) machine = _ZX_Z80_MACHINE_128K;
+    }
+    else if (ext_hdr_len >= 54) {
+        if (hw_mode == 0 || hw_mode == 1 || hw_mode == 3) machine = _ZX_Z80_MACHINE_48K;
+        else if (hw_mode >= 4 && hw_mode <= 6) machine = _ZX_Z80_MACHINE_128K;
+    }
+    if (hw_mode == 7 || hw_mode == 8) machine = _ZX_Z80_MACHINE_PLUS3;
+    else if (hw_mode == 12) machine = _ZX_Z80_MACHINE_PLUS2;
+    else if (hw_mode == 13) machine = _ZX_Z80_MACHINE_PLUS2A;
+
+    if (ext_hdr->flags & 0x80) {
+        if (machine == _ZX_Z80_MACHINE_128K) machine = _ZX_Z80_MACHINE_PLUS2;
+        else if (machine == _ZX_Z80_MACHINE_PLUS3) machine = _ZX_Z80_MACHINE_PLUS2A;
+    }
+    return machine;
+}
+
+static bool _zx_z80_machine_compatible(zx_type_t type, _zx_z80_machine_type machine) {
+    switch (machine) {
+        case _ZX_Z80_MACHINE_48K:
+            return type == ZX_TYPE_48K;
+        case _ZX_Z80_MACHINE_128K:
+        case _ZX_Z80_MACHINE_PLUS2:
+            return type == ZX_TYPE_128;
+        case _ZX_Z80_MACHINE_PLUS2A:
+            return type == ZX_TYPE_PLUS2A;
+        case _ZX_Z80_MACHINE_PLUS3:
+            return type == ZX_TYPE_PLUS3;
+        default:
+            return false;
+    }
+}
+
+static bool _zx_z80_expand(
+    const uint8_t* src,
+    size_t src_len,
+    uint8_t* dst,
+    size_t dst_len,
+    bool require_end_marker)
+{
+    size_t src_pos = 0;
+    size_t dst_pos = 0;
+    bool found_end_marker = false;
+    while (src_pos < src_len && dst_pos < dst_len) {
+        if (require_end_marker && src_len - src_pos >= 4 &&
+            src[src_pos] == 0 && src[src_pos + 1] == 0xED &&
+            src[src_pos + 2] == 0xED && src[src_pos + 3] == 0) {
+            src_pos += 4;
+            found_end_marker = true;
+            break;
+        }
+        if (src_len - src_pos >= 2 && src[src_pos] == 0xED && src[src_pos + 1] == 0xED) {
+            uint8_t count;
+            uint8_t value;
+            if (src_len - src_pos < 4) return false;
+            count = src[src_pos + 2];
+            value = src[src_pos + 3];
+            if (count == 0 || count > dst_len - dst_pos) return false;
+            memset(dst + dst_pos, value, count);
+            dst_pos += count;
+            src_pos += 4;
+        }
+        else {
+            dst[dst_pos++] = src[src_pos++];
+        }
+    }
+    if (require_end_marker && !found_end_marker && src_len - src_pos >= 4 &&
+        src[src_pos] == 0 && src[src_pos + 1] == 0xED &&
+        src[src_pos + 2] == 0xED && src[src_pos + 3] == 0) {
+        src_pos += 4;
+        found_end_marker = true;
+    }
+    return dst_pos == dst_len && src_pos == src_len &&
+        (!require_end_marker || found_end_marker);
+}
+
 bool zx_quickload(zx_t* sys, chips_range_t data) {
     CHIPS_ASSERT(data.ptr && (data.size > 0));
-    uint8_t* ptr = data.ptr;
+    const uint8_t* ptr = data.ptr;
     const uint8_t* end_ptr = ptr + data.size;
     if (_zx_overflow(ptr, sizeof(_zx_z80_header), end_ptr)) {
         return false;
@@ -2321,24 +2601,22 @@ bool zx_quickload(zx_t* sys, chips_range_t data) {
     const _zx_z80_header* hdr = (const _zx_z80_header*) ptr;
     ptr += sizeof(_zx_z80_header);
     const _zx_z80_ext_header* ext_hdr = 0;
+    uint16_t ext_hdr_len = 0;
     uint16_t pc = (hdr->PC_h<<8 | hdr->PC_l) & 0xFFFF;
     const bool is_version1 = 0 != pc;
     if (!is_version1) {
-        if (_zx_overflow(ptr, sizeof(_zx_z80_ext_header), end_ptr)) {
+        if (_zx_overflow(ptr, 2, end_ptr)) {
             return false;
         }
-        ext_hdr = (_zx_z80_ext_header*) ptr;
-        int ext_hdr_len = (ext_hdr->len_h<<8)|ext_hdr->len_l;
-        ptr += 2 + ext_hdr_len;
-        if (ext_hdr->hw_mode < 3) {
-            if (sys->type != ZX_TYPE_48K) {
-                return false;
-            }
+        ext_hdr = (const _zx_z80_ext_header*) ptr;
+        ext_hdr_len = (uint16_t)((ext_hdr->len_h<<8)|ext_hdr->len_l);
+        if (ext_hdr_len < 23 || _zx_overflow(ptr, 2 + ext_hdr_len, end_ptr)) {
+            return false;
         }
-        else {
-            if (sys->type != ZX_TYPE_128) {
-                return false;
-            }
+        ptr += 2 + ext_hdr_len;
+        if (!_zx_z80_machine_compatible(
+                sys->type, _zx_z80_machine(ext_hdr, ext_hdr_len))) {
+            return false;
         }
     }
     else {
@@ -2346,83 +2624,37 @@ bool zx_quickload(zx_t* sys, chips_range_t data) {
             return false;
         }
     }
-    const bool v1_compr = 0 != (hdr->flags0 & (1<<5));
+    if (is_version1) {
+        const size_t src_len = (size_t)(end_ptr - ptr);
+        if (hdr->flags0 & (1<<5)) {
+            if (!_zx_z80_expand(ptr, src_len, sys->ram[0], 0xC000, true)) return false;
+        }
+        else {
+            if (src_len != 0xC000) return false;
+            memcpy(sys->ram[0], ptr, 0xC000);
+        }
+        ptr = end_ptr;
+    }
     while (ptr < end_ptr) {
-        int page_index = 0;
-        int src_len = 0;
-        if (is_version1) {
-            src_len = data.size - sizeof(_zx_z80_header);
-        }
-        else {
-            _zx_z80_page_header* phdr = (_zx_z80_page_header*) ptr;
-            if (_zx_overflow(ptr, sizeof(_zx_z80_page_header), end_ptr)) {
-                return false;
-            }
-            ptr += sizeof(_zx_z80_page_header);
-            src_len = (phdr->len_h<<8 | phdr->len_l) & 0xFFFF;
-            page_index = phdr->page_nr - 3;
-            if ((sys->type == ZX_TYPE_48K) && (page_index == 5)) {
-                page_index = 0;
-            }
-            if ((page_index < 0) || (page_index > 7)) {
-                page_index = -1;
-            }
-        }
+        const _zx_z80_page_header* phdr;
+        uint16_t encoded_len;
+        size_t src_len;
+        int page_index;
         uint8_t* dst_ptr;
-        if (-1 == page_index) {
-            dst_ptr = sys->junk;
-        }
-        else {
-            dst_ptr = sys->ram[page_index];
-        }
-        if (0xFFFF == src_len) {
-            // FIXME: uncompressed not supported yet
-            return false;
-        }
-        else {
-            // compressed
-            int src_pos = 0;
-            bool v1_done = false;
-            uint8_t val[4];
-            while ((src_pos < src_len) && !v1_done) {
-                val[0] = ptr[src_pos];
-                val[1] = ptr[src_pos+1];
-                val[2] = ptr[src_pos+2];
-                val[3] = ptr[src_pos+3];
-                // check for version 1 end marker
-                if (v1_compr && (0==val[0]) && (0xED==val[1]) && (0xED==val[2]) && (0==val[3])) {
-                    v1_done = true;
-                    src_pos += 4;
-                }
-                else if (0xED == val[0]) {
-                    if (0xED == val[1]) {
-                        uint8_t count = val[2];
-                        CHIPS_ASSERT(0 != count);
-                        src_pos += 4;
-                        for (int i = 0; i < count; i++) {
-                            *dst_ptr++ = val[3];
-                        }
-                    }
-                    else {
-                        // single ED
-                        *dst_ptr++ = val[0];
-                        src_pos++;
-                    }
-                }
-                else {
-                    // any value
-                    *dst_ptr++ = val[0];
-                    src_pos++;
-                }
-            }
-            CHIPS_ASSERT(src_pos == src_len);
-        }
-        if (0xFFFF == src_len) {
-            ptr += 0x4000;
-        }
-        else {
-            ptr += src_len;
-        }
+        if (_zx_overflow(ptr, sizeof(_zx_z80_page_header), end_ptr)) return false;
+        phdr = (const _zx_z80_page_header*)ptr;
+        ptr += sizeof(_zx_z80_page_header);
+        encoded_len = (uint16_t)((phdr->len_h<<8)|phdr->len_l);
+        src_len = encoded_len == 0xFFFF ? 0x4000 : encoded_len;
+        if (_zx_overflow(ptr, (intptr_t)src_len, end_ptr)) return false;
+
+        page_index = phdr->page_nr - 3;
+        if (sys->type == ZX_TYPE_48K && page_index == 5) page_index = 0;
+        if (page_index < 0 || page_index > 7) page_index = -1;
+        dst_ptr = page_index < 0 ? sys->junk : sys->ram[page_index];
+        if (encoded_len == 0xFFFF) memcpy(dst_ptr, ptr, 0x4000);
+        else if (!_zx_z80_expand(ptr, src_len, dst_ptr, 0x4000, false)) return false;
+        ptr += src_len;
     }
 
     // start loaded image
@@ -2456,7 +2688,17 @@ bool zx_quickload(zx_t* sys, chips_range_t data) {
                 ay38910_set_register(&sys->ay, i, ext_hdr->audio[i]);
             }
             ay38910_set_addr_latch(&sys->ay, ext_hdr->out_fffd);
-            _zx_update_memory_map_zx128(sys, ext_hdr->out_7ffd);
+            sys->memory_paging_disabled = false;
+            if (sys->type == ZX_TYPE_128) {
+                _zx_update_memory_map_zx128(sys, ext_hdr->out_7ffd);
+            }
+            else {
+                sys->last_mem_config = ext_hdr->out_7ffd;
+                sys->last_plus3_mem_config = ext_hdr_len >= 55 ? ext_hdr->out_1ffd : 0;
+                sys->display_ram_bank = (ext_hdr->out_7ffd & (1<<3)) ? 7 : 5;
+                _zx_update_memory_map_plus3(sys);
+                sys->memory_paging_disabled = (ext_hdr->out_7ffd & (1<<5)) != 0;
+            }
         }
     }
     else {

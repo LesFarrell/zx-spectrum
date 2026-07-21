@@ -13,4 +13,13 @@ bool szx_inflate_zlib(
     size_t destination_size
 );
 
+/* Expands a zlib stream into a bounded buffer and returns its actual size. */
+bool szx_inflate_zlib_bounded(
+    const uint8_t *source,
+    size_t source_size,
+    uint8_t *destination,
+    size_t destination_capacity,
+    size_t *destination_size
+);
+
 #endif

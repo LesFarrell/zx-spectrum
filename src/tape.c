@@ -8,6 +8,7 @@
 #include "chips/kbd.h"
 #include "chips/clk.h"
 #include "systems/zx.h"
+#include "szx_inflate.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -177,11 +178,16 @@ static uint16_t tape_read_u16(const uint8_t *ptr) {
 }
 
 static uint32_t tape_read_u24(const uint8_t *ptr) {
-    return (uint32_t)(ptr[0] | (ptr[1] << 8) | (ptr[2] << 16));
+    return (uint32_t)ptr[0] |
+        ((uint32_t)ptr[1] << 8) |
+        ((uint32_t)ptr[2] << 16);
 }
 
 static uint32_t tape_read_u32(const uint8_t *ptr) {
-    return (uint32_t)(ptr[0] | (ptr[1] << 8) | (ptr[2] << 16) | (ptr[3] << 24));
+    return (uint32_t)ptr[0] |
+        ((uint32_t)ptr[1] << 8) |
+        ((uint32_t)ptr[2] << 16) |
+        ((uint32_t)ptr[3] << 24);
 }
 
 static uint8_t tape_cp_flags(uint8_t left, uint8_t right) {
@@ -468,6 +474,38 @@ static bool tape_append_csw_rle(
     return pulse_count == expected_pulses;
 }
 
+static bool tape_append_csw_zrle(
+    TapeBuilder *builder,
+    const uint8_t *data,
+    size_t length,
+    uint32_t sample_rate,
+    uint32_t expected_pulses)
+{
+    uint8_t *expanded;
+    size_t capacity;
+    size_t expanded_size = 0;
+    bool ok;
+
+    if (expected_pulses == 0 || expected_pulses > TAPE_MAX_SEGMENTS) {
+        return false;
+    }
+    capacity = (size_t)expected_pulses * 5u;
+    expanded = (uint8_t *)malloc(capacity);
+    if (expanded == NULL) {
+        return false;
+    }
+    ok = szx_inflate_zlib_bounded(
+            data, length, expanded, capacity, &expanded_size) &&
+        tape_append_csw_rle(
+            builder,
+            expanded,
+            expanded_size,
+            sample_rate,
+            expected_pulses);
+    free(expanded);
+    return ok;
+}
+
 static bool tape_append_data_bits(
     TapeBuilder *builder,
     const uint8_t *data,
@@ -605,6 +643,226 @@ static bool tape_parse_tap(
         offset += block_length;
     }
     return true;
+}
+
+/* PZX defines the level of each pulse directly and toggles after the pulse,
+   unlike the TZX helpers above which toggle before appending. */
+static bool tape_append_pzx_pulse(TapeBuilder *builder, uint32_t duration_tstates)
+{
+    uint32_t machine_ticks;
+    if (!tape_consume_work(builder, 1))
+    {
+        return false;
+    }
+    if (duration_tstates != 0)
+    {
+        if (!tape_tstates_to_ticks(
+                builder->player->tick_hz,
+                duration_tstates,
+                &machine_ticks) ||
+            !tape_append_level(
+                builder->player,
+                machine_ticks,
+                builder->current_level))
+        {
+            return false;
+        }
+    }
+    builder->current_level = !builder->current_level;
+    return true;
+}
+
+static bool tape_pzx_standard_data(
+    uint8_t p0,
+    uint8_t p1,
+    const uint8_t *sequence0,
+    const uint8_t *sequence1)
+{
+    return p0 == 2 && p1 == 2 &&
+        tape_read_u16(sequence0) == TAPE_ZERO_PULSE_TICKS &&
+        tape_read_u16(sequence0 + 2) == TAPE_ZERO_PULSE_TICKS &&
+        tape_read_u16(sequence1) == TAPE_ONE_PULSE_TICKS &&
+        tape_read_u16(sequence1 + 2) == TAPE_ONE_PULSE_TICKS;
+}
+
+static bool tape_parse_pzx(
+    TapePlayer *player,
+    const uint8_t *data,
+    size_t size,
+    char *error_buffer,
+    size_t error_buffer_size,
+    const char *path)
+{
+    TapeBuilder builder;
+    size_t offset = 0;
+    bool saw_header = false;
+
+    builder.player = player;
+    builder.current_level = false;
+    builder.work_remaining = tape_decode_work_budget(size);
+
+    while (offset < size)
+    {
+        const uint8_t *payload;
+        uint32_t payload_size;
+        char tag[5];
+        if (!tape_has_bytes(offset, 8, size))
+        {
+            tape_set_error(error_buffer, error_buffer_size, "Truncated PZX block header", path);
+            return false;
+        }
+        memcpy(tag, data + offset, 4);
+        tag[4] = '\0';
+        payload_size = tape_read_u32(data + offset + 4);
+        offset += 8;
+        if (!tape_has_bytes(offset, payload_size, size))
+        {
+            tape_set_error(error_buffer, error_buffer_size, "Truncated PZX block payload", path);
+            return false;
+        }
+        payload = data + offset;
+
+        if (memcmp(tag, "PZXT", 4) == 0)
+        {
+            if (payload_size < 2 || payload[0] != 1)
+            {
+                tape_set_error(error_buffer, error_buffer_size, "Unsupported PZX version", path);
+                return false;
+            }
+            saw_header = true;
+        }
+        else if (!saw_header)
+        {
+            tape_set_error(error_buffer, error_buffer_size, "PZX header is missing", path);
+            return false;
+        }
+        else if (memcmp(tag, "PULS", 4) == 0)
+        {
+            size_t pos = 0;
+            builder.current_level = false;
+            while (pos < payload_size)
+            {
+                uint32_t count = 1;
+                uint32_t duration;
+                uint16_t word;
+                if (!tape_has_bytes(pos, 2, payload_size)) goto invalid_pzx;
+                word = tape_read_u16(payload + pos);
+                pos += 2;
+                if (word > 0x8000u)
+                {
+                    count = word & 0x7FFFu;
+                    if (count == 0 || !tape_has_bytes(pos, 2, payload_size)) goto invalid_pzx;
+                    word = tape_read_u16(payload + pos);
+                    pos += 2;
+                }
+                duration = word;
+                if (word >= 0x8000u)
+                {
+                    if (!tape_has_bytes(pos, 2, payload_size)) goto invalid_pzx;
+                    duration = ((uint32_t)(word & 0x7FFFu) << 16) |
+                        tape_read_u16(payload + pos);
+                    pos += 2;
+                }
+                for (uint32_t repeat = 0; repeat < count; ++repeat)
+                {
+                    if (!tape_append_pzx_pulse(&builder, duration)) goto decode_limit;
+                }
+            }
+        }
+        else if (memcmp(tag, "DATA", 4) == 0)
+        {
+            uint32_t count_field;
+            uint32_t bit_count;
+            uint16_t tail;
+            uint8_t p0;
+            uint8_t p1;
+            const uint8_t *sequence0;
+            const uint8_t *sequence1;
+            const uint8_t *bytes;
+            size_t sequence_bytes;
+            size_t byte_count;
+            size_t resume_segment_index;
+            if (payload_size < 8) goto invalid_pzx;
+            count_field = tape_read_u32(payload);
+            bit_count = count_field & 0x7FFFFFFFu;
+            tail = tape_read_u16(payload + 4);
+            p0 = payload[6];
+            p1 = payload[7];
+            sequence_bytes = ((size_t)p0 + p1) * 2u;
+            byte_count = ((size_t)bit_count + 7u) / 8u;
+            if (!tape_has_bytes(8, sequence_bytes, payload_size) ||
+                !tape_has_bytes(8 + sequence_bytes, byte_count, payload_size) ||
+                8 + sequence_bytes + byte_count != payload_size)
+            {
+                goto invalid_pzx;
+            }
+            sequence0 = payload + 8;
+            sequence1 = sequence0 + ((size_t)p0 * 2u);
+            bytes = payload + 8 + sequence_bytes;
+            builder.current_level = (count_field & 0x80000000u) != 0;
+            for (uint32_t bit_index = 0; bit_index < bit_count; ++bit_index)
+            {
+                const bool one = (bytes[bit_index >> 3] &
+                    (uint8_t)(0x80u >> (bit_index & 7u))) != 0;
+                const uint8_t pulse_count = one ? p1 : p0;
+                const uint8_t *sequence = one ? sequence1 : sequence0;
+                for (uint8_t pulse = 0; pulse < pulse_count; ++pulse)
+                {
+                    if (!tape_append_pzx_pulse(
+                            &builder,
+                            tape_read_u16(sequence + ((size_t)pulse * 2u))))
+                    {
+                        goto decode_limit;
+                    }
+                }
+            }
+            if (!tape_append_pzx_pulse(&builder, tail)) goto decode_limit;
+            resume_segment_index = player->segment_count;
+            if ((bit_count & 7u) == 0 && byte_count > 0 &&
+                tape_pzx_standard_data(p0, p1, sequence0, sequence1) &&
+                !tape_append_fast_block(player, bytes, byte_count, resume_segment_index))
+            {
+                goto decode_limit;
+            }
+        }
+        else if (memcmp(tag, "PAUS", 4) == 0)
+        {
+            uint32_t duration;
+            if (payload_size != 4) goto invalid_pzx;
+            duration = tape_read_u32(payload);
+            builder.current_level = (duration & 0x80000000u) != 0;
+            if (!tape_append_pzx_pulse(&builder, duration & 0x7FFFFFFFu)) goto decode_limit;
+        }
+        else if (memcmp(tag, "STOP", 4) == 0)
+        {
+            uint16_t flags;
+            if (payload_size < 2) goto invalid_pzx;
+            flags = tape_read_u16(payload);
+            if (!tape_mark_stop(
+                    player,
+                    flags == 1 ? TAPE_STOP_48K_ONLY : TAPE_STOP_ALWAYS))
+            {
+                goto decode_limit;
+            }
+        }
+        /* BRWS and unknown extension blocks contain no waveform and are
+           intentionally skipped as required by the PZX specification. */
+        offset += payload_size;
+    }
+
+    if (!saw_header)
+    {
+        tape_set_error(error_buffer, error_buffer_size, "PZX header is missing", path);
+        return false;
+    }
+    return true;
+
+invalid_pzx:
+    tape_set_error(error_buffer, error_buffer_size, "Invalid PZX block", path);
+    return false;
+decode_limit:
+    tape_set_error(error_buffer, error_buffer_size, "PZX waveform exceeds the decode limit", path);
+    return false;
 }
 
 static bool tape_tzx_directory_append(TapeTzxDirectory *directory, size_t offset) {
@@ -870,7 +1128,8 @@ static bool tape_parse_tzx(
     size_t size,
     char *error_buffer,
     size_t error_buffer_size,
-    const char *path
+    const char *path,
+    const TapeLoadOptions *options
 ) {
     TapeBuilder builder;
     TapeTzxDirectory directory;
@@ -1031,24 +1290,31 @@ static bool tape_parse_tzx(
 
             case 0x18: {
                 const uint32_t block_length = tape_read_u32(&data[offset]);
-                const uint16_t pause_ms = tape_read_u16(&data[offset + 4]);
-                const uint32_t sample_rate = tape_read_u24(&data[offset + 6]);
-                const uint8_t compression = data[offset + 9];
-                const uint32_t pulse_count = tape_read_u32(&data[offset + 10]);
                 if (block_length < 10) {
                     failure_message = "Invalid TZX CSW recording block";
                     goto finished;
                 }
-                if (compression != 1) {
-                    failure_message = "Z-RLE compressed TZX CSW blocks are not supported";
+                const uint16_t pause_ms = tape_read_u16(&data[offset + 4]);
+                const uint32_t sample_rate = tape_read_u24(&data[offset + 6]);
+                const uint8_t compression = data[offset + 9];
+                const uint32_t pulse_count = tape_read_u32(&data[offset + 10]);
+                if (compression != 1 && compression != 2) {
+                    failure_message = "Unknown TZX CSW compression type";
                     goto finished;
                 }
-                if (!tape_append_csw_rle(
-                        &builder,
-                        &data[offset + 14],
-                        block_length - 10u,
-                        sample_rate,
-                        pulse_count) ||
+                if (!(compression == 1
+                        ? tape_append_csw_rle(
+                            &builder,
+                            &data[offset + 14],
+                            block_length - 10u,
+                            sample_rate,
+                            pulse_count)
+                        : tape_append_csw_zrle(
+                            &builder,
+                            &data[offset + 14],
+                            block_length - 10u,
+                            sample_rate,
+                            pulse_count)) ||
                     (pause_ms > 0 && !tape_append_pause(&builder, pause_ms))) {
                     failure_message = "Invalid or too large TZX CSW recording block";
                     goto finished;
@@ -1185,20 +1451,58 @@ static bool tape_parse_tzx(
                 }
                 selection_count = data[offset + 2];
                 if (selection_count > 0) {
-                    uint8_t description_length;
-                    if (select_length < 4u) {
-                        failure_message = "Invalid TZX select block";
-                        goto finished;
+                    const size_t select_end = offset + 2u + select_length;
+                    size_t entry_offset = offset + 3u;
+                    char (*labels)[256] = (char (*)[256])calloc(selection_count, 256u);
+                    const char **label_pointers =
+                        (const char **)calloc(selection_count, sizeof(*label_pointers));
+                    int selected = 0;
+                    bool valid = labels != NULL && label_pointers != NULL;
+                    for (uint8_t selection = 0; valid && selection < selection_count; ++selection) {
+                        uint8_t description_length;
+                        if (entry_offset + 3u > select_end) {
+                            valid = false;
+                            break;
+                        }
+                        description_length = data[entry_offset + 2u];
+                        if (entry_offset + 3u + description_length > select_end) {
+                            valid = false;
+                            break;
+                        }
+                        memcpy(
+                            labels[selection],
+                            &data[entry_offset + 3u],
+                            description_length);
+                        labels[selection][description_length] = '\0';
+                        label_pointers[selection] = labels[selection];
+                        entry_offset += 3u + description_length;
                     }
-                    description_length = data[offset + 5];
-                    if (
-                        (size_t)description_length + 4u > select_length ||
-                        !tape_tzx_relative_target(
+                    if (valid && entry_offset != select_end) valid = false;
+                    if (valid && options != NULL && options->select != NULL) {
+                        selected = options->select(
+                            options->user_data,
+                            label_pointers,
+                            selection_count);
+                    }
+                    if (valid && (selected < 0 || selected >= selection_count)) {
+                        failure_message = "TZX selection was cancelled";
+                        valid = false;
+                    }
+                    if (valid) {
+                        size_t chosen_offset = offset + 3u;
+                        for (int selection = 0; selection < selected; ++selection) {
+                            chosen_offset += 3u + data[chosen_offset + 2u];
+                        }
+                        valid = tape_tzx_relative_target(
                             current_block_index,
-                            (int16_t)tape_read_u16(&data[offset + 3]),
+                            (int16_t)tape_read_u16(&data[chosen_offset]),
                             directory.count,
-                            &next_block_index)) {
-                        failure_message = "Invalid TZX select block";
+                            &next_block_index);
+                    }
+                    free(label_pointers);
+                    free(labels);
+                    if (!valid) {
+                        if (failure_message == NULL) failure_message = "Invalid TZX select block";
                         goto finished;
                     }
                 }
@@ -1284,6 +1588,23 @@ bool tape_load_file(
     char *error_buffer,
     size_t error_buffer_size
 ) {
+    return tape_load_file_with_options(
+        player,
+        path,
+        tick_hz,
+        error_buffer,
+        error_buffer_size,
+        NULL);
+}
+
+bool tape_load_file_with_options(
+    TapePlayer *player,
+    const char *path,
+    uint32_t tick_hz,
+    char *error_buffer,
+    size_t error_buffer_size,
+    const TapeLoadOptions *options
+) {
     FILE *file;
     uint8_t *data = NULL;
     long file_size;
@@ -1335,6 +1656,15 @@ bool tape_load_file(
         ok = tape_parse_tap(player, data, (size_t)file_size, error_buffer, error_buffer_size, path);
     } else if (extension != NULL && _stricmp(extension, ".tzx") == 0) {
         ok = tape_parse_tzx(
+            player,
+            data,
+            (size_t)file_size,
+            error_buffer,
+            error_buffer_size,
+            path,
+            options);
+    } else if (extension != NULL && _stricmp(extension, ".pzx") == 0) {
+        ok = tape_parse_pzx(
             player,
             data,
             (size_t)file_size,

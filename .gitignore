@@ -10,6 +10,6 @@ src/*.res
 src/*.pdb
 src/*.exe
 src/Scintilla.dll
-src/plus3.rom
-src/plus2.rom
-src/plus2a.rom
+src/roms/plus3.rom
+src/roms/plus2.rom
+src/roms/plus2a.rom

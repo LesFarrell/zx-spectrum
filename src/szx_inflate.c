@@ -293,7 +293,8 @@ static bool szx_expand_deflate(
     const uint8_t *source,
     size_t source_size,
     uint8_t *destination,
-    size_t destination_size)
+    size_t destination_size,
+    size_t *actual_size)
 {
     SzxBitReader reader = {source, source_size, 0, 0, 0, false};
     size_t destination_position = 0;
@@ -351,7 +352,8 @@ static bool szx_expand_deflate(
             return false;
         }
     }
-    return destination_position == destination_size;
+    *actual_size = destination_position;
+    return true;
 }
 
 static uint32_t szx_adler32(const uint8_t *data, size_t size)
@@ -379,9 +381,31 @@ bool szx_inflate_zlib(
     uint8_t *destination,
     size_t destination_size)
 {
+    size_t actual_size = 0;
+    if (!szx_inflate_zlib_bounded(
+            source,
+            source_size,
+            destination,
+            destination_size,
+            &actual_size))
+    {
+        return false;
+    }
+    return actual_size == destination_size;
+}
+
+bool szx_inflate_zlib_bounded(
+    const uint8_t *source,
+    size_t source_size,
+    uint8_t *destination,
+    size_t destination_capacity,
+    size_t *destination_size)
+{
     uint16_t header;
     uint32_t expected_adler;
-    if (source == NULL || destination == NULL || source_size < 6)
+    size_t actual_size = 0;
+    if (source == NULL || destination == NULL || destination_size == NULL ||
+        source_size < 6)
     {
         return false;
     }
@@ -395,6 +419,16 @@ bool szx_inflate_zlib(
         ((uint32_t)source[source_size - 3] << 16) |
         ((uint32_t)source[source_size - 2] << 8) |
         source[source_size - 1];
-    return szx_expand_deflate(source + 2, source_size - 6, destination, destination_size) &&
-        szx_adler32(destination, destination_size) == expected_adler;
+    if (!szx_expand_deflate(
+            source + 2,
+            source_size - 6,
+            destination,
+            destination_capacity,
+            &actual_size) ||
+        szx_adler32(destination, actual_size) != expected_adler)
+    {
+        return false;
+    }
+    *destination_size = actual_size;
+    return true;
 }

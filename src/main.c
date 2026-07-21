@@ -59,11 +59,15 @@ enum {
     APP_MENU_FILE_PLAY_TAPE = 1004,
     APP_MENU_FILE_STOP_TAPE = 1005,
     APP_MENU_FILE_AUTOLOAD_TAPES = 1006,
+    APP_MENU_FILE_SAVE_SCREEN = 1007,
     APP_MENU_FILE_FAST_TAPE_LOADING = 1008,
     APP_MENU_FILE_SAVE_SNAPSHOT = 1009,
     APP_MENU_DISK_EJECT = 1010,
     APP_MENU_DISK_SAVE = 1011,
     APP_MENU_SOUND_MUTE = 1101,
+    APP_MENU_SOUND_FULLER_AY = 1102,
+    APP_MENU_SOUND_SPECDRUM = 1103,
+    APP_MENU_SOUND_COVOX = 1104,
     APP_MENU_TOOLS_ASSEMBLER = 1301,
     APP_MENU_TOOLS_DEBUGGER = 1302,
     APP_MENU_TOOLS_POKE = 1303,
@@ -78,6 +82,8 @@ enum {
     APP_MENU_MACHINE_SPEED_2X = 1213,
     APP_MENU_MACHINE_SPEED_4X = 1214,
     APP_MENU_MACHINE_SPEED_8X = 1215,
+    APP_MENU_MACHINE_MULTIFACE = 1216,
+    APP_MENU_MACHINE_MULTIFACE_NMI = 1217,
     APP_MENU_VIEW_FULLSCREEN = 1250,
     APP_MENU_VIEW_INTEGER_SCALING = 1251,
     APP_MENU_MICRODRIVE_INSERT_BASE = 1400,
@@ -89,6 +95,12 @@ enum {
     APP_MENU_INPUT_JOYSTICK_CURSOR = 1501,
     APP_MENU_INPUT_JOYSTICK_WASD = 1502,
     APP_MENU_INPUT_JOYSTICK_QAOP = 1503,
+    APP_MENU_INPUT_PROTOCOL_KEMPSTON = 1504,
+    APP_MENU_INPUT_PROTOCOL_SINCLAIR_1 = 1505,
+    APP_MENU_INPUT_PROTOCOL_SINCLAIR_2 = 1506,
+    APP_MENU_INPUT_PROTOCOL_CURSOR = 1507,
+    APP_MENU_INPUT_KEMPSTON_MOUSE = 1508,
+    APP_MENU_INPUT_PROTOCOL_FULLER = 1509,
     APP_MENU_RECENT_MEDIA_BASE = 1520,
     APP_MENU_RECENT_MEDIA_CLEAR = 1530,
     APP_CTRL_DEBUG_TEXT = 2001,
@@ -156,7 +168,8 @@ enum {
     APP_DIALOG_ASSEMBLER = 4002,
     APP_DIALOG_POKE = 4003,
     APP_MSG_TAPE_LOAD_COMPLETE = WM_APP + 1,
-    APP_MSG_SNAPSHOT_LOAD_COMPLETE = WM_APP + 2
+    APP_MSG_SNAPSHOT_LOAD_COMPLETE = WM_APP + 2,
+    APP_MSG_TZX_SELECT_REQUEST = WM_APP + 3
 };
 
 typedef struct AudioBuffer {
@@ -194,6 +207,12 @@ typedef struct AppTapeLoadJob {
     char error[256];
     bool ok;
 } AppTapeLoadJob;
+
+typedef struct AppTzxSelectRequest {
+    const char *const *descriptions;
+    size_t count;
+    int selection;
+} AppTzxSelectRequest;
 
 typedef enum AppSnapshotFormat {
     APP_SNAPSHOT_FORMAT_Z80,
@@ -381,6 +400,12 @@ struct RomSelection {
     RomSet rom_plus3;
     char interface1_rom[MAX_PATH];
     bool has_interface1_rom;
+    char multiface1_rom[MAX_PATH];
+    char multiface128_rom[MAX_PATH];
+    char multiface3_rom[MAX_PATH];
+    bool has_multiface1_rom;
+    bool has_multiface128_rom;
+    bool has_multiface3_rom;
 };
 
 struct AppState {
@@ -417,6 +442,17 @@ struct AppState {
     bool tape_load_in_progress;
     bool snapshot_load_in_progress;
     KeyboardJoystickPreset keyboard_joystick_preset;
+    zx_joystick_type_t joystick_type;
+    bool kempston_mouse_enabled;
+    bool fuller_audio_enabled;
+    bool specdrum_enabled;
+    bool covox_enabled;
+    bool multiface_enabled;
+    uint8_t mouse_x;
+    uint8_t mouse_y;
+    uint8_t mouse_buttons;
+    POINT mouse_last_position;
+    bool mouse_tracking;
     unsigned speed_multiplier;
     bool fullscreen;
     bool integer_scaling;
@@ -462,6 +498,10 @@ static bool app_start_autotype(AppState *app, const WCHAR *text);
 static bool app_tape_input_callback(void *user_data, uint64_t tick_count);
 static bool app_tape_fast_load_trap(void *user_data, void *machine);
 static DWORD WINAPI app_tape_load_worker(void *param);
+static int app_tzx_select_callback(
+    void *user_data,
+    const char *const *descriptions,
+    size_t count);
 static DWORD WINAPI app_snapshot_load_worker(void *param);
 static bool app_parent_dir(char *path);
 static bool app_file_exists(const char *path);
@@ -539,9 +579,13 @@ static void app_save_tape_autoload(bool enabled);
 static void app_save_fast_tape_loading(bool enabled);
 static void app_save_sound_muted(bool muted);
 static void app_save_keyboard_joystick(KeyboardJoystickPreset preset);
+static void app_save_joystick_type(zx_joystick_type_t type);
+static void app_save_kempston_mouse_enabled(bool enabled);
+static bool app_load_saved_toggle(const char *key, bool *enabled);
+static void app_save_toggle(const char *key, bool enabled);
 static void app_save_speed_multiplier(unsigned multiplier);
 static void app_update_model_menu(HWND hwnd, SpectrumModel model);
-static void app_update_sound_menu(HWND hwnd, bool muted);
+static void app_update_sound_menu(HWND hwnd, const AppState *app);
 static void app_update_disk_menu(HWND hwnd, bool inserted);
 static void app_update_microdrive_menu(HWND hwnd, const AppState *app);
 static void app_update_runtime_menu(HWND hwnd, const AppState *app);
@@ -696,6 +740,7 @@ static HMENU app_create_menu(void) {
     HMENU view_menu = CreatePopupMenu();
     HMENU input_menu = CreatePopupMenu();
     HMENU joystick_menu = CreatePopupMenu();
+    HMENU joystick_interface_menu = CreatePopupMenu();
     HMENU recent_menu = CreatePopupMenu();
     HMENU sound_menu = CreatePopupMenu();
     HMENU tools_menu = CreatePopupMenu();
@@ -703,6 +748,7 @@ static HMENU app_create_menu(void) {
     if (menu_bar == NULL || file_menu == NULL || tape_menu == NULL ||
         disk_menu == NULL || microdrive_menu == NULL || machine_menu == NULL ||
         speed_menu == NULL || view_menu == NULL || input_menu == NULL || joystick_menu == NULL ||
+        joystick_interface_menu == NULL ||
         recent_menu == NULL || sound_menu == NULL || tools_menu == NULL) {
         if (tools_menu != NULL) {
             DestroyMenu(tools_menu);
@@ -724,6 +770,9 @@ static HMENU app_create_menu(void) {
         }
         if (joystick_menu != NULL) {
             DestroyMenu(joystick_menu);
+        }
+        if (joystick_interface_menu != NULL) {
+            DestroyMenu(joystick_interface_menu);
         }
         if (recent_menu != NULL) {
             DestroyMenu(recent_menu);
@@ -748,6 +797,7 @@ static HMENU app_create_menu(void) {
 
     AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_OPEN_SNAPSHOT, "&Open Media/Snapshot...\tCtrl+O");
     AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_SAVE_SNAPSHOT, "&Save Snapshot...\tCtrl+S");
+    AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_SAVE_SCREEN, "Save Sc&reen...");
     for (int recent = 0; recent < APP_RECENT_MEDIA_COUNT; ++recent) {
         AppendMenuA(
             recent_menu,
@@ -815,14 +865,28 @@ static HMENU app_create_menu(void) {
     AppendMenuA(speed_menu, MF_STRING, APP_MENU_MACHINE_SPEED_8X, "&8x");
     AppendMenuA(machine_menu, MF_POPUP, (UINT_PTR)speed_menu, "&Speed (F6 cycles)");
     AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_REWIND, "&Rewind 5 Seconds\tCtrl+Backspace");
+    AppendMenuA(machine_menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_MULTIFACE, "Enable &Multiface");
+    AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_MULTIFACE_NMI, "Multiface &NMI\tAlt+F5");
     AppendMenuA(view_menu, MF_STRING, APP_MENU_VIEW_FULLSCREEN, "&Fullscreen\tF11");
     AppendMenuA(view_menu, MF_STRING, APP_MENU_VIEW_INTEGER_SCALING, "&Integer Scaling");
     AppendMenuA(joystick_menu, MF_STRING, APP_MENU_INPUT_JOYSTICK_NONE, "&None");
     AppendMenuA(joystick_menu, MF_STRING, APP_MENU_INPUT_JOYSTICK_CURSOR, "&Cursor Keys + Space");
     AppendMenuA(joystick_menu, MF_STRING, APP_MENU_INPUT_JOYSTICK_WASD, "&WASD + Space");
     AppendMenuA(joystick_menu, MF_STRING, APP_MENU_INPUT_JOYSTICK_QAOP, "&QAOP + M");
-    AppendMenuA(input_menu, MF_POPUP, (UINT_PTR)joystick_menu, "&Keyboard Kempston Joystick");
+    AppendMenuA(input_menu, MF_POPUP, (UINT_PTR)joystick_menu, "&Keyboard Joystick");
+    AppendMenuA(joystick_interface_menu, MF_STRING, APP_MENU_INPUT_PROTOCOL_KEMPSTON, "&Kempston");
+    AppendMenuA(joystick_interface_menu, MF_STRING, APP_MENU_INPUT_PROTOCOL_SINCLAIR_1, "Sinclair &1");
+    AppendMenuA(joystick_interface_menu, MF_STRING, APP_MENU_INPUT_PROTOCOL_SINCLAIR_2, "Sinclair &2");
+    AppendMenuA(joystick_interface_menu, MF_STRING, APP_MENU_INPUT_PROTOCOL_CURSOR, "&Cursor/Protek/AGF");
+    AppendMenuA(joystick_interface_menu, MF_STRING, APP_MENU_INPUT_PROTOCOL_FULLER, "&Fuller");
+    AppendMenuA(input_menu, MF_POPUP, (UINT_PTR)joystick_interface_menu, "Joystick &Interface");
+    AppendMenuA(input_menu, MF_STRING, APP_MENU_INPUT_KEMPSTON_MOUSE, "Kempston &Mouse");
     AppendMenuA(sound_menu, MF_STRING, APP_MENU_SOUND_MUTE, "&Mute Sound\tCtrl+M");
+    AppendMenuA(sound_menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(sound_menu, MF_STRING, APP_MENU_SOUND_FULLER_AY, "Fuller &AY (48K)");
+    AppendMenuA(sound_menu, MF_STRING, APP_MENU_SOUND_SPECDRUM, "&SpecDrum DAC");
+    AppendMenuA(sound_menu, MF_STRING, APP_MENU_SOUND_COVOX, "&Covox DAC");
     AppendMenuA(tools_menu, MF_STRING, APP_MENU_TOOLS_ASSEMBLER, "&Assembler...\tCtrl+Shift+A");
     AppendMenuA(tools_menu, MF_STRING, APP_MENU_TOOLS_DEBUGGER, "&Debugger...\tCtrl+Shift+D");
     AppendMenuA(tools_menu, MF_STRING, APP_MENU_TOOLS_POKE, "&Poke...\tCtrl+Shift+P");
@@ -839,16 +903,22 @@ static HMENU app_create_menu(void) {
 }
 
 /* Keeps the Sound menu check mark synchronized with the current mute state. */
-static void app_update_sound_menu(HWND hwnd, bool muted) {
+static void app_update_sound_menu(HWND hwnd, const AppState *app) {
     HMENU menu = GetMenu(hwnd);
-    if (menu == NULL) {
+    if (menu == NULL || app == NULL) {
         return;
     }
     CheckMenuItem(
         menu,
         APP_MENU_SOUND_MUTE,
-        MF_BYCOMMAND | (muted ? MF_CHECKED : MF_UNCHECKED)
+        MF_BYCOMMAND | (app->audio.muted ? MF_CHECKED : MF_UNCHECKED)
     );
+    CheckMenuItem(menu, APP_MENU_SOUND_FULLER_AY, MF_BYCOMMAND |
+        (app->fuller_audio_enabled ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(menu, APP_MENU_SOUND_SPECDRUM, MF_BYCOMMAND |
+        (app->specdrum_enabled ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(menu, APP_MENU_SOUND_COVOX, MF_BYCOMMAND |
+        (app->covox_enabled ? MF_CHECKED : MF_UNCHECKED));
 }
 
 static void app_update_disk_menu(HWND hwnd, bool inserted) {
@@ -972,6 +1042,15 @@ static void app_update_runtime_menu(HWND hwnd, const AppState *app) {
         menu,
         APP_MENU_MACHINE_REWIND,
         MF_BYCOMMAND | (app->rewind.count > 0 ? MF_ENABLED : MF_GRAYED));
+    CheckMenuItem(menu, APP_MENU_MACHINE_MULTIFACE, MF_BYCOMMAND |
+        (app->multiface_enabled ? MF_CHECKED : MF_UNCHECKED));
+    EnableMenuItem(menu, APP_MENU_MACHINE_MULTIFACE, MF_BYCOMMAND |
+        (app->spec.multiface_rom_loaded || app->spec.machine.multiface_16k_ram_mode
+            ? MF_ENABLED : MF_GRAYED));
+    EnableMenuItem(menu, APP_MENU_MACHINE_MULTIFACE_NMI, MF_BYCOMMAND |
+        (app->multiface_enabled &&
+         (app->spec.multiface_rom_loaded || app->spec.machine.multiface_16k_ram_mode)
+            ? MF_ENABLED : MF_GRAYED));
     CheckMenuItem(
         menu,
         APP_MENU_VIEW_FULLSCREEN,
@@ -985,6 +1064,7 @@ static void app_update_runtime_menu(HWND hwnd, const AppState *app) {
 static void app_update_input_menu(HWND hwnd, const AppState *app) {
     HMENU menu = GetMenu(hwnd);
     UINT selected;
+    UINT protocol_selected = APP_MENU_INPUT_PROTOCOL_KEMPSTON;
     if (menu == NULL || app == NULL) {
         return;
     }
@@ -995,6 +1075,34 @@ static void app_update_input_menu(HWND hwnd, const AppState *app) {
         APP_MENU_INPUT_JOYSTICK_QAOP,
         selected,
         MF_BYCOMMAND);
+    switch (app->joystick_type) {
+        case ZX_JOYSTICKTYPE_SINCLAIR_1:
+            protocol_selected = APP_MENU_INPUT_PROTOCOL_SINCLAIR_1;
+            break;
+        case ZX_JOYSTICKTYPE_SINCLAIR_2:
+            protocol_selected = APP_MENU_INPUT_PROTOCOL_SINCLAIR_2;
+            break;
+        case ZX_JOYSTICKTYPE_CURSOR:
+            protocol_selected = APP_MENU_INPUT_PROTOCOL_CURSOR;
+            break;
+        case ZX_JOYSTICKTYPE_FULLER:
+            protocol_selected = APP_MENU_INPUT_PROTOCOL_FULLER;
+            break;
+        case ZX_JOYSTICKTYPE_KEMPSTON:
+        default:
+            break;
+    }
+    CheckMenuRadioItem(
+        menu,
+        APP_MENU_INPUT_PROTOCOL_KEMPSTON,
+        APP_MENU_INPUT_PROTOCOL_FULLER,
+        protocol_selected,
+        MF_BYCOMMAND);
+    CheckMenuItem(
+        menu,
+        APP_MENU_INPUT_KEMPSTON_MOUSE,
+        MF_BYCOMMAND |
+            (app->kempston_mouse_enabled ? MF_CHECKED : MF_UNCHECKED));
 }
 
 static void app_update_recent_menu(HWND hwnd, const AppState *app) {
@@ -1883,18 +1991,37 @@ static bool app_start_autotype(AppState *app, const WCHAR *text) {
     return queued;
 }
 
+static int app_tzx_select_callback(
+    void *user_data,
+    const char *const *descriptions,
+    size_t count)
+{
+    AppTzxSelectRequest request;
+    request.descriptions = descriptions;
+    request.count = count;
+    request.selection = -1;
+    SendMessageA(
+        (HWND)user_data,
+        APP_MSG_TZX_SELECT_REQUEST,
+        0,
+        (LPARAM)&request);
+    return request.selection;
+}
+
 /* Runs tape file I/O and decode work away from the window thread so opening
    larger TAP/TZX files does not stall input or trigger the busy cursor. */
 static DWORD WINAPI app_tape_load_worker(void *param) {
     AppTapeLoadJob *job = (AppTapeLoadJob *)param;
+    TapeLoadOptions options = {app_tzx_select_callback, job->hwnd};
 
     tape_init(&job->tape);
-    job->ok = tape_load_file(
+    job->ok = tape_load_file_with_options(
         &job->tape,
         job->path,
         job->tick_hz,
         job->error,
-        sizeof(job->error)
+        sizeof(job->error),
+        &options
     );
     if (!PostMessageA(job->hwnd, APP_MSG_TAPE_LOAD_COMPLETE, 0, (LPARAM)job)) {
         if (job->ok) {
@@ -2161,14 +2288,14 @@ static bool app_load_microdrive_file(
         snprintf(
             error_buffer,
             error_buffer_size,
-            "Interface 1 ROM is not available. Place Interface1-v2.rom next to the emulator.");
+            "Interface 1 ROM is not available. Place Interface1-v2.rom in the roms folder.");
         return false;
     }
     if (drive < 0) {
         drive = microdrive_first_empty(&app->microdrives);
     }
     if (drive < 0 || drive >= MICRODRIVE_COUNT) {
-        snprintf(error_buffer, error_buffer_size, "All eight Microdrives already contain cartridges.");
+        snprintf(error_buffer, error_buffer_size, "Both Microdrives already contain cartridges.");
         return false;
     }
     if (!app_confirm_microdrive_changes(
@@ -2341,10 +2468,36 @@ static bool app_load_media_path(
             error_buffer,
             error_buffer_size);
     }
+    if (extension != NULL && _stricmp(extension, ".scr") == 0) {
+        uint8_t *data = NULL;
+        size_t data_size = 0;
+        const bool read_ok = app_read_file_all(
+            path,
+            &data,
+            &data_size,
+            error_buffer,
+            error_buffer_size,
+            "SCR");
+        const bool loaded = read_ok && spectrum_load_screen_scr_data(
+            &app->spec,
+            data,
+            data_size,
+            error_buffer,
+            error_buffer_size);
+        free(data);
+        if (loaded) {
+            app_add_recent_media(app, path);
+            app_rewind_clear(app);
+            app_debug_machine_changed(app);
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return loaded;
+    }
 
     if (extension != NULL &&
         (_stricmp(extension, ".tap") == 0 ||
-         _stricmp(extension, ".tzx") == 0)) {
+         _stricmp(extension, ".tzx") == 0 ||
+         _stricmp(extension, ".pzx") == 0)) {
         return app_load_tape_file(
             hwnd,
             app,
@@ -2368,7 +2521,7 @@ static bool app_load_media_path(
     snprintf(
         error_buffer,
         error_buffer_size,
-        "Unsupported file type. Open or drop a .tap, .tzx, .mdr, .dsk, .z80, .sna, or .szx file.");
+        "Unsupported file type. Open or drop a .tap, .tzx, .pzx, .mdr, .dsk, .scr, .z80, .sna, or .szx file.");
     return false;
 }
 
@@ -2479,6 +2632,13 @@ static bool app_apply_loaded_snapshot(
         return false;
     }
 
+    if (job->format == APP_SNAPSHOT_FORMAT_SZX) {
+        app->fuller_audio_enabled = app->spec.fuller_audio_enabled;
+        app->specdrum_enabled = app->spec.specdrum_enabled;
+        app->covox_enabled = app->spec.covox_enabled;
+        app->multiface_enabled = app->spec.multiface_enabled;
+    }
+
     app_audio_flush(app);
     app_sync_tape_stop_mode(app);
     if (model_changed) {
@@ -2487,6 +2647,8 @@ static bool app_apply_loaded_snapshot(
     app_update_title(hwnd, &app->spec);
     app_update_model_menu(hwnd, app->spec.model);
     app_update_microdrive_menu(hwnd, app);
+    app_update_sound_menu(hwnd, app);
+    app_update_runtime_menu(hwnd, app);
     app_rewind_clear(app);
     app_debug_machine_changed(app);
     InvalidateRect(hwnd, NULL, FALSE);
@@ -2564,6 +2726,7 @@ static bool app_update_tape_loader_activity(AppState *app) {
         app->tape_input_reads_this_frame = 0;
         return false;
     }
+
     if (!app->tape.playing) {
         app->tape_auto_stop_armed = false;
         app->tape_input_reads_this_frame = 0;
@@ -2621,6 +2784,8 @@ static void app_switch_model(HWND hwnd, AppState *app, SpectrumModel model) {
     app_update_title(hwnd, &app->spec);
     app_update_model_menu(hwnd, app->spec.model);
     app_update_microdrive_menu(hwnd, app);
+    app_update_sound_menu(hwnd, app);
+    app_update_runtime_menu(hwnd, app);
     app_debug_machine_changed(app);
     InvalidateRect(hwnd, NULL, FALSE);
 }
@@ -2876,6 +3041,69 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                 return TRUE;
             }
             break;
+        case WM_MOUSEMOVE:
+            if (app != NULL && app->kempston_mouse_enabled) {
+                POINT position = {
+                    (short)LOWORD(lparam),
+                    (short)HIWORD(lparam)
+                };
+                if (app->mouse_tracking) {
+                    const int delta_x = position.x - app->mouse_last_position.x;
+                    const int delta_y = position.y - app->mouse_last_position.y;
+                    app->mouse_x = (uint8_t)(app->mouse_x + delta_x);
+                    app->mouse_y = (uint8_t)(app->mouse_y - delta_y);
+                    spectrum_set_mouse(
+                        &app->spec,
+                        app->mouse_x,
+                        app->mouse_y,
+                        app->mouse_buttons);
+                } else {
+                    TRACKMOUSEEVENT tracking = {
+                        sizeof(tracking), TME_LEAVE, hwnd, 0
+                    };
+                    TrackMouseEvent(&tracking);
+                    app->mouse_tracking = true;
+                }
+                app->mouse_last_position = position;
+            }
+            break;
+        case WM_MOUSELEAVE:
+            if (app != NULL) {
+                app->mouse_tracking = false;
+            }
+            return 0;
+        case WM_LBUTTONDOWN:
+        case WM_RBUTTONDOWN:
+        case WM_MBUTTONDOWN:
+        case WM_LBUTTONUP:
+        case WM_RBUTTONUP:
+        case WM_MBUTTONUP:
+            if (app != NULL && app->kempston_mouse_enabled) {
+                uint8_t button = msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP
+                    ? ZX_MOUSE_LEFT
+                    : (msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP
+                        ? ZX_MOUSE_RIGHT
+                        : ZX_MOUSE_MIDDLE);
+                const bool pressed =
+                    msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN ||
+                    msg == WM_MBUTTONDOWN;
+                if (pressed) {
+                    app->mouse_buttons |= button;
+                    SetCapture(hwnd);
+                } else {
+                    app->mouse_buttons &= (uint8_t)~button;
+                    if (app->mouse_buttons == 0 && GetCapture() == hwnd) {
+                        ReleaseCapture();
+                    }
+                }
+                spectrum_set_mouse(
+                    &app->spec,
+                    app->mouse_x,
+                    app->mouse_y,
+                    app->mouse_buttons);
+                return 0;
+            }
+            break;
         case WM_KEYDOWN:
         case WM_SYSKEYDOWN:
             if (app != NULL) {
@@ -2939,9 +3167,15 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                             break;
                     }
                 }
-                if (alt_down && (UINT)wparam == VK_F4) {
-                    SendMessageA(hwnd, WM_CLOSE, 0, 0);
-                    return 0;
+                if (alt_down) {
+                    if ((UINT)wparam == VK_F4) {
+                        SendMessageA(hwnd, WM_CLOSE, 0, 0);
+                        return 0;
+                    }
+                    if ((UINT)wparam == VK_F5) {
+                        SendMessageA(hwnd, WM_COMMAND, APP_MENU_MACHINE_MULTIFACE_NMI, 0);
+                        return 0;
+                    }
                 }
                 if (!ctrl_down && !shift_down && !alt_down) {
                     switch ((UINT)wparam) {
@@ -2992,6 +3226,10 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         case WM_KILLFOCUS:
             if (app != NULL) {
                 app_release_all_keys(app);
+                app->mouse_buttons = 0;
+                app->mouse_tracking = false;
+                spectrum_set_mouse(
+                    &app->spec, app->mouse_x, app->mouse_y, 0);
             }
             return 0;
         case WM_ENTERSIZEMOVE:
@@ -3003,6 +3241,49 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         case WM_TIMER:
             if (app != NULL && wparam == APP_TIMER_MODAL_LOOP) {
                 app_tick_emulator(app);
+                return 0;
+            }
+            break;
+        case APP_MSG_TZX_SELECT_REQUEST:
+            if (app != NULL) {
+                AppTzxSelectRequest *request = (AppTzxSelectRequest *)lparam;
+                HMENU choice_menu = CreatePopupMenu();
+                if (request != NULL && choice_menu != NULL) {
+                    RECT window_rect;
+                    UINT command;
+                    AppendMenuA(
+                        choice_menu,
+                        MF_STRING | MF_DISABLED,
+                        0,
+                        "Select tape option");
+                    AppendMenuA(choice_menu, MF_SEPARATOR, 0, NULL);
+                    for (size_t index = 0; index < request->count; ++index) {
+                        const char *description = request->descriptions[index];
+                        AppendMenuA(
+                            choice_menu,
+                            MF_STRING,
+                            (UINT_PTR)(index + 1u),
+                            description != NULL && description[0] != '\0'
+                                ? description
+                                : "(unnamed option)");
+                    }
+                    GetWindowRect(hwnd, &window_rect);
+                    SetForegroundWindow(hwnd);
+                    command = TrackPopupMenu(
+                        choice_menu,
+                        TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN,
+                        (window_rect.left + window_rect.right) / 2,
+                        (window_rect.top + window_rect.bottom) / 2,
+                        0,
+                        hwnd,
+                        NULL);
+                    request->selection = command > 0
+                        ? (int)(command - 1u)
+                        : -1;
+                }
+                if (choice_menu != NULL) {
+                    DestroyMenu(choice_menu);
+                }
                 return 0;
             }
             break;
@@ -3060,10 +3341,11 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                         ofn.lStructSize = sizeof(ofn);
                         ofn.hwndOwner = hwnd;
                         ofn.lpstrFilter =
-                            "ZX Spectrum Files (*.tap;*.tzx;*.mdr;*.dsk;*.z80;*.sna;*.szx)\0*.tap;*.tzx;*.mdr;*.dsk;*.z80;*.sna;*.szx\0"
-                            "Tape Images (*.tap;*.tzx)\0*.tap;*.tzx\0"
+                            "ZX Spectrum Files (*.tap;*.tzx;*.pzx;*.mdr;*.dsk;*.scr;*.z80;*.sna;*.szx)\0*.tap;*.tzx;*.pzx;*.mdr;*.dsk;*.scr;*.z80;*.sna;*.szx\0"
+                            "Tape Images (*.tap;*.tzx;*.pzx)\0*.tap;*.tzx;*.pzx\0"
                             "Microdrive Cartridges (*.mdr)\0*.mdr\0"
                             "Spectrum +3 Disks (*.dsk)\0*.dsk\0"
+                            "Spectrum Screens (*.scr)\0*.scr\0"
                             "ZX Spectrum Snapshots (*.z80;*.sna;*.szx)\0*.z80;*.sna;*.szx\0"
                             "All Files (*.*)\0*.*\0";
                         ofn.lpstrFile = path;
@@ -3089,13 +3371,14 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                     }
                     case APP_MENU_FILE_SAVE_SNAPSHOT: {
                         OPENFILENAMEA ofn;
-                        char path[MAX_PATH] = "snapshot.sna";
+                        char path[MAX_PATH] = "snapshot.z80";
                         char error_buffer[256];
                         ZeroMemory(&ofn, sizeof(ofn));
                         ZeroMemory(error_buffer, sizeof(error_buffer));
                         ofn.lStructSize = sizeof(ofn);
                         ofn.hwndOwner = hwnd;
                         ofn.lpstrFilter =
+                            "Z80 Snapshots (*.z80)\0*.z80\0"
                             "SNA Snapshots (*.sna)\0*.sna\0"
                             "All Files (*.*)\0*.*\0";
                         ofn.lpstrFile = path;
@@ -3104,9 +3387,39 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                             OFN_OVERWRITEPROMPT |
                             OFN_PATHMUSTEXIST |
                             OFN_NOCHANGEDIR;
-                        ofn.lpstrDefExt = "sna";
+                        ofn.lpstrDefExt = "z80";
+                        if (GetSaveFileNameA(&ofn)) {
+                            const char *extension = strrchr(path, '.');
+                            bool saved = extension != NULL &&
+                                _stricmp(extension, ".sna") == 0
+                                ? spectrum_save_snapshot_sna_file(
+                                    &app->spec, path, error_buffer, sizeof(error_buffer))
+                                : spectrum_save_snapshot_z80_file(
+                                    &app->spec, path, error_buffer, sizeof(error_buffer));
+                            if (!saved) app_show_error(error_buffer);
+                        }
+                        return 0;
+                    }
+                    case APP_MENU_FILE_SAVE_SCREEN: {
+                        OPENFILENAMEA ofn;
+                        char path[MAX_PATH] = "screen.scr";
+                        char error_buffer[256];
+                        ZeroMemory(&ofn, sizeof(ofn));
+                        ZeroMemory(error_buffer, sizeof(error_buffer));
+                        ofn.lStructSize = sizeof(ofn);
+                        ofn.hwndOwner = hwnd;
+                        ofn.lpstrFilter =
+                            "Spectrum Screens (*.scr)\0*.scr\0"
+                            "All Files (*.*)\0*.*\0";
+                        ofn.lpstrFile = path;
+                        ofn.nMaxFile = MAX_PATH;
+                        ofn.Flags =
+                            OFN_OVERWRITEPROMPT |
+                            OFN_PATHMUSTEXIST |
+                            OFN_NOCHANGEDIR;
+                        ofn.lpstrDefExt = "scr";
                         if (GetSaveFileNameA(&ofn) &&
-                            !spectrum_save_snapshot_sna_file(
+                            !spectrum_save_screen_scr_file(
                                 &app->spec,
                                 path,
                                 error_buffer,
@@ -3165,6 +3478,12 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                         app_audio_flush(app);
                         tape_stop(&app->tape);
                         spectrum_reset(&app->spec);
+                        app_apply_joystick_mask(app);
+                        spectrum_set_mouse(
+                            &app->spec,
+                            app->mouse_x,
+                            app->mouse_y,
+                            app->mouse_buttons);
                         tape_rewind(&app->tape, (uint32_t)app->spec.machine.freq_hz);
                         app_rewind_clear(app);
                         app_debug_machine_changed(app);
@@ -3175,7 +3494,40 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                         app_audio_flush(app);
                         app_audio_service(app);
                         app_save_sound_muted(app->audio.muted);
-                        app_update_sound_menu(hwnd, app->audio.muted);
+                        app_update_sound_menu(hwnd, app);
+                        return 0;
+                    case APP_MENU_SOUND_FULLER_AY:
+                        app->fuller_audio_enabled = !app->fuller_audio_enabled;
+                        spectrum_set_expansion_audio(
+                            &app->spec,
+                            app->fuller_audio_enabled,
+                            app->specdrum_enabled,
+                            app->covox_enabled);
+                        app_save_toggle("fuller_audio", app->fuller_audio_enabled);
+                        app_rewind_clear(app);
+                        app_update_sound_menu(hwnd, app);
+                        return 0;
+                    case APP_MENU_SOUND_SPECDRUM:
+                        app->specdrum_enabled = !app->specdrum_enabled;
+                        spectrum_set_expansion_audio(
+                            &app->spec,
+                            app->fuller_audio_enabled,
+                            app->specdrum_enabled,
+                            app->covox_enabled);
+                        app_save_toggle("specdrum", app->specdrum_enabled);
+                        app_rewind_clear(app);
+                        app_update_sound_menu(hwnd, app);
+                        return 0;
+                    case APP_MENU_SOUND_COVOX:
+                        app->covox_enabled = !app->covox_enabled;
+                        spectrum_set_expansion_audio(
+                            &app->spec,
+                            app->fuller_audio_enabled,
+                            app->specdrum_enabled,
+                            app->covox_enabled);
+                        app_save_toggle("covox", app->covox_enabled);
+                        app_rewind_clear(app);
+                        app_update_sound_menu(hwnd, app);
                         return 0;
                     case APP_MENU_MACHINE_48K:
                         app_switch_model(hwnd, app, SPECTRUM_MODEL_48K);
@@ -3224,6 +3576,25 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                             MessageBeep(MB_ICONINFORMATION);
                         }
                         return 0;
+                    case APP_MENU_MACHINE_MULTIFACE:
+                        if (app->spec.multiface_rom_loaded ||
+                            app->spec.machine.multiface_16k_ram_mode) {
+                            app->multiface_enabled = !app->multiface_enabled;
+                            spectrum_set_multiface_enabled(
+                                &app->spec, app->multiface_enabled);
+                            app_save_toggle("multiface", app->multiface_enabled);
+                            app_rewind_clear(app);
+                            app_update_runtime_menu(hwnd, app);
+                        }
+                        return 0;
+                    case APP_MENU_MACHINE_MULTIFACE_NMI:
+                        if (app->multiface_enabled &&
+                            (app->spec.multiface_rom_loaded ||
+                             app->spec.machine.multiface_16k_ram_mode)) {
+                            spectrum_multiface_nmi(&app->spec);
+                            app_rewind_clear(app);
+                        }
+                        return 0;
                     case APP_MENU_VIEW_FULLSCREEN:
                         app_set_fullscreen(hwnd, app, !app->fullscreen);
                         return 0;
@@ -3240,6 +3611,46 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                         app->keyboard_joystick_preset = (KeyboardJoystickPreset)(
                             LOWORD(wparam) - APP_MENU_INPUT_JOYSTICK_NONE);
                         app_save_keyboard_joystick(app->keyboard_joystick_preset);
+                        app_update_input_menu(hwnd, app);
+                        return 0;
+                    case APP_MENU_INPUT_PROTOCOL_KEMPSTON:
+                    case APP_MENU_INPUT_PROTOCOL_SINCLAIR_1:
+                    case APP_MENU_INPUT_PROTOCOL_SINCLAIR_2:
+                    case APP_MENU_INPUT_PROTOCOL_CURSOR:
+                    case APP_MENU_INPUT_PROTOCOL_FULLER:
+                        app_release_all_keys(app);
+                        if (LOWORD(wparam) == APP_MENU_INPUT_PROTOCOL_SINCLAIR_1) {
+                            app->joystick_type = ZX_JOYSTICKTYPE_SINCLAIR_1;
+                        } else if (LOWORD(wparam) == APP_MENU_INPUT_PROTOCOL_SINCLAIR_2) {
+                            app->joystick_type = ZX_JOYSTICKTYPE_SINCLAIR_2;
+                        } else if (LOWORD(wparam) == APP_MENU_INPUT_PROTOCOL_CURSOR) {
+                            app->joystick_type = ZX_JOYSTICKTYPE_CURSOR;
+                        } else if (LOWORD(wparam) == APP_MENU_INPUT_PROTOCOL_FULLER) {
+                            app->joystick_type = ZX_JOYSTICKTYPE_FULLER;
+                        } else {
+                            app->joystick_type = ZX_JOYSTICKTYPE_KEMPSTON;
+                        }
+                        spectrum_set_joystick_type(&app->spec, app->joystick_type);
+                        app_apply_joystick_mask(app);
+                        app_rewind_clear(app);
+                        app_save_joystick_type(app->joystick_type);
+                        app_update_input_menu(hwnd, app);
+                        return 0;
+                    case APP_MENU_INPUT_KEMPSTON_MOUSE:
+                        app->kempston_mouse_enabled = !app->kempston_mouse_enabled;
+                        app->mouse_tracking = false;
+                        if (!app->kempston_mouse_enabled) {
+                            app->mouse_buttons = 0;
+                        }
+                        spectrum_set_kempston_mouse_enabled(
+                            &app->spec, app->kempston_mouse_enabled);
+                        spectrum_set_mouse(
+                            &app->spec,
+                            app->mouse_x,
+                            app->mouse_y,
+                            app->mouse_buttons);
+                        app_rewind_clear(app);
+                        app_save_kempston_mouse_enabled(app->kempston_mouse_enabled);
                         app_update_input_menu(hwnd, app);
                         return 0;
                     case APP_MENU_RECENT_MEDIA_CLEAR:
@@ -3570,7 +3981,7 @@ static void app_print_usage(void) {
     fprintf(stderr, "  zxspecemu --plus2a <plus2a-combined-64k.rom>\n");
     fprintf(stderr, "  zxspecemu --plus3 <plus3-combined-64k.rom>\n");
     fprintf(stderr, "  zxspecemu\n");
-    fprintf(stderr, "\nAutodetects plus3.rom, plus2a.rom, plus2.rom, 128.rom, and 48.rom.\n");
+    fprintf(stderr, "\nAutodetects ROM images in the roms folder.\n");
 }
 
 /* Resolves the persisted settings file path, preferring `%APPDATA%` so the
@@ -3652,6 +4063,31 @@ static bool app_load_saved_tape_autoload(bool *enabled) {
     return false;
 }
 
+static bool app_load_saved_toggle(const char *key, bool *enabled) {
+    char path[MAX_PATH];
+    char value[16];
+    if (key == NULL || enabled == NULL || !app_settings_path(path, sizeof(path))) {
+        return false;
+    }
+    GetPrivateProfileStringA("emulator", key, "", value, sizeof(value), path);
+    if (strcmp(value, "1") == 0) {
+        *enabled = true;
+        return true;
+    }
+    if (strcmp(value, "0") == 0) {
+        *enabled = false;
+        return true;
+    }
+    return false;
+}
+
+static void app_save_toggle(const char *key, bool enabled) {
+    char path[MAX_PATH];
+    if (key != NULL && app_settings_path(path, sizeof(path))) {
+        WritePrivateProfileStringA("emulator", key, enabled ? "1" : "0", path);
+    }
+}
+
 static bool app_load_saved_keyboard_joystick(KeyboardJoystickPreset *preset) {
     char path[MAX_PATH];
     char value[16];
@@ -3673,6 +4109,43 @@ static bool app_load_saved_keyboard_joystick(KeyboardJoystickPreset *preset) {
     }
     *preset = (KeyboardJoystickPreset)parsed;
     return value[0] != '\0';
+}
+
+static bool app_load_saved_joystick_type(zx_joystick_type_t *type) {
+    char path[MAX_PATH];
+    char value[16];
+    int parsed;
+    if (!app_settings_path(path, sizeof(path))) {
+        return false;
+    }
+    GetPrivateProfileStringA(
+        "emulator", "joystick_type", "", value, sizeof(value), path);
+    parsed = atoi(value);
+    if (value[0] == '\0' || parsed < ZX_JOYSTICKTYPE_KEMPSTON ||
+        parsed > ZX_JOYSTICKTYPE_FULLER) {
+        return false;
+    }
+    *type = (zx_joystick_type_t)parsed;
+    return true;
+}
+
+static bool app_load_saved_kempston_mouse_enabled(bool *enabled) {
+    char path[MAX_PATH];
+    char value[16];
+    if (!app_settings_path(path, sizeof(path))) {
+        return false;
+    }
+    GetPrivateProfileStringA(
+        "emulator", "kempston_mouse", "", value, sizeof(value), path);
+    if (strcmp(value, "1") == 0) {
+        *enabled = true;
+        return true;
+    }
+    if (strcmp(value, "0") == 0) {
+        *enabled = false;
+        return true;
+    }
+    return false;
 }
 
 static void app_load_recent_media(AppState *app) {
@@ -3844,6 +4317,25 @@ static void app_save_keyboard_joystick(KeyboardJoystickPreset preset) {
         path);
 }
 
+static void app_save_joystick_type(zx_joystick_type_t type) {
+    char path[MAX_PATH];
+    char value[16];
+    if (!app_settings_path(path, sizeof(path))) {
+        return;
+    }
+    snprintf(value, sizeof(value), "%d", (int)type);
+    WritePrivateProfileStringA("emulator", "joystick_type", value, path);
+}
+
+static void app_save_kempston_mouse_enabled(bool enabled) {
+    char path[MAX_PATH];
+    if (!app_settings_path(path, sizeof(path))) {
+        return;
+    }
+    WritePrivateProfileStringA(
+        "emulator", "kempston_mouse", enabled ? "1" : "0", path);
+}
+
 static void app_save_recent_media(const AppState *app) {
     char path[MAX_PATH];
     if (app == NULL || !app_settings_path(path, sizeof(path))) {
@@ -3865,9 +4357,11 @@ static bool app_find_rom(char *out_path, size_t out_size, const char *filename) 
     char module_path[MAX_PATH];
     char module_dir[MAX_PATH];
     char parent_dir[MAX_PATH];
+    char rom_dir[MAX_PATH];
 
-    if (app_file_exists(filename)) {
-        snprintf(out_path, out_size, "%s", filename);
+    if (app_join_path(rom_dir, sizeof(rom_dir), "roms", filename) &&
+        app_file_exists(rom_dir)) {
+        snprintf(out_path, out_size, "%s", rom_dir);
         return true;
     }
 
@@ -3880,13 +4374,17 @@ static bool app_find_rom(char *out_path, size_t out_size, const char *filename) 
         return false;
     }
 
-    if (app_join_path(out_path, out_size, module_dir, filename) && app_file_exists(out_path)) {
+    if (app_join_path(rom_dir, sizeof(rom_dir), module_dir, "roms") &&
+        app_join_path(out_path, out_size, rom_dir, filename) &&
+        app_file_exists(out_path)) {
         return true;
     }
 
     snprintf(parent_dir, sizeof(parent_dir), "%s", module_dir);
     if (app_parent_dir(parent_dir)) {
-        if (app_join_path(out_path, out_size, parent_dir, filename) && app_file_exists(out_path)) {
+        if (app_join_path(rom_dir, sizeof(rom_dir), parent_dir, "roms") &&
+            app_join_path(out_path, out_size, rom_dir, filename) &&
+            app_file_exists(out_path)) {
             return true;
         }
     }
@@ -3974,6 +4472,20 @@ static void app_rom_set_set_paths(RomSet *set, const char *rom_a, const char *ro
     }
 }
 
+static const char *app_multiface_rom_for_model(
+    const RomSelection *selection,
+    SpectrumModel model)
+{
+    if (selection == NULL) return NULL;
+    if (model == SPECTRUM_MODEL_48K) {
+        return selection->has_multiface1_rom ? selection->multiface1_rom : NULL;
+    }
+    if (model == SPECTRUM_MODEL_128K || model == SPECTRUM_MODEL_PLUS2) {
+        return selection->has_multiface128_rom ? selection->multiface128_rom : NULL;
+    }
+    return selection->has_multiface3_rom ? selection->multiface3_rom : NULL;
+}
+
 /* Rebuilds the wrapped Spectrum from the ROM files assigned to the requested
    model so each machine variant boots from its own supplied images. */
 static bool app_load_model_roms(
@@ -4033,6 +4545,14 @@ static bool app_load_model_roms(
         app->spec = previous_spec;
         return false;
     }
+    if (!spectrum_load_multiface_rom(
+            &app->spec,
+            app_multiface_rom_for_model(&app->roms, model),
+            error_buffer,
+            error_buffer_size)) {
+        app->spec = previous_spec;
+        return false;
+    }
     if (!spectrum_load_roms(
             &app->spec,
             set->rom_a,
@@ -4043,6 +4563,17 @@ static bool app_load_model_roms(
         return false;
     }
 
+    spectrum_set_joystick_type(&app->spec, app->joystick_type);
+    spectrum_set_kempston_mouse_enabled(
+        &app->spec, app->kempston_mouse_enabled);
+    spectrum_set_expansion_audio(
+        &app->spec,
+        app->fuller_audio_enabled,
+        app->specdrum_enabled,
+        app->covox_enabled);
+    spectrum_set_multiface_enabled(&app->spec, app->multiface_enabled);
+    spectrum_set_mouse(
+        &app->spec, app->mouse_x, app->mouse_y, app->mouse_buttons);
     app_apply_joystick_mask(app);
     return true;
 }
@@ -4093,8 +4624,8 @@ static void app_controller_shutdown(AppState *app) {
     }
 }
 
-/* Converts the current XInput state into a Kempston joystick bitmask and
-   pushes it into the emulated machine each frame. */
+/* Converts the current XInput state into a Spectrum joystick bitmask and
+   pushes it through the selected interface each frame. */
 static void app_controller_poll(AppState *app) {
     ControllerState *controller = &app->controller;
     XINPUT_STATE state;
@@ -4254,6 +4785,18 @@ static bool app_resolve_roms(
         snprintf(selection->interface1_rom, sizeof(selection->interface1_rom), "%s", rom_path);
         selection->has_interface1_rom = true;
     }
+    if (app_find_rom(rom_path, sizeof(rom_path), "multiface1.rom")) {
+        snprintf(selection->multiface1_rom, sizeof(selection->multiface1_rom), "%s", rom_path);
+        selection->has_multiface1_rom = true;
+    }
+    if (app_find_rom(rom_path, sizeof(rom_path), "multiface128.rom")) {
+        snprintf(selection->multiface128_rom, sizeof(selection->multiface128_rom), "%s", rom_path);
+        selection->has_multiface128_rom = true;
+    }
+    if (app_find_rom(rom_path, sizeof(rom_path), "multiface3.rom")) {
+        snprintf(selection->multiface3_rom, sizeof(selection->multiface3_rom), "%s", rom_path);
+        selection->has_multiface3_rom = true;
+    }
     if (rom_a != NULL) {
         target_set = app_rom_set_for_model(selection, model);
         app_rom_set_set_paths(target_set, rom_a, rom_b);
@@ -4324,12 +4867,24 @@ int main(int argc, char **argv) {
     bool saved_sound_muted = false;
     unsigned saved_speed_multiplier = 1;
     KeyboardJoystickPreset saved_keyboard_joystick = APP_KEYBOARD_JOYSTICK_NONE;
+    zx_joystick_type_t saved_joystick_type = ZX_JOYSTICKTYPE_KEMPSTON;
+    bool saved_kempston_mouse_enabled = false;
+    bool saved_fuller_audio_enabled = false;
+    bool saved_specdrum_enabled = false;
+    bool saved_covox_enabled = false;
+    bool saved_multiface_enabled = false;
     bool has_saved_model;
     bool has_saved_tape_autoload;
     bool has_saved_fast_tape_loading;
     bool has_saved_sound_muted;
     bool has_saved_speed_multiplier;
     bool has_saved_keyboard_joystick;
+    bool has_saved_joystick_type;
+    bool has_saved_kempston_mouse_enabled;
+    bool has_saved_fuller_audio_enabled;
+    bool has_saved_specdrum_enabled;
+    bool has_saved_covox_enabled;
+    bool has_saved_multiface_enabled;
     INITCOMMONCONTROLSEX common_controls;
     ZeroMemory(&selection, sizeof(selection));
     has_saved_model = app_load_saved_model(&saved_model);
@@ -4340,9 +4895,20 @@ int main(int argc, char **argv) {
         app_load_saved_speed_multiplier(&saved_speed_multiplier);
     has_saved_keyboard_joystick =
         app_load_saved_keyboard_joystick(&saved_keyboard_joystick);
+    has_saved_joystick_type = app_load_saved_joystick_type(&saved_joystick_type);
+    has_saved_kempston_mouse_enabled =
+        app_load_saved_kempston_mouse_enabled(&saved_kempston_mouse_enabled);
+    has_saved_fuller_audio_enabled =
+        app_load_saved_toggle("fuller_audio", &saved_fuller_audio_enabled);
+    has_saved_specdrum_enabled =
+        app_load_saved_toggle("specdrum", &saved_specdrum_enabled);
+    has_saved_covox_enabled =
+        app_load_saved_toggle("covox", &saved_covox_enabled);
+    has_saved_multiface_enabled =
+        app_load_saved_toggle("multiface", &saved_multiface_enabled);
     if (!app_resolve_roms(argc, argv, has_saved_model, saved_model, &selection)) {
         app_print_usage();
-        app_show_error("No compatible ROM found. Place a supported 48K, 128K, +2, +2A, or +3 ROM next to the EXE or in the repo.");
+        app_show_error("No compatible ROM found. Place a supported 48K, 128K, +2, +2A, or +3 ROM in the roms folder.");
         return 1;
     }
 
@@ -4359,6 +4925,22 @@ int main(int argc, char **argv) {
     app.keyboard_joystick_preset = has_saved_keyboard_joystick
         ? saved_keyboard_joystick
         : APP_KEYBOARD_JOYSTICK_NONE;
+    app.joystick_type = has_saved_joystick_type
+        ? saved_joystick_type
+        : ZX_JOYSTICKTYPE_KEMPSTON;
+    app.kempston_mouse_enabled = has_saved_kempston_mouse_enabled
+        ? saved_kempston_mouse_enabled
+        : false;
+    app.fuller_audio_enabled = has_saved_fuller_audio_enabled
+        ? saved_fuller_audio_enabled : false;
+    app.specdrum_enabled = has_saved_specdrum_enabled
+        ? saved_specdrum_enabled : false;
+    app.covox_enabled = has_saved_covox_enabled
+        ? saved_covox_enabled : false;
+    app.multiface_enabled = has_saved_multiface_enabled
+        ? saved_multiface_enabled : false;
+    app.mouse_x = 128;
+    app.mouse_y = 96;
     app.integer_scaling = true;
     app_load_recent_media(&app);
     tape_init(&app.tape);
@@ -4466,7 +5048,7 @@ int main(int argc, char **argv) {
     app_update_title(hwnd, &app.spec);
     app_update_model_menu(hwnd, app.spec.model);
     app_update_microdrive_menu(hwnd, &app);
-    app_update_sound_menu(hwnd, app.audio.muted);
+    app_update_sound_menu(hwnd, &app);
     app_update_disk_menu(hwnd, app.disk.inserted);
     app_update_runtime_menu(hwnd, &app);
     app_update_input_menu(hwnd, &app);

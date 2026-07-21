@@ -25,7 +25,10 @@ enum
     SNA_48K_SIZE = SNA_HEADER_SIZE + (3 * SNA_RAM_BANK_SIZE),
     SNA_128K_BASE_SIZE = SNA_48K_SIZE + 4,
     SNA_128K_SIZE = SNA_128K_BASE_SIZE + (5 * SNA_RAM_BANK_SIZE),
-    SNA_128K_DUPLICATE_BANK_SIZE = SNA_128K_BASE_SIZE + (6 * SNA_RAM_BANK_SIZE)
+    SNA_128K_DUPLICATE_BANK_SIZE = SNA_128K_BASE_SIZE + (6 * SNA_RAM_BANK_SIZE),
+    Z80_V3_HEADER_SIZE = 87,
+    Z80_PAGE_HEADER_SIZE = 3,
+    SCR_SCREEN_SIZE = 6912
 };
 
 static uint16_t spectrum_read_u16(const uint8_t *data)
@@ -109,7 +112,11 @@ bool spectrum_detect_snapshot_model_data(
     size_t size,
     SpectrumModel *model)
 {
-    if (size < 30)
+    uint16_t additional_length;
+    uint8_t hardware_mode;
+    uint8_t flags;
+
+    if (data == NULL || model == NULL || size < 30)
     {
         return false;
     }
@@ -121,22 +128,45 @@ bool spectrum_detect_snapshot_model_data(
         return true;
     }
 
-    if (size < 35)
+    if (size < 32)
     {
         return false;
     }
-
-    if (data[34] < 3)
+    additional_length = spectrum_read_u16(&data[30]);
+    if (additional_length < 23 || additional_length > size - 32)
     {
-        *model = SPECTRUM_MODEL_48K;
+        return false;
     }
-    else
+    hardware_mode = data[34];
+    flags = data[37];
+
+    if (hardware_mode == 7 || hardware_mode == 8)
+        *model = SPECTRUM_MODEL_PLUS3;
+    else if (hardware_mode == 12)
+        *model = SPECTRUM_MODEL_PLUS2;
+    else if (hardware_mode == 13)
+        *model = SPECTRUM_MODEL_PLUS2A;
+    else if (additional_length == 23)
     {
-        if (data[34] == 7 || data[34] == 8 || data[34] == 13)
-        {
-            return false;
-        }
-        *model = SPECTRUM_MODEL_128K;
+        if (hardware_mode <= 1) *model = SPECTRUM_MODEL_48K;
+        else if (hardware_mode == 3 || hardware_mode == 4)
+            *model = SPECTRUM_MODEL_128K;
+        else return false;
+    }
+    else if (additional_length >= 54)
+    {
+        if (hardware_mode == 0 || hardware_mode == 1 || hardware_mode == 3)
+            *model = SPECTRUM_MODEL_48K;
+        else if (hardware_mode >= 4 && hardware_mode <= 6)
+            *model = SPECTRUM_MODEL_128K;
+        else return false;
+    }
+    else return false;
+
+    if (flags & 0x80)
+    {
+        if (*model == SPECTRUM_MODEL_128K) *model = SPECTRUM_MODEL_PLUS2;
+        else if (*model == SPECTRUM_MODEL_PLUS3) *model = SPECTRUM_MODEL_PLUS2A;
     }
     return true;
 }
@@ -186,7 +216,7 @@ static void spectrum_init_machine(Spectrum *spec)
     {
         desc.type = ZX_TYPE_48K;
     }
-    desc.joystick_type = ZX_JOYSTICKTYPE_NONE;
+    desc.joystick_type = spec->joystick_type;
     desc.audio.callback = spec->audio_callback;
     desc.audio.num_samples = spec->audio_num_samples;
     desc.audio.sample_rate = spec->audio_sample_rate;
@@ -212,6 +242,16 @@ static void spectrum_init_machine(Spectrum *spec)
     desc.interface1.read = spec->microdrive_read;
     desc.interface1.write = spec->microdrive_write;
     desc.interface1.user_data = spec->microdrive_user_data;
+    desc.expansion.fuller_audio = spec->fuller_audio_enabled;
+    desc.expansion.specdrum = spec->specdrum_enabled;
+    desc.expansion.covox = spec->covox_enabled;
+    /* Make the ROM available to the core even when the attachment is
+       currently disabled, so an SZX MFCE block can enable it on restore. */
+    desc.expansion.multiface_enabled = spec->multiface_rom_loaded;
+    desc.expansion.multiface_rom.ptr = spec->multiface_rom;
+    desc.expansion.multiface_rom.size = spec->multiface_rom_loaded
+        ? sizeof(spec->multiface_rom)
+        : 0;
     if (spec->model == SPECTRUM_MODEL_PLUS2A ||
         spec->model == SPECTRUM_MODEL_PLUS3)
     {
@@ -238,6 +278,11 @@ static void spectrum_init_machine(Spectrum *spec)
         desc.roms.zx48k.size = sizeof(spec->rom[spec->rom48_index]);
     }
     zx_init(&spec->machine, &desc);
+    zx_set_multiface_enabled(
+        &spec->machine,
+        spec->multiface_enabled && spec->multiface_rom_loaded);
+    zx_set_kempston_mouse_enabled(&spec->machine, spec->kempston_mouse_enabled);
+    zx_mouse(&spec->machine, spec->mouse_x, spec->mouse_y, spec->mouse_buttons);
     spec->display = zx_display_info(&spec->machine);
 
     /* Add direct bindings for the two Spectrum modifier keys so the frontend
@@ -296,6 +341,9 @@ void spectrum_init(Spectrum *spec, SpectrumModel model)
     spec->audio_sample_rate = 44100;
     spec->beeper_volume = 0.35f;
     spec->ay_volume = 0.20f;
+    spec->joystick_type = ZX_JOYSTICKTYPE_KEMPSTON;
+    spec->mouse_x = 128;
+    spec->mouse_y = 96;
     spec->rom48_index = 0;
 }
 
@@ -419,6 +467,34 @@ bool spectrum_load_interface1_rom(
         return false;
     }
     spec->interface1_rom_loaded = true;
+    return true;
+}
+
+bool spectrum_load_multiface_rom(
+    Spectrum *spec,
+    const char *rom_path,
+    char *error_buffer,
+    size_t error_buffer_size)
+{
+    size_t file_size = 0;
+
+    spec->multiface_rom_loaded = false;
+    if (rom_path == NULL || rom_path[0] == '\0') {
+        return true;
+    }
+    if (!spectrum_load_file_exact(
+            rom_path,
+            spec->multiface_rom,
+            sizeof(spec->multiface_rom),
+            &file_size)) {
+        snprintf(error_buffer, error_buffer_size, "Could not load Multiface ROM: %s", rom_path);
+        return false;
+    }
+    if (file_size != sizeof(spec->multiface_rom)) {
+        snprintf(error_buffer, error_buffer_size, "Multiface ROM must be exactly 8 KB: %s", rom_path);
+        return false;
+    }
+    spec->multiface_rom_loaded = true;
     return true;
 }
 
@@ -583,8 +659,17 @@ void spectrum_key_up(Spectrum *spec, int key_code)
     zx_key_up(&spec->machine, key_code);
 }
 
+void spectrum_set_joystick_type(Spectrum *spec, zx_joystick_type_t type)
+{
+    spec->joystick_type = type;
+    if (spec->machine_ready)
+    {
+        zx_set_joystick_type(&spec->machine, type);
+    }
+}
+
 /* Updates the emulated joystick lines so frontend controller input can feed
-   the Kempston port without interfering with keyboard mappings. */
+   the selected interface without interfering with normal keyboard input. */
 void spectrum_set_joystick_mask(Spectrum *spec, uint8_t mask)
 {
     if (!spec->machine_ready)
@@ -592,6 +677,115 @@ void spectrum_set_joystick_mask(Spectrum *spec, uint8_t mask)
         return;
     }
     zx_joystick(&spec->machine, mask);
+}
+
+void spectrum_set_kempston_mouse_enabled(Spectrum *spec, bool enabled)
+{
+    spec->kempston_mouse_enabled = enabled;
+    if (spec->machine_ready)
+    {
+        zx_set_kempston_mouse_enabled(&spec->machine, enabled);
+    }
+}
+
+void spectrum_set_mouse(Spectrum *spec, uint8_t x, uint8_t y, uint8_t buttons)
+{
+    spec->mouse_x = x;
+    spec->mouse_y = y;
+    spec->mouse_buttons = buttons & 0x07u;
+    if (spec->machine_ready)
+    {
+        zx_mouse(&spec->machine, spec->mouse_x, spec->mouse_y, spec->mouse_buttons);
+    }
+}
+
+void spectrum_set_expansion_audio(
+    Spectrum *spec,
+    bool fuller_audio,
+    bool specdrum,
+    bool covox)
+{
+    spec->fuller_audio_enabled = fuller_audio;
+    spec->specdrum_enabled = specdrum;
+    spec->covox_enabled = covox;
+    if (spec->machine_ready) {
+        zx_set_expansion_audio(&spec->machine, fuller_audio, specdrum, covox);
+    }
+}
+
+void spectrum_set_multiface_enabled(Spectrum *spec, bool enabled)
+{
+    spec->multiface_enabled = enabled &&
+        (spec->multiface_rom_loaded ||
+         (spec->machine_ready && spec->machine.multiface_16k_ram_mode));
+    if (spec->machine_ready) {
+        zx_set_multiface_enabled(&spec->machine, spec->multiface_enabled);
+    }
+}
+
+void spectrum_multiface_nmi(Spectrum *spec)
+{
+    if (spec != NULL && spec->machine_ready && spec->multiface_enabled) {
+        zx_multiface_nmi(&spec->machine);
+    }
+}
+
+bool spectrum_load_screen_scr_data(
+    Spectrum *spec,
+    const uint8_t *data,
+    size_t data_size,
+    char *error_buffer,
+    size_t error_buffer_size)
+{
+    if (spec == NULL || !spec->machine_ready || data == NULL)
+    {
+        snprintf(error_buffer, error_buffer_size, "No running machine or SCR data is available.");
+        return false;
+    }
+    if (data_size != SCR_SCREEN_SIZE || spec->machine.display_ram_bank >= 8)
+    {
+        snprintf(error_buffer, error_buffer_size, "SCR images must be exactly 6912 bytes.");
+        return false;
+    }
+    memcpy(
+        spec->machine.ram[spec->machine.display_ram_bank],
+        data,
+        SCR_SCREEN_SIZE);
+    spectrum_render_frame(spec);
+    return true;
+}
+
+bool spectrum_save_screen_scr_file(
+    const Spectrum *spec,
+    const char *path,
+    char *error_buffer,
+    size_t error_buffer_size)
+{
+    FILE *file;
+    if (spec == NULL || !spec->machine_ready || path == NULL || path[0] == '\0' ||
+        spec->machine.display_ram_bank >= 8)
+    {
+        snprintf(error_buffer, error_buffer_size, "No visible Spectrum screen is available to save.");
+        return false;
+    }
+    file = fopen(path, "wb");
+    if (file == NULL)
+    {
+        snprintf(error_buffer, error_buffer_size, "Could not create SCR file: %s", path);
+        return false;
+    }
+    const bool wrote_all = fwrite(
+        spec->machine.ram[spec->machine.display_ram_bank],
+        1,
+        SCR_SCREEN_SIZE,
+        file) == SCR_SCREEN_SIZE;
+    const int close_result = fclose(file);
+    if (!wrote_all || close_result != 0)
+    {
+        snprintf(error_buffer, error_buffer_size, "Could not save the complete SCR file: %s", path);
+        return false;
+    }
+    return true;
 }
 
 static void spectrum_store_sna_registers(
@@ -615,6 +809,151 @@ static void spectrum_store_sna_registers(
     spectrum_write_u16(&header[23], stack_pointer);
     header[25] = machine->cpu.im;
     header[26] = machine->border_color & 0x07u;
+}
+
+static uint8_t spectrum_z80_hardware_mode(SpectrumModel model)
+{
+    switch (model)
+    {
+        case SPECTRUM_MODEL_128K: return 4;
+        case SPECTRUM_MODEL_PLUS2: return 12;
+        case SPECTRUM_MODEL_PLUS2A: return 13;
+        case SPECTRUM_MODEL_PLUS3: return 7;
+        case SPECTRUM_MODEL_48K:
+        default: return 0;
+    }
+}
+
+static void spectrum_store_z80_registers(
+    const zx_t *machine,
+    uint8_t *header,
+    uint16_t program_counter)
+{
+    header[0] = machine->cpu.a;
+    header[1] = machine->cpu.f;
+    header[2] = machine->cpu.c;
+    header[3] = machine->cpu.b;
+    header[4] = machine->cpu.l;
+    header[5] = machine->cpu.h;
+    spectrum_write_u16(header + 8, machine->cpu.sp);
+    header[10] = machine->cpu.i;
+    header[11] = machine->cpu.r & 0x7Fu;
+    header[12] = (uint8_t)(((machine->cpu.r >> 7) & 1u) |
+        ((machine->border_color & 7u) << 1));
+    header[13] = machine->cpu.e;
+    header[14] = machine->cpu.d;
+    header[15] = (uint8_t)machine->cpu.bc2;
+    header[16] = (uint8_t)(machine->cpu.bc2 >> 8);
+    header[17] = (uint8_t)machine->cpu.de2;
+    header[18] = (uint8_t)(machine->cpu.de2 >> 8);
+    header[19] = (uint8_t)machine->cpu.hl2;
+    header[20] = (uint8_t)(machine->cpu.hl2 >> 8);
+    header[21] = (uint8_t)(machine->cpu.af2 >> 8);
+    header[22] = (uint8_t)machine->cpu.af2;
+    spectrum_write_u16(header + 23, machine->cpu.iy);
+    spectrum_write_u16(header + 25, machine->cpu.ix);
+    header[27] = machine->cpu.iff1 ? 1 : 0;
+    header[28] = machine->cpu.iff2 ? 1 : 0;
+    header[29] = machine->cpu.im & 3u;
+
+    spectrum_write_u16(header + 30, 55);
+    spectrum_write_u16(header + 32, program_counter);
+}
+
+bool spectrum_save_snapshot_z80_file(
+    Spectrum *spec,
+    const char *path,
+    char *error_buffer,
+    size_t error_buffer_size)
+{
+    zx_t *restore_state;
+    zx_t *machine;
+    uint32_t restore_version;
+    uint16_t program_counter;
+    const unsigned page_count = spec != NULL && spec->model == SPECTRUM_MODEL_48K ? 3u : 8u;
+    const size_t data_size = Z80_V3_HEADER_SIZE +
+        ((size_t)page_count * (Z80_PAGE_HEADER_SIZE + SNA_RAM_BANK_SIZE));
+    uint8_t *data;
+    size_t offset = Z80_V3_HEADER_SIZE;
+    FILE *file;
+    bool ok;
+
+    if (spec == NULL || !spec->machine_ready || path == NULL || path[0] == '\0')
+    {
+        snprintf(error_buffer, error_buffer_size, "No running machine or snapshot path is available.");
+        return false;
+    }
+    restore_state = (zx_t *)_aligned_malloc(sizeof(*restore_state), _Alignof(zx_t));
+    data = (uint8_t *)calloc(1, data_size);
+    if (restore_state == NULL || data == NULL)
+    {
+        _aligned_free(restore_state);
+        free(data);
+        snprintf(error_buffer, error_buffer_size, "Out of memory while creating the Z80 snapshot.");
+        return false;
+    }
+
+    restore_version = zx_save_snapshot(&spec->machine, restore_state);
+    machine = &spec->machine;
+    for (unsigned ticks = 0; ticks < 128 && !z80_opdone(&machine->cpu); ++ticks)
+    {
+        machine->pins = _zx_tick(machine, machine->pins);
+    }
+    program_counter = z80_opdone(&machine->cpu)
+        ? Z80_GET_ADDR(machine->pins)
+        : machine->cpu.pc;
+    spectrum_store_z80_registers(machine, data, program_counter);
+    data[34] = spectrum_z80_hardware_mode(spec->model);
+    data[35] = machine->last_mem_config;
+    data[38] = machine->ay.addr & 0x0Fu;
+    memcpy(data + 39, machine->ay.reg, AY38910_NUM_REGISTERS);
+    data[86] = (spec->model == SPECTRUM_MODEL_PLUS2A ||
+                spec->model == SPECTRUM_MODEL_PLUS3)
+        ? machine->last_plus3_mem_config
+        : 0;
+
+    if (spec->model == SPECTRUM_MODEL_48K)
+    {
+        static const uint8_t page_ids[3] = {8, 4, 5};
+        for (unsigned page = 0; page < 3; ++page)
+        {
+            data[offset] = 0xFF;
+            data[offset + 1] = 0xFF;
+            data[offset + 2] = page_ids[page];
+            memcpy(data + offset + 3, machine->ram[page], SNA_RAM_BANK_SIZE);
+            offset += Z80_PAGE_HEADER_SIZE + SNA_RAM_BANK_SIZE;
+        }
+    }
+    else
+    {
+        for (uint8_t page = 0; page < 8; ++page)
+        {
+            data[offset] = 0xFF;
+            data[offset + 1] = 0xFF;
+            data[offset + 2] = (uint8_t)(page + 3u);
+            memcpy(data + offset + 3, machine->ram[page], SNA_RAM_BANK_SIZE);
+            offset += Z80_PAGE_HEADER_SIZE + SNA_RAM_BANK_SIZE;
+        }
+    }
+    (void)zx_load_snapshot(&spec->machine, restore_version, restore_state);
+    _aligned_free(restore_state);
+
+    file = fopen(path, "wb");
+    if (file == NULL)
+    {
+        free(data);
+        snprintf(error_buffer, error_buffer_size, "Could not open the Z80 snapshot for writing.");
+        return false;
+    }
+    ok = fwrite(data, 1, data_size, file) == data_size;
+    if (fclose(file) != 0) ok = false;
+    free(data);
+    if (!ok)
+    {
+        snprintf(error_buffer, error_buffer_size, "Could not save the complete Z80 snapshot.");
+        return false;
+    }
+    return true;
 }
 
 bool spectrum_save_snapshot_sna_file(
@@ -903,7 +1242,13 @@ enum {
     SZX_PLTT_SIZE = 67,
     SZX_PAGE_SIZE = 0x4000,
     SZX_RAMP_COMPRESSED = 1,
-    SZX_PLTT_ENABLED = 1
+    SZX_PLTT_ENABLED = 1,
+    SZX_MF_PAGED = 0x01,
+    SZX_MF_COMPRESSED = 0x02,
+    SZX_MF_SOFTWARE_LOCKOUT = 0x04,
+    SZX_MF_RED_BUTTON_DISABLED = 0x08,
+    SZX_MF_DISABLED = 0x10,
+    SZX_MF_16K_RAM = 0x20
 };
 
 typedef struct SpectrumSzxState {
@@ -913,6 +1258,10 @@ typedef struct SpectrumSzxState {
     uint8_t ay[SZX_AY_SIZE];
     uint8_t ulaplus_palette[ZX_ULAPLUS_PALETTE_SIZE];
     uint8_t ulaplus_register;
+    uint8_t specdrum_value;
+    uint8_t covox_value;
+    uint8_t multiface_flags;
+    uint8_t multiface_ram[ZX_MULTIFACE_RAM_SIZE];
     uint8_t *pages[8];
     uint8_t page_mask;
     bool has_z80;
@@ -920,6 +1269,9 @@ typedef struct SpectrumSzxState {
     bool has_ay;
     bool has_ulaplus;
     bool ulaplus_enabled;
+    bool has_specdrum;
+    bool has_covox;
+    bool has_multiface;
 } SpectrumSzxState;
 
 bool spectrum_detect_snapshot_szx_model_data(
@@ -932,17 +1284,15 @@ bool spectrum_detect_snapshot_szx_model_data(
     {
         return false;
     }
-    if (data[6] == 1)
+    switch (data[6])
     {
-        *model = SPECTRUM_MODEL_48K;
-        return true;
+        case 1: *model = SPECTRUM_MODEL_48K; return true;
+        case 2: *model = SPECTRUM_MODEL_128K; return true;
+        case 3: *model = SPECTRUM_MODEL_PLUS2; return true;
+        case 4: *model = SPECTRUM_MODEL_PLUS2A; return true;
+        case 5: *model = SPECTRUM_MODEL_PLUS3; return true;
+        default: return false;
     }
-    if (data[6] == 2)
-    {
-        *model = SPECTRUM_MODEL_128K;
-        return true;
-    }
-    return false;
 }
 
 static void spectrum_discard_szx_state(SpectrumSzxState *state)
@@ -968,7 +1318,7 @@ static bool spectrum_parse_szx(
     if (!spectrum_detect_snapshot_szx_model_data(data, data_size, &model))
     {
         snprintf(error_buffer, error_buffer_size,
-            "Unsupported SZX version or machine (only original 48K and 128K are supported).");
+            "Unsupported SZX version or machine.");
         return false;
     }
     state->model = model;
@@ -1039,6 +1389,63 @@ static bool spectrum_parse_szx(
                 sizeof(state->ulaplus_palette));
             state->has_ulaplus = true;
         }
+        else if (memcmp(header, "DRUM", 4) == 0)
+        {
+            if (state->has_specdrum || payload_size != 1)
+            {
+                snprintf(error_buffer, error_buffer_size, "Invalid or duplicate SZX DRUM block.");
+                goto fail;
+            }
+            state->specdrum_value = payload[0];
+            state->has_specdrum = true;
+        }
+        else if (memcmp(header, "COVX", 4) == 0)
+        {
+            if (state->has_covox || payload_size != 4)
+            {
+                snprintf(error_buffer, error_buffer_size, "Invalid or duplicate SZX COVX block.");
+                goto fail;
+            }
+            state->covox_value = payload[0];
+            state->has_covox = true;
+        }
+        else if (memcmp(header, "MFCE", 4) == 0)
+        {
+            uint8_t flags;
+            size_t ram_size;
+            if (state->has_multiface || payload_size < 2)
+            {
+                snprintf(error_buffer, error_buffer_size, "Invalid or duplicate SZX MFCE block.");
+                goto fail;
+            }
+            flags = payload[1];
+            ram_size = (flags & SZX_MF_16K_RAM) != 0
+                ? ZX_MULTIFACE_RAM_SIZE
+                : ZX_MULTIFACE_ROM_SIZE;
+            if ((flags & SZX_MF_COMPRESSED) != 0)
+            {
+                if (!szx_inflate_zlib(
+                        payload + 2,
+                        payload_size - 2,
+                        state->multiface_ram,
+                        ram_size))
+                {
+                    snprintf(error_buffer, error_buffer_size, "Could not decompress SZX Multiface RAM.");
+                    goto fail;
+                }
+            }
+            else if (payload_size == 2 + ram_size)
+            {
+                memcpy(state->multiface_ram, payload + 2, ram_size);
+            }
+            else
+            {
+                snprintf(error_buffer, error_buffer_size, "Uncompressed SZX Multiface RAM has the wrong size.");
+                goto fail;
+            }
+            state->multiface_flags = flags;
+            state->has_multiface = true;
+        }
         else if (memcmp(header, "RAMP", 4) == 0)
         {
             uint16_t flags;
@@ -1093,7 +1500,7 @@ static bool spectrum_parse_szx(
 
     if (!state->has_z80 || !state->has_spcr ||
         (state->model == SPECTRUM_MODEL_48K && state->page_mask != 0x25u) ||
-        (state->model == SPECTRUM_MODEL_128K && state->page_mask != 0xFFu))
+        (state->model != SPECTRUM_MODEL_48K && state->page_mask != 0xFFu))
     {
         snprintf(error_buffer, error_buffer_size, "SZX snapshot is missing required machine-state blocks.");
         goto fail;
@@ -1208,16 +1615,28 @@ bool spectrum_load_snapshot_szx_data(
             memcpy(spec->machine.ram[page], state.pages[page], SZX_PAGE_SIZE);
         }
         spec->machine.memory_paging_disabled = false;
-        _zx_update_memory_map_zx128(&spec->machine, state.spcr[1]);
-        ay38910_reset(&spec->machine.ay);
-        if (state.has_ay)
+        if (state.model == SPECTRUM_MODEL_PLUS2A ||
+            state.model == SPECTRUM_MODEL_PLUS3)
         {
-            for (uint8_t reg = 0; reg < AY38910_NUM_REGISTERS; ++reg)
-            {
-                ay38910_set_register(&spec->machine.ay, reg, state.ay[2 + reg]);
-            }
-            ay38910_set_addr_latch(&spec->machine.ay, state.ay[1] & 0x0Fu);
+            spec->machine.last_mem_config = state.spcr[1];
+            spec->machine.last_plus3_mem_config = state.spcr[2];
+            spec->machine.display_ram_bank = (state.spcr[1] & 0x08u) ? 7 : 5;
+            _zx_update_memory_map_plus3(&spec->machine);
+            spec->machine.memory_paging_disabled = (state.spcr[1] & 0x20u) != 0;
         }
+        else
+        {
+            _zx_update_memory_map_zx128(&spec->machine, state.spcr[1]);
+        }
+    }
+    ay38910_reset(&spec->machine.ay);
+    if (state.has_ay)
+    {
+        for (uint8_t reg = 0; reg < AY38910_NUM_REGISTERS; ++reg)
+        {
+            ay38910_set_register(&spec->machine.ay, reg, state.ay[2 + reg]);
+        }
+        ay38910_set_addr_latch(&spec->machine.ay, state.ay[1] & 0x0Fu);
     }
     _zx_ulaplus_reset(&spec->machine);
     if (state.has_ulaplus)
@@ -1230,6 +1649,37 @@ bool spectrum_load_snapshot_szx_data(
             state.ulaplus_palette,
             sizeof(spec->machine.ulaplus_palette));
         _zx_ulaplus_begin_scanline(&spec->machine);
+    }
+    spectrum_set_expansion_audio(
+        spec,
+        state.model == SPECTRUM_MODEL_48K && state.has_ay &&
+            (state.ay[0] & 0x01u) != 0,
+        state.has_specdrum,
+        state.has_covox);
+    spec->machine.specdrum_value = state.specdrum_value;
+    spec->machine.covox_value = state.covox_value;
+    spec->machine.multiface_software_lockout = false;
+    spec->machine.multiface_red_button_disabled = false;
+    spec->machine.multiface_16k_ram_mode = state.has_multiface &&
+        (state.multiface_flags & SZX_MF_16K_RAM) != 0;
+    spectrum_set_multiface_enabled(
+        spec,
+        state.has_multiface &&
+            (state.multiface_flags & SZX_MF_DISABLED) == 0);
+    if (state.has_multiface && spec->machine.multiface_enabled)
+    {
+        memcpy(
+            spec->machine.multiface_ram,
+            state.multiface_ram,
+            sizeof(state.multiface_ram));
+        spec->machine.multiface_software_lockout =
+            (state.multiface_flags & SZX_MF_SOFTWARE_LOCKOUT) != 0;
+        spec->machine.multiface_red_button_disabled =
+            (state.multiface_flags & SZX_MF_RED_BUTTON_DISABLED) != 0;
+        if ((state.multiface_flags & SZX_MF_PAGED) != 0)
+        {
+            _zx_multiface_page(&spec->machine);
+        }
     }
     spectrum_restore_szx_cpu(&spec->machine, state.z80);
     spectrum_restore_szx_timing(&spec->machine, state.z80);
