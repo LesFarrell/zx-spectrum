@@ -184,16 +184,6 @@ Spectrum +3 with one combined 64 KB ROM:
 - `Tools -> Debugger...` opens a separate debugger window with pause, run, single-step, register state, and memory/disassembly views
 - `Tools -> Poke...` opens a small RAM poke tool for writing one or more byte values directly to memory
 
-## Tests
-
-Run the Interface 1/Microdrive tests and the snapshot, screen, input, PZX/TZX,
-peripheral, +2A-paging, and disk-writeback tests with:
-
-```powershell
-.\src\test_interface1.bat
-.\src\test_features.bat
-```
-
 ## Assembler Notes
 
 - The built-in assembler is intentionally small: it supports labels, `EQU` constants, and a practical subset of Z80 mnemonics, not a full macro assembler
