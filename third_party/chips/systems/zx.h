@@ -874,10 +874,13 @@ static void _zx_multiface_page(zx_t* sys) {
     }
     sys->multiface_paged = true;
     if (sys->multiface_16k_ram_mode) {
+        /* Some compatible devices expose a full 16KB RAM window. */
         mem_map_ram(
             &sys->mem, 0, 0x0000, ZX_MULTIFACE_RAM_SIZE, sys->multiface_ram);
     }
     else {
+        /* Original Multifaces overlay an 8KB ROM and 8KB writable workspace
+           on top of the Spectrum's normal 0000h-3FFFh mapping. */
         mem_map_rom(
             &sys->mem, 0, 0x0000, ZX_MULTIFACE_ROM_SIZE, sys->multiface_rom);
         mem_map_ram(
@@ -1879,6 +1882,7 @@ static bool _zx_should_apply_memory_contention(zx_t* sys, uint64_t pins) {
 
 static uint8_t _zx_fuller_joystick_value(const zx_t* sys) {
     const uint8_t mask = sys->kbd_joymask | sys->joy_joymask;
+    /* Fuller inputs are active-low, unlike the active-high Kempston port. */
     uint8_t data = 0xFF;
     if (mask & ZX_JOYSTICK_UP)    data &= (uint8_t)~(1u<<0);
     if (mask & ZX_JOYSTICK_DOWN)  data &= (uint8_t)~(1u<<1);
@@ -1889,6 +1893,7 @@ static uint8_t _zx_fuller_joystick_value(const zx_t* sys) {
 }
 
 static uint8_t _zx_multiface_page_in_port(const zx_t* sys) {
+    /* Multiface generations use different low-byte page/unpage ports. */
     if (sys->type == ZX_TYPE_48K) return 0x9F;
     if (sys->type == ZX_TYPE_128) return 0xBF;
     return 0x3F;
@@ -2041,6 +2046,7 @@ static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
         }
         else if (sys->multiface_enabled && (pins & Z80_RD) &&
                  (uint8_t)io_addr == _zx_multiface_page_in_port(sys)) {
+            /* Only the low address byte is decoded by the real interface. */
             if (!sys->multiface_software_lockout) {
                 _zx_multiface_page(sys);
             }
@@ -2110,6 +2116,8 @@ static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
         }
         else if (sys->type == ZX_TYPE_48K && sys->fuller_audio_enabled &&
                  (uint8_t)io_addr == 0x3F && (pins & Z80_WR)) {
+            /* The Fuller Box supplies the AY chip absent from a stock 48K:
+               3Fh selects a register and 5Fh transfers register data. */
             ay38910_set_addr_latch(&sys->ay, Z80_GET_DATA(pins));
         }
         else if (sys->type == ZX_TYPE_48K && sys->fuller_audio_enabled &&
@@ -2127,6 +2135,8 @@ static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
         }
         else if (sys->specdrum_enabled && (uint8_t)io_addr == 0xDF &&
                  (pins & Z80_WR)) {
+            /* SpecDrum and Covox are latch-style DACs; the last byte written
+               remains their output level until software writes another. */
             sys->specdrum_value = Z80_GET_DATA(pins);
         }
         else if (sys->covox_enabled && (uint8_t)io_addr == 0xFB &&

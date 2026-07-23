@@ -711,6 +711,8 @@ static bool tape_parse_pzx(
             tape_set_error(error_buffer, error_buffer_size, "Truncated PZX block header", path);
             return false;
         }
+        /* Every PZX block starts with a four-byte ASCII tag followed by a
+           little-endian payload length, which also makes extensions skippable. */
         memcpy(tag, data + offset, 4);
         tag[4] = '\0';
         payload_size = tape_read_u32(data + offset + 4);
@@ -739,6 +741,8 @@ static bool tape_parse_pzx(
         else if (memcmp(tag, "PULS", 4) == 0)
         {
             size_t pos = 0;
+            /* PULS defines its own waveform and therefore starts at low level.
+               Each emitted duration ends by toggling the signal. */
             builder.current_level = false;
             while (pos < payload_size)
             {
@@ -748,6 +752,9 @@ static bool tape_parse_pzx(
                 if (!tape_has_bytes(pos, 2, payload_size)) goto invalid_pzx;
                 word = tape_read_u16(payload + pos);
                 pos += 2;
+                /* Values above 8000h are repeat counts for the duration that
+                   follows. A duration with bit 15 set continues into another
+                   word, giving PZX its extended 31-bit timing form. */
                 if (word > 0x8000u)
                 {
                     count = word & 0x7FFFu;
@@ -784,6 +791,8 @@ static bool tape_parse_pzx(
             size_t resume_segment_index;
             if (payload_size < 8) goto invalid_pzx;
             count_field = tape_read_u32(payload);
+            /* The high bit supplies the initial signal level; the remaining
+               31 bits are the number of meaningful, MSB-first data bits. */
             bit_count = count_field & 0x7FFFFFFFu;
             tail = tape_read_u16(payload + 4);
             p0 = payload[6];
@@ -818,6 +827,8 @@ static bool tape_parse_pzx(
             }
             if (!tape_append_pzx_pulse(&builder, tail)) goto decode_limit;
             resume_segment_index = player->segment_count;
+            /* ROM fast loading is safe only for the canonical Spectrum pulse
+               pairs. Non-standard DATA blocks still play through the waveform. */
             if ((bit_count & 7u) == 0 && byte_count > 0 &&
                 tape_pzx_standard_data(p0, p1, sequence0, sequence1) &&
                 !tape_append_fast_block(player, bytes, byte_count, resume_segment_index))
@@ -830,6 +841,7 @@ static bool tape_parse_pzx(
             uint32_t duration;
             if (payload_size != 4) goto invalid_pzx;
             duration = tape_read_u32(payload);
+            /* PAUS also stores its starting level in the duration's high bit. */
             builder.current_level = (duration & 0x80000000u) != 0;
             if (!tape_append_pzx_pulse(&builder, duration & 0x7FFFFFFFu)) goto decode_limit;
         }

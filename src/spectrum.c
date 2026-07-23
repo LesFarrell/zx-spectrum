@@ -829,6 +829,9 @@ static void spectrum_store_z80_registers(
     uint8_t *header,
     uint16_t program_counter)
 {
+    /* Version 3 keeps bytes 6-7 of the original header at zero and stores the
+       real PC in its extended header. The caller zero-fills the whole header,
+       so only fields with defined values need to be written here. */
     header[0] = machine->cpu.a;
     header[1] = machine->cpu.f;
     header[2] = machine->cpu.c;
@@ -895,6 +898,9 @@ bool spectrum_save_snapshot_z80_file(
 
     restore_version = zx_save_snapshot(&spec->machine, restore_state);
     machine = &spec->machine;
+    /* Snapshot only at an instruction boundary. A partially executed opcode
+       cannot be represented by .z80, and the private chips snapshot lets us
+       put the live emulator back exactly where it was after serialising. */
     for (unsigned ticks = 0; ticks < 128 && !z80_opdone(&machine->cpu); ++ticks)
     {
         machine->pins = _zx_tick(machine, machine->pins);
@@ -914,11 +920,14 @@ bool spectrum_save_snapshot_z80_file(
 
     if (spec->model == SPECTRUM_MODEL_48K)
     {
+        /* .z80 page numbers are format IDs, not Spectrum bank numbers. In a
+           48K snapshot IDs 8, 4, and 5 represent 4000h, 8000h, and C000h. */
         static const uint8_t page_ids[3] = {8, 4, 5};
         for (unsigned page = 0; page < 3; ++page)
         {
             data[offset] = 0xFF;
             data[offset + 1] = 0xFF;
+            /* A length of FFFFh marks an uncompressed 16KB page. */
             data[offset + 2] = page_ids[page];
             memcpy(data + offset + 3, machine->ram[page], SNA_RAM_BANK_SIZE);
             offset += Z80_PAGE_HEADER_SIZE + SNA_RAM_BANK_SIZE;
@@ -926,6 +935,7 @@ bool spectrum_save_snapshot_z80_file(
     }
     else
     {
+        /* Version 3 numbers the eight 128K-family RAM banks from page ID 3. */
         for (uint8_t page = 0; page < 8; ++page)
         {
             data[offset] = 0xFF;
@@ -1284,6 +1294,7 @@ bool spectrum_detect_snapshot_szx_model_data(
     {
         return false;
     }
+    /* ZX-State machine IDs 1-5 match the five machines implemented here. */
     switch (data[6])
     {
         case 1: *model = SPECTRUM_MODEL_48K; return true;
@@ -1313,6 +1324,8 @@ static bool spectrum_parse_szx(
 {
     size_t offset = SZX_HEADER_SIZE;
     SpectrumModel model;
+    /* Decode into temporary storage first. The running machine is only
+       mutated after every required block and payload has been validated. */
     memset(state, 0, sizeof(*state));
 
     if (!spectrum_detect_snapshot_szx_model_data(data, data_size, &model))
@@ -1418,6 +1431,9 @@ static bool spectrum_parse_szx(
                 snprintf(error_buffer, error_buffer_size, "Invalid or duplicate SZX MFCE block.");
                 goto fail;
             }
+            /* Byte 0 identifies the Multiface model; byte 1 contains paging,
+               compression, lockout, and RAM-size flags. The remaining bytes
+               are the device RAM image. */
             flags = payload[1];
             ram_size = (flags & SZX_MF_16K_RAM) != 0
                 ? ZX_MULTIFACE_RAM_SIZE
@@ -1457,6 +1473,8 @@ static bool spectrum_parse_szx(
             }
             flags = spectrum_read_u16(payload);
             page = payload[2];
+            /* A 48K SZX still uses physical 128K bank IDs: banks 5, 2, and 0
+               correspond to the three visible 16KB RAM regions. */
             if (page >= 8 || (flags & ~SZX_RAMP_COMPRESSED) != 0 ||
                 state->pages[page] != NULL ||
                 (state->model == SPECTRUM_MODEL_48K && page != 0 && page != 2 && page != 5))
@@ -1604,6 +1622,8 @@ bool spectrum_load_snapshot_szx_data(
 
     if (state.model == SPECTRUM_MODEL_48K)
     {
+        /* The chips 48K backend stores visible RAM in address order, whereas
+           SZX names the same regions by physical bank number. */
         memcpy(spec->machine.ram[0], state.pages[5], SZX_PAGE_SIZE);
         memcpy(spec->machine.ram[1], state.pages[2], SZX_PAGE_SIZE);
         memcpy(spec->machine.ram[2], state.pages[0], SZX_PAGE_SIZE);
@@ -1618,6 +1638,8 @@ bool spectrum_load_snapshot_szx_data(
         if (state.model == SPECTRUM_MODEL_PLUS2A ||
             state.model == SPECTRUM_MODEL_PLUS3)
         {
+            /* Restore both paging latches before rebuilding the +2A/+3 map;
+               1FFD may select an all-RAM layout instead of a ROM at 0000h. */
             spec->machine.last_mem_config = state.spcr[1];
             spec->machine.last_plus3_mem_config = state.spcr[2];
             spec->machine.display_ram_bank = (state.spcr[1] & 0x08u) ? 7 : 5;
@@ -1652,6 +1674,7 @@ bool spectrum_load_snapshot_szx_data(
     }
     spectrum_set_expansion_audio(
         spec,
+        /* Bit 0 of the AY block identifies a Fuller Box AY on a 48K machine. */
         state.model == SPECTRUM_MODEL_48K && state.has_ay &&
             (state.ay[0] & 0x01u) != 0,
         state.has_specdrum,
