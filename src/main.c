@@ -205,6 +205,7 @@ typedef struct AppTapeLoadJob {
     uint32_t tick_hz;
     TapePlayer tape;
     char error[256];
+    bool assume_128k;
     bool ok;
 } AppTapeLoadJob;
 
@@ -528,7 +529,13 @@ static bool app_load_model_roms(
 static bool app_parse_number(const char *text, int *value);
 static double app_model_frame_duration_ms(SpectrumModel model);
 static void app_tick_emulator(AppState *app);
-static bool app_load_tape_file(HWND hwnd, AppState *app, const char *path, char *error_buffer, size_t error_buffer_size);
+static bool app_load_tape_file(
+    HWND hwnd,
+    AppState *app,
+    const char *path,
+    bool assume_128k,
+    char *error_buffer,
+    size_t error_buffer_size);
 static bool app_load_disk_file(HWND hwnd, AppState *app, const char *path, char *error_buffer, size_t error_buffer_size);
 static bool app_load_microdrive_file(
     HWND hwnd,
@@ -537,9 +544,21 @@ static bool app_load_microdrive_file(
     int requested_drive,
     char *error_buffer,
     size_t error_buffer_size);
-static bool app_apply_loaded_tape(HWND hwnd, AppState *app, TapePlayer *loaded_tape, char *error_buffer, size_t error_buffer_size);
+static bool app_apply_loaded_tape(
+    HWND hwnd,
+    AppState *app,
+    TapePlayer *loaded_tape,
+    bool assume_128k,
+    char *error_buffer,
+    size_t error_buffer_size);
 static bool app_load_snapshot_file(HWND hwnd, AppState *app, const char *path, char *error_buffer, size_t error_buffer_size);
-static bool app_load_media_path(HWND hwnd, AppState *app, const char *path, char *error_buffer, size_t error_buffer_size);
+static bool app_load_media_path(
+    HWND hwnd,
+    AppState *app,
+    const char *path,
+    bool assume_128k,
+    char *error_buffer,
+    size_t error_buffer_size);
 static bool app_apply_loaded_snapshot(HWND hwnd, AppState *app, AppSnapshotLoadJob *job, char *error_buffer, size_t error_buffer_size);
 static void app_play_tape(AppState *app);
 static void app_stop_tape(AppState *app);
@@ -2090,6 +2109,7 @@ static bool app_load_tape_file(
     HWND hwnd,
     AppState *app,
     const char *path,
+    bool assume_128k,
     char *error_buffer,
     size_t error_buffer_size
 ) {
@@ -2109,6 +2129,7 @@ static bool app_load_tape_file(
 
     job->hwnd = hwnd;
     job->tick_hz = (uint32_t)app->spec.machine.freq_hz;
+    job->assume_128k = assume_128k;
     snprintf(job->path, sizeof(job->path), "%s", path);
 
     thread_handle = CreateThread(NULL, 0, app_tape_load_worker, job, 0, NULL);
@@ -2442,6 +2463,7 @@ static bool app_load_media_path(
     HWND hwnd,
     AppState *app,
     const char *path,
+    bool assume_128k,
     char *error_buffer,
     size_t error_buffer_size
 ) {
@@ -2502,6 +2524,7 @@ static bool app_load_media_path(
             hwnd,
             app,
             path,
+            assume_128k,
             error_buffer,
             error_buffer_size);
     }
@@ -2532,23 +2555,28 @@ static bool app_apply_loaded_tape(
     HWND hwnd,
     AppState *app,
     TapePlayer *loaded_tape,
+    bool assume_128k,
     char *error_buffer,
     size_t error_buffer_size
 ) {
     const TapeAutoloadTarget autoload_target = tape_autoload_target(loaded_tape);
-    SpectrumModel autoload_model = app->spec.model;
+    SpectrumModel autoload_model = assume_128k
+        ? SPECTRUM_MODEL_128K
+        : app->spec.model;
 
     tape_discard(&app->tape);
     app->tape = *loaded_tape;
     app_stop_tape(app);
 
     if (app->tape_autoload_enabled) {
-        if (autoload_target == TAPE_AUTOLOAD_TARGET_128_MENU) {
-            autoload_model = app->spec.model == SPECTRUM_MODEL_48K
-                ? SPECTRUM_MODEL_128K
-                : app->spec.model;
-        } else if (autoload_target == TAPE_AUTOLOAD_TARGET_48_BASIC) {
-            autoload_model = SPECTRUM_MODEL_48K;
+        if (!assume_128k) {
+            if (autoload_target == TAPE_AUTOLOAD_TARGET_128_MENU) {
+                autoload_model = app->spec.model == SPECTRUM_MODEL_48K
+                    ? SPECTRUM_MODEL_128K
+                    : app->spec.model;
+            } else if (autoload_target == TAPE_AUTOLOAD_TARGET_48_BASIC) {
+                autoload_model = SPECTRUM_MODEL_48K;
+            }
         }
 
         app_autotype_clear(app);
@@ -3022,10 +3050,15 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
             DragFinish(drop);
 
             if (app != NULL && path_ready) {
-                if (!app_load_media_path(
+                /* Treat drag-and-drop media as targeting a 128K Spectrum unless
+                   the media loader subsequently requires a specific model. */
+                app_switch_model(hwnd, app, SPECTRUM_MODEL_128K);
+                if (app->spec.model == SPECTRUM_MODEL_128K &&
+                    !app_load_media_path(
                         hwnd,
                         app,
                         path,
+                        true,
                         error_buffer,
                         sizeof(error_buffer))) {
                     app_show_error(error_buffer);
@@ -3294,7 +3327,13 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                 if (job != NULL) {
                     if (!job->ok) {
                         app_show_error(job->error);
-                    } else if (!app_apply_loaded_tape(hwnd, app, &job->tape, job->error, sizeof(job->error))) {
+                    } else if (!app_apply_loaded_tape(
+                                   hwnd,
+                                   app,
+                                   &job->tape,
+                                   job->assume_128k,
+                                   job->error,
+                                   sizeof(job->error))) {
                         tape_init(&job->tape);
                         app_show_error(job->error);
                     } else {
@@ -3362,6 +3401,7 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                                     hwnd,
                                     app,
                                     path,
+                                    false,
                                     error_buffer,
                                     sizeof(error_buffer))) {
                                 app_show_error(error_buffer);
@@ -3684,6 +3724,7 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                                         hwnd,
                                         app,
                                         path,
+                                        false,
                                         error_buffer,
                                         sizeof(error_buffer))) {
                                     app_show_error(error_buffer);

@@ -1,5 +1,8 @@
 /* Split from main.c: assembler core implementation. Included by main.c. */
 
+#include <errno.h>
+#include <limits.h>
+
 static char *app_trim_inplace(char *text)
 {
     char *start = text;
@@ -219,7 +222,7 @@ static bool app_parse_number(const char *text, int *value)
 {
     char token[128];
     char *end = NULL;
-    long parsed;
+    long long parsed;
     bool negative = false;
     int base = 10;
     size_t length;
@@ -286,14 +289,23 @@ static bool app_parse_number(const char *text, int *value)
         base = 2;
     }
 
-    parsed = strtol(token, &end, base);
-    if (end == NULL || *end != '\0')
+    if (token[0] == '\0')
+    {
+        return false;
+    }
+    errno = 0;
+    parsed = strtoll(token, &end, base);
+    if (errno == ERANGE || end == token || *end != '\0')
     {
         return false;
     }
     if (negative)
     {
         parsed = -parsed;
+    }
+    if (parsed < INT_MIN || parsed > INT_MAX)
+    {
+        return false;
     }
     *value = (int)parsed;
     return true;
@@ -720,6 +732,12 @@ static bool app_parse_value(
     AssemblerValue *out_value)
 {
     char token[128];
+    char atom[128];
+    char operators[128];
+    AssemblerValue values[128];
+    size_t value_count = 0;
+    size_t operator_count = 0;
+    const char *cursor;
     int numeric_value;
     int constant_index;
     int label_index;
@@ -737,45 +755,163 @@ static bool app_parse_value(
         return false;
     }
 
-    if (app_parse_number(token, &numeric_value))
+    cursor = token;
+    while (*cursor != '\0')
     {
-        out_value->value = numeric_value;
-        out_value->resolved = true;
-        out_value->numeric_literal = true;
-        return true;
+        const char *start;
+        size_t atom_length;
+        AssemblerValue atom_value;
+
+        while (isspace((unsigned char)*cursor))
+        {
+            cursor++;
+        }
+        start = cursor;
+        if ((*cursor == '+' || *cursor == '-') && value_count == 0)
+        {
+            cursor++;
+        }
+        while (*cursor != '\0' && *cursor != '+' && *cursor != '-' && *cursor != '*' && *cursor != '&')
+        {
+            cursor++;
+        }
+        atom_length = (size_t)(cursor - start);
+        while (atom_length > 0 && isspace((unsigned char)start[atom_length - 1]))
+        {
+            atom_length--;
+        }
+        if (atom_length == 0 || atom_length >= sizeof(atom))
+        {
+            return false;
+        }
+        memcpy(atom, start, atom_length);
+        atom[atom_length] = '\0';
+
+        if (app_parse_number(atom, &numeric_value))
+        {
+            atom_value.value = numeric_value;
+            atom_value.resolved = true;
+            atom_value.numeric_literal = true;
+        }
+        else if (strcmp(atom, "$") == 0)
+        {
+            atom_value.value = ctx->address;
+            atom_value.resolved = true;
+            atom_value.numeric_literal = false;
+        }
+        else
+        {
+            if (!app_is_symbol_name(atom))
+            {
+                return false;
+            }
+            constant_index = app_find_constant_index(ctx, atom);
+            label_index = app_find_label_index(ctx, atom);
+            if (constant_index >= 0)
+            {
+                atom_value.value = ctx->constants[constant_index].value;
+                atom_value.resolved = true;
+            }
+            else if (label_index >= 0)
+            {
+                atom_value.value = ctx->labels[label_index].address;
+                atom_value.resolved = true;
+            }
+            else if (ctx->pass == 1)
+            {
+                atom_value.value = 0;
+                atom_value.resolved = false;
+            }
+            else
+            {
+                return false;
+            }
+            atom_value.numeric_literal = false;
+        }
+        if (value_count >= sizeof(values) / sizeof(values[0]))
+        {
+            return false;
+        }
+        values[value_count++] = atom_value;
+
+        while (isspace((unsigned char)*cursor))
+        {
+            cursor++;
+        }
+        if (*cursor != '\0')
+        {
+            if (operator_count >= sizeof(operators) / sizeof(operators[0]))
+            {
+                return false;
+            }
+            operators[operator_count++] = *cursor++;
+        }
     }
 
-    if (!app_is_symbol_name(token))
+    if (value_count == 0 || operator_count + 1 != value_count)
     {
         return false;
     }
 
-    constant_index = app_find_constant_index(ctx, token);
-    if (constant_index >= 0)
+    /* Apply multiplication before addition/subtraction, then bitwise AND. */
+    for (size_t i = 0; i < operator_count;)
     {
-        out_value->value = ctx->constants[constant_index].value;
-        out_value->resolved = true;
-        out_value->numeric_literal = false;
-        return true;
+        if (operators[i] == '*')
+        {
+            const int64_t result = (int64_t)values[i].value * values[i + 1].value;
+            if (result < INT_MIN || result > INT_MAX)
+            {
+                return false;
+            }
+            values[i].value = (int)result;
+            values[i].resolved = values[i].resolved && values[i + 1].resolved;
+            values[i].numeric_literal = values[i].numeric_literal && values[i + 1].numeric_literal;
+            memmove(&values[i + 1], &values[i + 2], (value_count - i - 2) * sizeof(values[0]));
+            memmove(&operators[i], &operators[i + 1], (operator_count - i - 1) * sizeof(operators[0]));
+            value_count--;
+            operator_count--;
+        }
+        else
+        {
+            i++;
+        }
     }
-
-    label_index = app_find_label_index(ctx, token);
-    if (label_index >= 0)
+    for (size_t i = 0; i < operator_count;)
     {
-        out_value->value = ctx->labels[label_index].address;
-        out_value->resolved = true;
-        out_value->numeric_literal = false;
-        return true;
+        if (operators[i] == '+' || operators[i] == '-')
+        {
+            const int64_t result = operators[i] == '+'
+                ? (int64_t)values[i].value + values[i + 1].value
+                : (int64_t)values[i].value - values[i + 1].value;
+            if (result < INT_MIN || result > INT_MAX)
+            {
+                return false;
+            }
+            values[i].value = (int)result;
+            values[i].resolved = values[i].resolved && values[i + 1].resolved;
+            values[i].numeric_literal = values[i].numeric_literal && values[i + 1].numeric_literal;
+            memmove(&values[i + 1], &values[i + 2], (value_count - i - 2) * sizeof(values[0]));
+            memmove(&operators[i], &operators[i + 1], (operator_count - i - 1) * sizeof(operators[0]));
+            value_count--;
+            operator_count--;
+        }
+        else
+        {
+            i++;
+        }
     }
-
-    if (ctx->pass == 1)
+    for (size_t i = 0; i < operator_count; ++i)
     {
-        out_value->value = 0;
-        out_value->resolved = false;
-        out_value->numeric_literal = false;
-        return true;
+        if (operators[i] != '&')
+        {
+            return false;
+        }
+        values[0].value &= values[i + 1].value;
+        values[0].resolved = values[0].resolved && values[i + 1].resolved;
+        values[0].numeric_literal = values[0].numeric_literal && values[i + 1].numeric_literal;
     }
-    return false;
+    *out_value = values[0];
+    return true;
 }
 
 /* Returns the 8-bit register code used by most primary Z80 opcodes, including
@@ -808,6 +944,30 @@ static int app_parse_reg16(const char *text)
         {
             return i;
         }
+    }
+    return -1;
+}
+
+/* Returns the register-pair code accepted by ADD IX,rr and ADD IY,rr. The
+   prefixed opcode uses the index register itself where unprefixed ADD HL,rr
+   uses HL, so accepting the spelling HL here would silently change meaning. */
+static int app_parse_index_reg16(const char *text, const char *index_name)
+{
+    if (app_equals_ignore_case(text, "BC"))
+    {
+        return 0;
+    }
+    if (app_equals_ignore_case(text, "DE"))
+    {
+        return 1;
+    }
+    if (app_equals_ignore_case(text, index_name))
+    {
+        return 2;
+    }
+    if (app_equals_ignore_case(text, "SP"))
+    {
+        return 3;
     }
     return -1;
 }
@@ -882,6 +1042,73 @@ static bool app_parse_indirect_address(
     }
 
     return app_parse_value(ctx, inner, value);
+}
+
+/* Parses `(IX+d)` and `(IY+d)` operands used by indexed Z80 instructions. */
+static bool app_parse_indexed_operand(
+    const AssemblerContext *ctx,
+    const char *text,
+    uint8_t *prefix,
+    AssemblerValue *displacement)
+{
+    char token[128];
+    char expression[128];
+    char *inner;
+    const char *suffix;
+    size_t length;
+
+    snprintf(token, sizeof(token), "%s", text);
+    {
+        char *trimmed = app_trim_inplace(token);
+        if (trimmed != token)
+        {
+            memmove(token, trimmed, strlen(trimmed) + 1);
+        }
+    }
+    length = strlen(token);
+    if (length < 4 || token[0] != '(' || token[length - 1] != ')')
+    {
+        return false;
+    }
+    token[length - 1] = '\0';
+    inner = app_trim_inplace(token + 1);
+    if (_strnicmp(inner, "IX", 2) == 0)
+    {
+        *prefix = 0xDD;
+    }
+    else if (_strnicmp(inner, "IY", 2) == 0)
+    {
+        *prefix = 0xFD;
+    }
+    else
+    {
+        return false;
+    }
+    suffix = inner + 2;
+    while (isspace((unsigned char)*suffix))
+    {
+        suffix++;
+    }
+    if (*suffix == '\0')
+    {
+        displacement->value = 0;
+        displacement->resolved = true;
+        displacement->numeric_literal = true;
+        return true;
+    }
+    if (*suffix != '+' && *suffix != '-')
+    {
+        return false;
+    }
+    if (*suffix == '+')
+    {
+        snprintf(expression, sizeof(expression), "%s", suffix + 1);
+    }
+    else
+    {
+        snprintf(expression, sizeof(expression), "0%s", suffix);
+    }
+    return app_parse_value(ctx, expression, displacement);
 }
 
 /* Emits bytes into the active Spectrum address space while rejecting writes to
@@ -1389,6 +1616,73 @@ static bool app_assemble_line(
         }
         bytes[length++] = 0xD9;
     }
+    else if (app_equals_ignore_case(mnemonic, "LDIR"))
+    {
+        if (!app_require_operand_count("LDIR", operand_count, 0, 0, error_buffer, error_buffer_size))
+        {
+            return false;
+        }
+        bytes[length++] = 0xED;
+        bytes[length++] = 0xB0;
+    }
+    else if (app_equals_ignore_case(mnemonic, "NEG"))
+    {
+        if (!app_require_operand_count("NEG", operand_count, 0, 0, error_buffer, error_buffer_size))
+        {
+            return false;
+        }
+        bytes[length++] = 0xED;
+        bytes[length++] = 0x44;
+    }
+    else if (
+        app_equals_ignore_case(mnemonic, "BIT") ||
+        app_equals_ignore_case(mnemonic, "SET") ||
+        app_equals_ignore_case(mnemonic, "RES"))
+    {
+        int bit_number;
+        int register_code;
+        int operation_base;
+        uint8_t index_prefix;
+        AssemblerValue index_displacement;
+
+        if (!app_require_operand_count(mnemonic, operand_count, 2, 2, error_buffer, error_buffer_size) ||
+            !app_parse_number(lhs, &bit_number) ||
+            bit_number < 0 ||
+            bit_number > 7)
+        {
+            snprintf(error_buffer, error_buffer_size, "%s expects a bit number from 0 to 7 and one operand.", mnemonic);
+            return false;
+        }
+        operation_base = app_equals_ignore_case(mnemonic, "BIT")
+            ? 0x40
+            : (app_equals_ignore_case(mnemonic, "SET") ? 0xC0 : 0x80);
+        register_code = app_parse_reg8(rhs);
+        if (register_code >= 0)
+        {
+            bytes[length++] = 0xCB;
+            bytes[length++] = (uint8_t)(operation_base + (bit_number << 3) + register_code);
+        }
+        else if (app_parse_indexed_operand(ctx, rhs, &index_prefix, &index_displacement))
+        {
+            if (ctx->pass == 2 &&
+                (!index_displacement.resolved ||
+                 index_displacement.value < -128 ||
+                 index_displacement.value > 127))
+            {
+                snprintf(error_buffer, error_buffer_size, "Indexed displacement is out of range: %s", rhs);
+                return false;
+            }
+            bytes[length++] = index_prefix;
+            bytes[length++] = 0xCB;
+            bytes[length++] = (uint8_t)(int8_t)index_displacement.value;
+            bytes[length++] = (uint8_t)(operation_base + (bit_number << 3) + 6);
+        }
+        else
+        {
+            snprintf(error_buffer, error_buffer_size, "Unsupported %s operand: %s", mnemonic, rhs);
+            return false;
+        }
+    }
     else if (app_equals_ignore_case(mnemonic, "RET"))
     {
         if (!app_require_operand_count("RET", operand_count, 0, 1, error_buffer, error_buffer_size))
@@ -1618,9 +1912,16 @@ static bool app_assemble_line(
         {
             return false;
         }
+        if (app_equals_ignore_case(lhs, "A") && app_equals_ignore_case(rhs, "(C)"))
+        {
+            bytes[length++] = 0xED;
+            bytes[length++] = 0x78;
+        }
+        else
+        {
         if (!app_equals_ignore_case(lhs, "A") || !app_parse_indirect_address(ctx, rhs, &value))
         {
-            snprintf(error_buffer, error_buffer_size, "Only IN A,(n) is supported.");
+            snprintf(error_buffer, error_buffer_size, "Only IN A,(n) and IN A,(C) are supported.");
             return false;
         }
         if (ctx->pass == 2 && (value.value < 0 || value.value > 0xFF))
@@ -1630,6 +1931,7 @@ static bool app_assemble_line(
         }
         bytes[length++] = 0xDB;
         bytes[length++] = (uint8_t)value.value;
+        }
     }
     else if (app_equals_ignore_case(mnemonic, "PUSH") || app_equals_ignore_case(mnemonic, "POP"))
     {
@@ -1663,6 +1965,8 @@ static bool app_assemble_line(
     {
         uint8_t op8 = app_equals_ignore_case(mnemonic, "INC") ? 0x04 : 0x05;
         uint8_t op16 = app_equals_ignore_case(mnemonic, "INC") ? 0x03 : 0x0B;
+        uint8_t index_prefix;
+        AssemblerValue index_displacement;
         int r = app_parse_reg8(lhs);
         int rr = app_parse_reg16(lhs);
         if (!app_require_operand_count(mnemonic, operand_count, 1, 1, error_buffer, error_buffer_size))
@@ -1686,6 +1990,20 @@ static bool app_assemble_line(
         {
             bytes[length++] = 0xFD;
             bytes[length++] = app_equals_ignore_case(mnemonic, "INC") ? 0x23 : 0x2B;
+        }
+        else if (app_parse_indexed_operand(ctx, lhs, &index_prefix, &index_displacement))
+        {
+            if (ctx->pass == 2 &&
+                (!index_displacement.resolved ||
+                 index_displacement.value < -128 ||
+                 index_displacement.value > 127))
+            {
+                snprintf(error_buffer, error_buffer_size, "Indexed displacement is out of range: %s", lhs);
+                return false;
+            }
+            bytes[length++] = index_prefix;
+            bytes[length++] = app_equals_ignore_case(mnemonic, "INC") ? 0x34 : 0x35;
+            bytes[length++] = (uint8_t)(int8_t)index_displacement.value;
         }
         else
         {
@@ -1727,10 +2045,60 @@ static bool app_assemble_line(
             return false;
         }
     }
+    else if (app_equals_ignore_case(mnemonic, "ADC"))
+    {
+        int source_register = app_parse_reg8(rhs);
+        uint8_t index_prefix;
+        AssemblerValue index_displacement;
+
+        if (!app_require_operand_count("ADC", operand_count, 2, 2, error_buffer, error_buffer_size) ||
+            !app_equals_ignore_case(lhs, "A"))
+        {
+            snprintf(error_buffer, error_buffer_size, "Only ADC A,r, ADC A,(IX/IY+d), and ADC A,n are supported.");
+            return false;
+        }
+        if (source_register >= 0)
+        {
+            bytes[length++] = (uint8_t)(0x88 + source_register);
+        }
+        else if (app_parse_indexed_operand(ctx, rhs, &index_prefix, &index_displacement))
+        {
+            if (ctx->pass == 2 &&
+                (!index_displacement.resolved ||
+                 index_displacement.value < -128 ||
+                 index_displacement.value > 127))
+            {
+                snprintf(error_buffer, error_buffer_size, "Indexed displacement is out of range: %s", rhs);
+                return false;
+            }
+            bytes[length++] = index_prefix;
+            bytes[length++] = 0x8E;
+            bytes[length++] = (uint8_t)(int8_t)index_displacement.value;
+        }
+        else if (app_parse_value(ctx, rhs, &value))
+        {
+            if (ctx->pass == 2 && (!value.resolved || value.value < -128 || value.value > 255))
+            {
+                snprintf(error_buffer, error_buffer_size, "Invalid ADC value: %s", rhs);
+                return false;
+            }
+            bytes[length++] = 0xCE;
+            bytes[length++] = (uint8_t)value.value;
+        }
+        else
+        {
+            snprintf(error_buffer, error_buffer_size, "Unsupported ADC operand: %s", rhs);
+            return false;
+        }
+    }
     else if (app_equals_ignore_case(mnemonic, "ADD"))
     {
         int rr = app_parse_reg16(rhs);
+        int ix_rr = app_parse_index_reg16(rhs, "IX");
+        int iy_rr = app_parse_index_reg16(rhs, "IY");
         int r = app_parse_reg8(rhs);
+        uint8_t index_prefix;
+        AssemblerValue index_displacement;
         if (!app_require_operand_count("ADD", operand_count, 2, 2, error_buffer, error_buffer_size))
         {
             return false;
@@ -1739,19 +2107,35 @@ static bool app_assemble_line(
         {
             bytes[length++] = (uint8_t)(0x09 + (rr << 4));
         }
-        else if (app_equals_ignore_case(lhs, "IX") && rr >= 0)
+        else if (app_equals_ignore_case(lhs, "IX") && ix_rr >= 0)
         {
             bytes[length++] = 0xDD;
-            bytes[length++] = (uint8_t)(0x09 + (rr << 4));
+            bytes[length++] = (uint8_t)(0x09 + (ix_rr << 4));
         }
-        else if (app_equals_ignore_case(lhs, "IY") && rr >= 0)
+        else if (app_equals_ignore_case(lhs, "IY") && iy_rr >= 0)
         {
             bytes[length++] = 0xFD;
-            bytes[length++] = (uint8_t)(0x09 + (rr << 4));
+            bytes[length++] = (uint8_t)(0x09 + (iy_rr << 4));
         }
         else if (app_equals_ignore_case(lhs, "A") && r >= 0)
         {
             bytes[length++] = (uint8_t)(0x80 + r);
+        }
+        else if (
+            app_equals_ignore_case(lhs, "A") &&
+            app_parse_indexed_operand(ctx, rhs, &index_prefix, &index_displacement))
+        {
+            if (ctx->pass == 2 &&
+                (!index_displacement.resolved ||
+                 index_displacement.value < -128 ||
+                 index_displacement.value > 127))
+            {
+                snprintf(error_buffer, error_buffer_size, "Indexed displacement is out of range: %s", rhs);
+                return false;
+            }
+            bytes[length++] = index_prefix;
+            bytes[length++] = 0x86;
+            bytes[length++] = (uint8_t)(int8_t)index_displacement.value;
         }
         else if (app_equals_ignore_case(lhs, "A") && app_parse_value(ctx, rhs, &value))
         {
@@ -1778,6 +2162,8 @@ static bool app_assemble_line(
     {
         uint8_t reg_base;
         uint8_t imm_base;
+        uint8_t index_prefix;
+        AssemblerValue index_displacement;
         int r = app_parse_reg8(lhs);
 
         if (app_equals_ignore_case(mnemonic, "SUB"))
@@ -1814,6 +2200,20 @@ static bool app_assemble_line(
         {
             bytes[length++] = (uint8_t)(reg_base + r);
         }
+        else if (app_parse_indexed_operand(ctx, lhs, &index_prefix, &index_displacement))
+        {
+            if (ctx->pass == 2 &&
+                (!index_displacement.resolved ||
+                 index_displacement.value < -128 ||
+                 index_displacement.value > 127))
+            {
+                snprintf(error_buffer, error_buffer_size, "Indexed displacement is out of range: %s", lhs);
+                return false;
+            }
+            bytes[length++] = index_prefix;
+            bytes[length++] = (uint8_t)(reg_base + 6);
+            bytes[length++] = (uint8_t)(int8_t)index_displacement.value;
+        }
         else if (app_parse_value(ctx, lhs, &value))
         {
             if (ctx->pass == 2 && (value.value < -128 || value.value > 255))
@@ -1835,6 +2235,20 @@ static bool app_assemble_line(
         int rr = app_parse_reg16(lhs);
         int dst8 = app_parse_reg8(lhs);
         int src8 = app_parse_reg8(rhs);
+        uint8_t source_index_prefix;
+        uint8_t destination_index_prefix;
+        AssemblerValue source_index_displacement;
+        AssemblerValue destination_index_displacement;
+        bool source_is_indexed = app_parse_indexed_operand(
+            ctx,
+            rhs,
+            &source_index_prefix,
+            &source_index_displacement);
+        bool destination_is_indexed = app_parse_indexed_operand(
+            ctx,
+            lhs,
+            &destination_index_prefix,
+            &destination_index_displacement);
         if (!app_require_operand_count("LD", operand_count, 2, 2, error_buffer, error_buffer_size))
         {
             return false;
@@ -1842,7 +2256,7 @@ static bool app_assemble_line(
 
         if (rr >= 0 && app_parse_value(ctx, rhs, &value))
         {
-            if (ctx->pass == 2 && (value.value < 0 || value.value > 0xFFFF))
+            if (ctx->pass == 2 && (value.value < -32768 || value.value > 0xFFFF))
             {
                 snprintf(error_buffer, error_buffer_size, "Unsupported LD form: %s,%s", lhs, rhs);
                 return false;
@@ -1853,7 +2267,7 @@ static bool app_assemble_line(
         }
         else if (app_equals_ignore_case(lhs, "IX") && app_parse_value(ctx, rhs, &value))
         {
-            if (ctx->pass == 2 && (value.value < 0 || value.value > 0xFFFF))
+            if (ctx->pass == 2 && (value.value < -32768 || value.value > 0xFFFF))
             {
                 snprintf(error_buffer, error_buffer_size, "Unsupported LD form: %s,%s", lhs, rhs);
                 return false;
@@ -1865,7 +2279,7 @@ static bool app_assemble_line(
         }
         else if (app_equals_ignore_case(lhs, "IY") && app_parse_value(ctx, rhs, &value))
         {
-            if (ctx->pass == 2 && (value.value < 0 || value.value > 0xFFFF))
+            if (ctx->pass == 2 && (value.value < -32768 || value.value > 0xFFFF))
             {
                 snprintf(error_buffer, error_buffer_size, "Unsupported LD form: %s,%s", lhs, rhs);
                 return false;
@@ -1888,6 +2302,57 @@ static bool app_assemble_line(
         {
             bytes[length++] = 0xFD;
             bytes[length++] = 0xF9;
+        }
+        else if (dst8 >= 0 && dst8 != 6 && source_is_indexed)
+        {
+            if (ctx->pass == 2 &&
+                (!source_index_displacement.resolved ||
+                 source_index_displacement.value < -128 ||
+                 source_index_displacement.value > 127))
+            {
+                snprintf(error_buffer, error_buffer_size, "Indexed displacement is out of range: %s", rhs);
+                return false;
+            }
+            bytes[length++] = source_index_prefix;
+            bytes[length++] = (uint8_t)(0x46 + (dst8 << 3));
+            bytes[length++] = (uint8_t)(int8_t)source_index_displacement.value;
+        }
+        else if (destination_is_indexed && src8 >= 0 && src8 != 6)
+        {
+            if (ctx->pass == 2 &&
+                (!destination_index_displacement.resolved ||
+                 destination_index_displacement.value < -128 ||
+                 destination_index_displacement.value > 127))
+            {
+                snprintf(error_buffer, error_buffer_size, "Indexed displacement is out of range: %s", lhs);
+                return false;
+            }
+            bytes[length++] = destination_index_prefix;
+            bytes[length++] = (uint8_t)(0x70 + src8);
+            bytes[length++] = (uint8_t)(int8_t)destination_index_displacement.value;
+        }
+        else if (destination_is_indexed && app_parse_value(ctx, rhs, &value))
+        {
+            if (ctx->pass == 2 &&
+                (!destination_index_displacement.resolved ||
+                 destination_index_displacement.value < -128 ||
+                 destination_index_displacement.value > 127 ||
+                 !value.resolved ||
+                 value.value < -128 ||
+                 value.value > 255))
+            {
+                snprintf(error_buffer, error_buffer_size, "Unsupported LD form: %s,%s", lhs, rhs);
+                return false;
+            }
+            bytes[length++] = destination_index_prefix;
+            bytes[length++] = 0x36;
+            bytes[length++] = (uint8_t)(int8_t)destination_index_displacement.value;
+            bytes[length++] = (uint8_t)value.value;
+        }
+        else if (app_equals_ignore_case(lhs, "A") && app_equals_ignore_case(rhs, "R"))
+        {
+            bytes[length++] = 0xED;
+            bytes[length++] = 0x5F;
         }
         else if (app_parse_indirect_address(ctx, lhs, &value) && app_equals_ignore_case(rhs, "A"))
         {
