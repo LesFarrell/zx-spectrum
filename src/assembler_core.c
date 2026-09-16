@@ -2711,12 +2711,13 @@ static bool app_assembler_write_tap_block(
     uint8_t checksum = 0;
     uint16_t block_length;
 
-    if (payload_length > 0xFFFFu)
+    /* The TAP length covers the flag/data payload and its trailing checksum. */
+    if (payload_length > 0xFFFEu)
     {
         snprintf(error_buffer, error_buffer_size, "TAP block is too large: %s", path);
         return false;
     }
-    block_length = (uint16_t)payload_length;
+    block_length = (uint16_t)(payload_length + 1u);
     if (fputc(block_length & 0xFF, file) == EOF ||
         fputc((block_length >> 8) & 0xFF, file) == EOF)
     {
@@ -2755,9 +2756,9 @@ static bool app_assembler_write_tap_file(
     char tape_name[11];
     bool ok = false;
 
-    if (length == 0 || length > 0xFFFFu)
+    if (length == 0 || length > 0xFFFDu)
     {
-        snprintf(error_buffer, error_buffer_size, "TAP export requires 1-65535 assembled bytes.");
+        snprintf(error_buffer, error_buffer_size, "TAP export requires 1-65533 assembled bytes.");
         return false;
     }
 
@@ -2796,7 +2797,11 @@ static bool app_assembler_write_tap_file(
         ok = true;
     }
 
-    fclose(file);
+    if (fclose(file) != 0)
+    {
+        ok = false;
+        snprintf(error_buffer, error_buffer_size, "Could not finish writing TAP file: %s", path);
+    }
     free(block_data);
 
     if (!ok)

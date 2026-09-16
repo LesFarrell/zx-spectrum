@@ -1,5 +1,3 @@
-build/
-build-cmake/
 tmp-ui-check/
 src/*.tzx
 src/*.z80

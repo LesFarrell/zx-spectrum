@@ -22,6 +22,7 @@ zig cc ^
     spectrum.c ^
     szx_inflate.c ^
     disk.c ^
+    microdrive.c ^
     tape.c ^
     zxspectrum-res.o ^
     -lgdi32 ^

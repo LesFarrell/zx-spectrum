@@ -1608,14 +1608,16 @@ static bool app_assembler_write_source_to_path(
         snprintf(status_buffer, status_buffer_size, "Could not write file: %s", path);
         return false;
     }
-    if (source_length > 0 && fwrite(source, 1, (size_t)source_length, file) != (size_t)source_length) {
-        fclose(file);
-        free(source);
+    bool write_ok = source_length <= 0 ||
+        fwrite(source, 1, (size_t)source_length, file) == (size_t)source_length;
+    if (fclose(file) != 0) {
+        write_ok = false;
+    }
+    free(source);
+    if (!write_ok) {
         snprintf(status_buffer, status_buffer_size, "Could not write file: %s", path);
         return false;
     }
-    fclose(file);
-    free(source);
     app->debug.assembler_dirty = false;
     app_assembler_set_current_path(app, path);
     snprintf(status_buffer, status_buffer_size, "Saved assembler source to %s", path);

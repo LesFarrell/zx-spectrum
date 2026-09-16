@@ -1,1209 +1,1882 @@
-; SPACE INVADERS demo for the ZX Spectrum 48K
-; Built for the emulator's integrated mini assembler.
+; SPACE INVADERS
+; 48K ZX Spectrum game, assembled at 8000h.
 ;
-; Build:    Ctrl+F5 assembles the source at 8000h and runs from 8000h.
-; Controls: 5 moves left, 8 moves right, and 0 fires.
+; Controls:
+;   Z     move the player left
+;   X     move the player right
+;   SPACE fire
+;   0     leave the game through the ROM restart entry
 ;
-; Gameplay: destroy the animated 3x6 formation before it reaches the player.
-; Four destructible shield bases stop one laser or alien bomb per occupied cell.
-; Surviving aliens launch aimed bombs from rotating formation columns.
+; The renderer works directly on the Spectrum's non-linear bitmap memory.
+; Sprites are stored four bytes wide and pre-shifted into eight horizontal
+; variants during startup, which keeps the drawing loops small and fast.
+
+    ORG $8000
+; ENT is not required by the integrated assembler
+
+; ---------------------------------------------------------------------------
+; Game constants
 ;
-; Video: eleven custom 8x8 UDGs provide two animation frames per alien type,
-; the player, projectiles, explosions, and bases. Spectrum attributes colour
-; individual objects while direct bitmap writes keep drawing independent of ROM.
-;
-; Audio: the 48K beeper supplies fire, explosion, hit, formation-step, and
-; bomb-drop effects.
+; Each invader/projectile record occupies 32 bytes. Only the fields below are
+; currently used; the padding makes table indexing cheap and leaves room for
+; additional state.
 
-; UDG character assignments. Alternate alien frames are seven codes above the
-; corresponding primary frame, which lets draw_swarm select them with ADD A,7.
+    lInv         EQU 32
+    nInv         EQU 45       ; Five rows of nine invaders
+    InvStep      EQU 3
+    InvSp        EQU 30       ; Ticks between invader updates
+    InvVStep     EQU 3
+    InvLeftMar   EQU 14
+    InvRightMar  EQU 244
+    nProj        EQU 4        ; Alien projectile slots; slot zero is the player shot
+    BLeft        EQU 15
+    SLeft        EQU 15
+    BRight       EQU 240
+    SRight       EQU 240
+    ShipVel      EQU 34       ; Delay between bonus-ship horizontal steps
+    ShipTime     EQU 20000    ; Delay before trying to launch the bonus ship
 
-	INVADER_TOP    EQU 144
-	INVADER_MID    EQU 145
-	INVADER_LOW    EQU 146
-	PLAYER_CHAR    EQU 147
-	LASER_CHAR     EQU 148
-	BOMB_CHAR      EQU 149
-	EXPLODE_CHAR   EQU 150
-	INVADER_TOP_ALT EQU 151
-	INVADER_MID_ALT EQU 152
-	INVADER_LOW_ALT EQU 153
-	BASE_CHAR       EQU 154
-	SPACE_CHAR     EQU 32
+; Byte offsets within an entry in InvTable or ProjTable.
+; TgType bit 7 marks an explosion and bit 0 selects a zigzag projectile.
+    TgAlive      EQU 0
+    TgX          EQU 1
+    TgY          EQU 2
+    TgSpeedI     EQU 3
+    TgSpeed      EQU 4
+    TgType       EQU 5
+    TgMissDisp   EQU 6
+    TgMissInv    EQU 7
+    TgMissCount  EQU 8
 
-	ORG 8000h
-
-start:
-	; Take control from the ROM, move the stack safely above the program, and
-	; force a black border before initializing all mutable game state.
-	DI
-	LD SP,0FF00h
-	XOR A
-	OUT (0FEh),A
-	CALL reset_game
-
-main_loop:
-	; One iteration updates every actor. game_state remains zero while playing,
-	; becomes one after defeat, and becomes two after the final alien is removed.
-	CALL frame_delay
-	CALL handle_player
-	CALL update_laser
-	CALL update_bomb
-	CALL update_swarm
-	CALL update_status
-	LD A,(remaining)
-	OR A
-	JR NZ,check_game_state
-	LD A,2
-	LD (game_state),A
-
-check_game_state:
-	LD A,(game_state)
-	OR A
-	JP Z,main_loop
-	CP 2
-	JP Z,show_win
-	JP show_game_over
-; ---------------------------------------------------------------------------
-; Game setup
-
-reset_game:
-	; Draw the fixed UI first, then restore player, projectile, formation, and
-	; shield state. Arrays are filled at runtime so replay does not reload code.
-	CALL clear_screen
-	LD D,0
-	LD E,0
-	LD HL,header_text
-	CALL print_text
-	LD D,23
-	LD E,2
-	LD HL,help_text
-	CALL print_text
-	LD A,15
-	LD (player_x),A
-	LD A,3
-	LD (lives),A
-	XOR A
-	LD (score),A
-	LD (game_state),A
-	LD (laser_active),A
-	LD (bomb_active),A
-	LD (bomb_column),A
-	LD (player_delay),A
-	LD (animation_frame),A
-	LD (base_hit),A
-	LD A,2
-	LD (swarm_x),A
-	LD A,4
-	LD (swarm_y),A
-	LD A,1
-	LD (swarm_dir),A
-	LD A,10
-	LD (move_timer),A
-	LD A,35
-	LD (bomb_timer),A
-	LD A,18
-	LD (remaining),A
-	LD HL,invaders
-	LD B,18
-	LD A,1
-
-reset_invaders:
-	LD (HL),A
-	INC HL
-	DJNZ reset_invaders
-	LD HL,bases
-	LD B,12
-
-reset_bases:
-	LD (HL),A
-	INC HL
-	DJNZ reset_bases
-	XOR A
-	LD (swarm_paint),A
-	CALL draw_swarm
-	CALL draw_bases
-	CALL draw_player
-	CALL update_status
-	RET
+; Runtime actor tables live high in RAM, away from the assembled program and
+; the display file.
+    InvTable     EQU $E000
+    ProjTable    EQU $F000
 
 ; ---------------------------------------------------------------------------
-; Player and keyboard
+; Entry point and one-time setup
 
-handle_player:
-	; Erase the old player cell before reading the keyboard. player_delay limits
-	; horizontal movement while fire remains independently responsive.
-	LD A,(player_x)
-	LD E,A
-	LD D,21
-	LD A,SPACE_CHAR
-	CALL print_at
-	LD A,(player_delay)
-	OR A
-	JR Z,player_keys
-	DEC A
-	LD (player_delay),A
-	JR player_fire
+Start:
+    DI
+    CALL InitGame
+    CALL Game
+    JR Start
+InitGame:
+    ; Set the initial game counters and build every shifted sprite variant.
+    LD A,3
+    LD (nBases),A
+    LD A,0
+    LD (nSheets),A
+    CALL InitBaseSh
+    CALL InitInvSh
+    CALL InitExplSh
+    RET
+nBases:
+    NOP
+nSheets:
+    NOP
 
-player_keys:
-	CALL key_left
-	JR NZ,try_right
-	LD A,(player_x)
-	CP 1
-	JR Z,player_moved
-	DEC A
-	LD (player_x),A
-	JR set_player_delay
-
-try_right:
-	CALL key_right
-	JR NZ,player_moved
-	LD A,(player_x)
-	CP 30
-	JR Z,player_moved
-	INC A
-	LD (player_x),A
-
-set_player_delay:
-	LD A,2
-	LD (player_delay),A
-
-player_moved:
-player_fire:
-	; Only one player laser may exist. A new shot begins one row above the player
-	; and advances every main-loop iteration.
-	CALL key_fire
-	JR NZ,draw_player
-	LD A,(laser_active)
-	OR A
-	JR NZ,draw_player
-	LD A,1
-	LD (laser_active),A
-	LD A,(player_x)
-	LD (laser_x),A
-	LD A,20
-	LD (laser_y),A
-	LD A,1
-	LD (laser_delay),A
-	CALL fire_sound
-
-draw_player:
-	LD A,(player_x)
-	LD E,A
-	LD D,21
-	LD A,PLAYER_CHAR
-	CALL print_at
-	RET
-
-; Keyboard matrix reads. Spectrum keys are active-low: a zero result means the
-; requested key is held. IN A,(C) is emitted as ED 78 because the mini assembler
-; intentionally supports only the immediate-port spelling IN A,(n).
-key_left:
-	LD BC,0F7FEh
-	DB 0EDh,078h
-	AND 10h
-	RET
-
-key_right:
-	LD BC,0EFFEh
-	DB 0EDh,078h
-	AND 04h
-	RET
-
-key_fire:
-	LD BC,0EFFEh
-	DB 0EDh,078h
-	AND 01h
-	RET
-
-; ---------------------------------------------------------------------------
-; Player laser
-
-update_laser:
-	; Erase, delay, move upward, test shields and aliens, then repaint if the shot
-	; survived. Reaching row zero simply retires the projectile.
-	LD A,(laser_active)
-	OR A
-	RET Z
-	LD A,(laser_x)
-	LD E,A
-	LD A,(laser_y)
-	LD D,A
-	LD A,SPACE_CHAR
-	CALL print_at
-	LD A,(laser_delay)
-	DEC A
-	LD (laser_delay),A
-	JR Z,move_laser
-	CALL draw_laser
-	RET
-
-move_laser:
-	LD A,1
-	LD (laser_delay),A
-	LD A,(laser_y)
-	DEC A
-	LD (laser_y),A
-	CP 1
-	JR NC,laser_collision
-	XOR A
-	LD (laser_active),A
-	RET
-
-laser_collision:
-	LD A,(laser_y)
-	CP 18
-	JR NZ,laser_alien_collision
-	LD A,(laser_x)
-	CALL damage_base
-	LD A,(base_hit)
-	OR A
-	JR Z,laser_alien_collision
-	XOR A
-	LD (laser_active),A
-	RET
-
-laser_alien_collision:
-	CALL collide_laser
-	LD A,(laser_active)
-	OR A
-	RET Z
-
-draw_laser:
-	LD A,(laser_x)
-	LD E,A
-	LD A,(laser_y)
-	LD D,A
-	LD A,LASER_CHAR
-	CALL print_at
-	RET
-
-collide_laser:
-	; HL walks the 18-byte alien alive/dead array in the same 3x6 order used by
-	; draw_swarm. D/E hold each alien's current screen row and column.
-	LD HL,invaders
-	LD B,3
-	LD A,(swarm_y)
-	LD D,A
-
-collision_row:
-	LD C,6
-	LD A,(swarm_x)
-	LD E,A
-
-collision_column:
-	; Dead entries are skipped. A live entry is hit only when both coordinates
-	; match the laser; the hit clears state and updates score and remaining count.
-	LD A,(HL)
-	OR A
-	JR Z,collision_next
-	LD A,(laser_y)
-	CP D
-	JR NZ,collision_next
-	LD A,(laser_x)
-	CP E
-	JR NZ,collision_next
-	XOR A
-	LD (HL),A
-	LD (laser_active),A
-	LD A,(remaining)
-	DEC A
-	LD (remaining),A
-	LD A,(score)
-	INC A
-	LD (score),A
-	LD A,EXPLODE_CHAR
-	CALL print_at
-	CALL explosion_sound
-	LD A,SPACE_CHAR
-	CALL print_at
-	RET
-
-collision_next:
-	INC HL
-	LD A,E
-	ADD A,3
-	LD E,A
-	DEC C
-	JR NZ,collision_column
-	INC D
-	INC D
-	DJNZ collision_row
-	RET
-
-; ---------------------------------------------------------------------------
-; Alien bomb
-
-update_bomb:
-	; Alien bombs move more slowly than the laser. They can destroy a shield cell,
-	; hit the player on row 21, or disappear after passing the player.
-	LD A,(bomb_active)
-	OR A
-	JR Z,bomb_waiting
-	LD A,(bomb_x)
-	LD E,A
-	LD A,(bomb_y)
-	LD D,A
-	LD A,SPACE_CHAR
-	CALL print_at
-	LD A,(bomb_delay)
-	DEC A
-	LD (bomb_delay),A
-	JR Z,move_bomb
-	CALL draw_bomb
-	RET
-
-move_bomb:
-	LD A,3
-	LD (bomb_delay),A
-	LD A,(bomb_y)
-	INC A
-	LD (bomb_y),A
-	CP 18
-	JR NZ,bomb_player_check
-	LD A,(bomb_x)
-	CALL damage_base
-	LD A,(base_hit)
-	OR A
-	JR Z,bomb_player_check
-	XOR A
-	LD (bomb_active),A
-	RET
-
-bomb_player_check:
-	LD A,(bomb_y)
-	CP 21
-	JP C,draw_bomb
-	JR NZ,remove_bomb
-	LD A,(bomb_x)
-	LD B,A
-	LD A,(player_x)
-	CP B
-	JR NZ,remove_bomb
-	CALL player_hit
-	RET
-
-remove_bomb:
-	XOR A
-	LD (bomb_active),A
-	RET
-
-bomb_waiting:
-	; A countdown spaces bomb launches. Only one alien bomb is active at a time.
-	LD A,(bomb_timer)
-	DEC A
-	LD (bomb_timer),A
-	RET NZ
-	LD A,35
-	LD (bomb_timer),A
-	CALL spawn_bomb
-	RET
-
-; Choose a rotating formation column, then use its lowest surviving alien.
-; The bomb begins in the empty character cell immediately below that alien.
-spawn_bomb:
-	; Try all six columns beginning with bomb_column, which rotates after every
-	; attempt. This distributes fire instead of always choosing the first alien.
-	LD B,6
-
-spawn_try_column:
-	; Start at the bottom-row entry for this column, then step back by six bytes
-	; until the lowest surviving alien is found.
-	LD A,(bomb_column)
-	LD C,A
-	INC A
-	CP 6
-	JR C,store_next_column
-	XOR A
-
-store_next_column:
-	LD (bomb_column),A
-	LD A,C
-	LD E,A
-	LD D,0
-	LD HL,invaders
-	ADD HL,DE
-	LD DE,12
-	ADD HL,DE
-	LD A,(HL)
-	OR A
-	JR NZ,spawn_from_bottom
-	DEC HL
-	DEC HL
-	DEC HL
-	DEC HL
-	DEC HL
-	DEC HL
-	LD A,(HL)
-	OR A
-	JR NZ,spawn_from_middle
-	DEC HL
-	DEC HL
-	DEC HL
-	DEC HL
-	DEC HL
-	DEC HL
-	LD A,(HL)
-	OR A
-	JR NZ,spawn_from_top
-	DJNZ spawn_try_column
-	RET
-
-spawn_from_bottom:
-	LD A,(swarm_y)
-	ADD A,5
-	JR finish_bomb_spawn
-
-spawn_from_middle:
-	LD A,(swarm_y)
-	ADD A,3
-	JR finish_bomb_spawn
-
-spawn_from_top:
-	LD A,(swarm_y)
-	INC A
-
-finish_bomb_spawn:
-	; Convert formation-relative column C into a screen column. Aliens are spaced
-	; three character cells apart, so the conversion is C*3 + swarm_x.
-	LD (bomb_y),A
-	LD A,C
-	LD E,A
-	ADD A,A
-	ADD A,E
-	LD E,A
-	LD A,(swarm_x)
-	ADD A,E
-	LD (bomb_x),A
-	LD A,1
-	LD (bomb_active),A
-	LD A,3
-	LD (bomb_delay),A
-	CALL draw_bomb
-	CALL bomb_sound
-	RET
-
-draw_bomb:
-	LD A,(bomb_x)
-	LD E,A
-	LD A,(bomb_y)
-	LD D,A
-	LD A,BOMB_CHAR
-	CALL print_at
-	RET
-
-player_hit:
-	; Show a temporary explosion, consume one life, and either end the game or
-	; respawn the player at the centre.
-	XOR A
-	LD (bomb_active),A
-	LD A,(player_x)
-	LD E,A
-	LD D,21
-	LD A,EXPLODE_CHAR
-	CALL print_at
-	CALL explosion_sound
-	CALL frame_delay
-	CALL frame_delay
-	LD A,(lives)
-	DEC A
-	LD (lives),A
-	JR NZ,player_survived
-	LD A,1
-	LD (game_state),A
-	RET
-
-player_survived:
-	LD A,15
-	LD (player_x),A
-	CALL draw_player
-	RET
+; Build the eight pixel-aligned versions of the player/base graphic. The first
+; definition is copied verbatim; IBSa shifts each following row one bit right.
+InitBaseSh:
+    LD HL,BaseDef1
+    LD DE,BaseDefn
+    LD BC,32
+    LDIR
+    LD HL,BaseDefn
+    LD DE,BaseDefn+32
+    LD B,56
+IBSa:
+    ; Rotate four source bytes through carry to produce one shifted scanline.
+    OR A
+    LD A,(HL)
+    RRA
+    LD (DE),A
+    INC DE
+    INC HL
+    LD A,(HL)
+    RRA
+    LD (DE),A
+    INC DE
+    INC HL
+    LD A,(HL)
+    RRA
+    LD (DE),A
+    INC DE
+    INC HL
+    LD A,(HL)
+    RRA
+    LD (DE),A
+    INC DE
+    INC HL
+    DJNZ IBSa
+    RET
+InitInvSh:
+    ; Six invader frames, each expanded from 44 bytes to 8 * 44 bytes.
+    LD B,6
+    LD IX,InvShapes
+    LD IY,InvDef0
+IIShlp:
+    PUSH BC
+    CALL InitInv1
+    POP BC
+    LD DE,44
+    ADD IY,DE
+    LD DE,352
+    ADD IX,DE
+    DJNZ IIShlp
+    RET
+InitExplSh:
+    ; Four explosion frames plus the bonus-ship sprite.
+    LD B,5
+    LD IX,Expl1
+    LD IY,ExplDefn1
+IEShlp:
+    PUSH BC
+    CALL InitExp1
+    POP BC
+    LD DE,32
+    ADD IY,DE
+    LD DE,256
+    ADD IX,DE
+    DJNZ IEShlp
+    RET
+InitExp1:
+    ; Copy one 8-row definition, then generate its seven shifted variants.
+    PUSH IY
+    POP HL
+    PUSH IX
+    POP DE
+    LD BC,32
+    LDIR
+    PUSH IX
+    POP DE
+    LD HL,32
+    ADD HL,DE
+    EX DE,HL
+    LD B,56
+    JP IBSa
+InitInv1:
+    ; Invaders are 11 rows high, so each shifted frame occupies 8 * 44 bytes.
+    PUSH IY
+    POP HL
+    PUSH IX
+    POP DE
+    LD BC,44
+    LDIR
+    PUSH IX
+    POP DE
+    LD HL,44
+    ADD HL,DE
+    EX DE,HL
+    LD B,77
+    JP IBSa
+InitInvaders:
+    ; Create a 9-by-5 formation in InvTable. D is the row and E the column.
+    LD IX,InvTable
+    LD DE,0
+    LD C,5
+II1:
+    LD B,9
+    PUSH DE
+II2:
+    PUSH BC
+    CALL CreateInv
+    PUSH DE
+    LD DE,lInv
+    ADD IX,DE
+    POP DE
+    INC E
+    POP BC
+    DJNZ II2
+    POP DE
+    INC D
+    DEC C
+    JR NZ,II1
+    LD A,nInv
+    LD (NoInv1),A
+    LD (cInv),A
+    LD A,1
+    LD (InvDir),A
+    LD A,0
+    LD (ChangeDir),A
+    RET
+    CreateInv    EQU $
+             ; IX = current InvTable entry
+             ; E  = formation column
+             ; D  = formation row
+    LD (IX+TgType),D
+    LD (IX+TgAlive),1
+    LD A,E
+    ADD A,A
+    ADD A,A
+    ADD A,A
+    ADD A,A
+    ADD A,E
+    ADD A,E
+    ADD A,12
+    LD (IX+TgX),A
+    LD A,D
+    ADD A,A
+    ADD A,A
+    ADD A,A
+    ADD A,A
+    ADD A,8
+    LD B,A
+    LD A,(nSheets)
+    ADD A,A
+    ADD A,A
+    ADD A,A
+    ADD A,A
+    ADD A,B
+    LD (IX+TgY),A
+    RET
+InitProj:
+    ; Mark the player-shot slot and all four alien-shot slots as unused.
+    LD IX,ProjTable
+    LD B,nProj+1
+    LD DE,lInv
+IPlp:
+    LD (IX+TgAlive),0
+    ADD IX,DE
+    DJNZ IPlp
+    RET
+InitBase:
+    ; Reset the player position and the per-wave death flag.
+    XOR A
+    LD (KilledF),A
+    LD A,31
+    LD (BaseX),A
+    RET
+Game:
+    ; Start a wave. A cleared formation advances nSheets; a lost base consumes
+    ; one of nBases before another wave is initialized.
+    CALL InitInvaders
+    CALL InitProj
+    CALL InitBase
+    CALL PlaySheet
+    LD A,(KilledF)
+    OR A
+    JR Z,GameNS
+    LD A,(nBases)
+    DEC A
+    LD (nBases),A
+    RET Z
+    JR Game
+GameNS:
+    LD A,(nSheets)
+    INC A
+    LD (nSheets),A
+    JR Game
+KilledF:
+    NOP
 
 ; ---------------------------------------------------------------------------
-; Alien formation. Each movement erases the old formation, changes direction or
-; descends at an edge, flips animation_frame, and paints the surviving aliens.
+; Main wave loop and screen setup
 
-update_swarm:
-	; Movement is timer-driven. The old image is erased before changing position;
-	; reaching either horizontal limit reverses direction and descends one row.
-	LD A,(move_timer)
-	DEC A
-	LD (move_timer),A
-	RET NZ
-	LD A,10
-	LD (move_timer),A
-	LD A,SPACE_CHAR
-	LD (swarm_paint),A
-	CALL draw_swarm
-	LD A,(swarm_dir)
-	CP 1
-	JR NZ,swarm_left
-
-swarm_right:
-	LD A,(swarm_x)
-	INC A
-	LD (swarm_x),A
-	CP 15
-	JR C,paint_swarm
-	LD A,0FFh
-	LD (swarm_dir),A
-	JR swarm_down
-
-swarm_left:
-	LD A,(swarm_x)
-	DEC A
-	LD (swarm_x),A
-	CP 1
-	JR NZ,paint_swarm
-	LD A,1
-	LD (swarm_dir),A
-
-swarm_down:
-	LD A,(swarm_y)
-	INC A
-	LD (swarm_y),A
-	CP 16
-	JR C,paint_swarm
-	LD A,1
-	LD (game_state),A
-
-paint_swarm:
-	LD A,(animation_frame)
-	XOR 1
-	LD (animation_frame),A
-	XOR A
-	LD (swarm_paint),A
-	CALL draw_swarm
-	CALL move_sound
-	RET
-
-draw_swarm:
-	; Paint or erase all 18 formation slots. swarm_paint is SPACE_CHAR while
-	; erasing and zero while drawing the row-specific animated UDG.
-	LD HL,invaders
-	LD B,3
-	LD A,INVADER_TOP
-	LD (row_char),A
-	LD A,(swarm_y)
-	LD D,A
-
-draw_swarm_row:
-	; Each logical row contains six aliens separated by two blank character cells.
-	LD C,6
-	LD A,(swarm_x)
-	LD E,A
-
-draw_swarm_column:
-	LD A,(HL)
-	OR A
-	JR Z,draw_swarm_next
-	LD A,(swarm_paint)
-	OR A
-	JR NZ,draw_swarm_char
-	LD A,(animation_frame)
-	OR A
-	LD A,(row_char)
-	JR Z,draw_swarm_char
-	ADD A,7
-
-draw_swarm_char:
-	CALL print_at
-
-draw_swarm_next:
-	INC HL
-	LD A,E
-	ADD A,3
-	LD E,A
-	DEC C
-	JR NZ,draw_swarm_column
-	LD A,(row_char)
-	INC A
-	LD (row_char),A
-	INC D
-	INC D
-	DJNZ draw_swarm_row
-	RET
-
-; ---------------------------------------------------------------------------
-; Destructible shield bases. Four groups of three cells occupy character row 18.
-; A live cell is represented by 1 in bases and becomes 0 after either projectile
-; hits it. damage_base reports a collision through base_hit.
-
-draw_bases:
-	; Four groups begin at columns 4, 11, 18, and 25. Each group contains three
-	; independently destructible cells backed by the 12-byte bases array.
-	LD HL,bases
-	LD B,4
-	LD D,18
-	LD E,4
-
-draw_base_group:
-	LD C,3
-
-draw_base_cell:
-	LD A,(HL)
-	OR A
-	JR Z,draw_base_next
-	LD A,BASE_CHAR
-	CALL print_at
-
-draw_base_next:
-	INC HL
-	INC E
-	DEC C
-	JR NZ,draw_base_cell
-	LD A,E
-	ADD A,4
-	LD E,A
-	DJNZ draw_base_group
-	RET
-
-; A contains the projectile column. The matching live shield cell is removed.
-damage_base:
-	; Search the same four-by-three layout used by draw_bases. collision_x is
-	; saved because A is reused while walking and drawing the matching cell.
-	LD (collision_x),A
-	XOR A
-	LD (base_hit),A
-	LD HL,bases
-	LD B,4
-	LD D,18
-	LD E,4
-
-damage_base_group:
-	LD C,3
-
-damage_base_cell:
-	LD A,(collision_x)
-	CP E
-	JR NZ,damage_base_next
-	LD A,(HL)
-	OR A
-	JR Z,damage_base_next
-	XOR A
-	LD (HL),A
-	LD A,1
-	LD (base_hit),A
-	LD A,EXPLODE_CHAR
-	CALL print_at
-	CALL hit_sound
-	LD A,SPACE_CHAR
-	CALL print_at
-	RET
-
-damage_base_next:
-	INC HL
-	INC E
-	DEC C
-	JR NZ,damage_base_cell
-	LD A,E
-	ADD A,4
-	LD E,A
-	DJNZ damage_base_group
-	RET
-
-; ---------------------------------------------------------------------------
-; Status, messages and direct screen output
-
-update_status:
-	; Rewrite only the numeric fields embedded in the fixed header line.
-	LD A,(score)
-	LD D,0
-	LD E,6
-	CALL draw_two_digits
-	LD D,0
-	LD E,8
-	LD A,"0"
-	CALL print_at
-	LD A,(lives)
-	ADD A,"0"
-	LD D,0
-	LD E,18
-	CALL print_at
-	LD A,(remaining)
-	LD D,0
-	LD E,29
-	CALL draw_two_digits
-	RET
-
-draw_two_digits:
-	; Convert an unsigned value below 100 by repeated subtraction. B accumulates
-	; tens and A retains units, avoiding a division routine.
-	LD B,0
-
-digit_tens:
-	CP 10
-	JR C,digits_ready
-	SUB 10
-	INC B
-	JR digit_tens
-
-digits_ready:
-	LD C,A
-	LD A,B
-	ADD A,"0"
-	CALL print_at
-	INC E
-	LD A,C
-	ADD A,"0"
-	CALL print_at
-	RET
-
-print_at:
-	; Input: A=character code, D=row (0-23), E=column (0-31).
-	; The routine preserves BC, DE, and HL for callers and writes both bitmap and
-	; attribute memory directly.
-	LD (draw_char),A
-	LD A,D
-	LD (draw_row),A
-	LD A,E
-	LD (draw_column),A
-	PUSH BC
-	PUSH DE
-	PUSH HL
-
-; Locate the glyph. Normal text uses the ROM font at 3D00h; codes
-; 144-154 use the game's UDG table.
-	LD A,(draw_char)
-	CP INVADER_TOP
-	JR NC,locate_udg
-	SUB 32
-	LD L,A
-	LD H,0
-	ADD HL,HL
-	ADD HL,HL
-	ADD HL,HL
-	LD DE,03D00h
-	ADD HL,DE
-	EX DE,HL
-	JR locate_screen
-
-locate_udg:
-	; Each custom glyph is eight bytes, so (character-144)*8 indexes udg_data.
-	SUB INVADER_TOP
-	LD L,A
-	LD H,0
-	ADD HL,HL
-	ADD HL,HL
-	ADD HL,HL
-	LD DE,udg_data
-	ADD HL,DE
-	EX DE,HL
-
-locate_screen:
-; Fetch the top bitmap address for the character row and add the column.
-	LD A,(draw_row)
-	ADD A,A
-	LD L,A
-	LD H,0
-	LD BC,screen_rows
-	ADD HL,BC
-	LD C,(HL)
-	INC HL
-	LD B,(HL)
-	LD A,(draw_column)
-	LD L,A
-	LD H,0
-	ADD HL,BC
-	LD B,8
-
-copy_glyph:
-	; Within one Spectrum character cell, consecutive pixel scanlines are 256
-	; bytes apart. Incrementing H advances to the next scanline efficiently.
-	LD A,(DE)
-	LD (HL),A
-	INC DE
-	INC H
-	DJNZ copy_glyph
-
-; Choose a bright Spectrum colour for each game object. Text is cyan,
-; alien rows are yellow/magenta/green, bombs are red, and explosions flash.
-	LD A,(draw_char)
-	CP SPACE_CHAR
-	JR Z,attribute_white
-	CP INVADER_TOP
-	JR C,attribute_cyan
-	JR Z,attribute_yellow
-	CP INVADER_MID
-	JR Z,attribute_magenta
-	CP INVADER_LOW
-	JR Z,attribute_green
-	CP PLAYER_CHAR
-	JR Z,attribute_cyan
-	CP LASER_CHAR
-	JR Z,attribute_white
-	CP BOMB_CHAR
-	JR Z,attribute_red
-	CP EXPLODE_CHAR
-	JR Z,attribute_explosion
-	CP INVADER_TOP_ALT
-	JR Z,attribute_yellow
-	CP INVADER_MID_ALT
-	JR Z,attribute_magenta
-	CP INVADER_LOW_ALT
-	JR Z,attribute_green
-	CP BASE_CHAR
-	JR Z,attribute_cyan
-
-attribute_explosion:
-	LD A,0C6h
-	JR store_attribute
-
-attribute_yellow:
-	LD A,046h
-	JR store_attribute
-
-attribute_magenta:
-	LD A,043h
-	JR store_attribute
-
-attribute_green:
-	LD A,044h
-	JR store_attribute
-
-attribute_cyan:
-	LD A,045h
-	JR store_attribute
-
-attribute_red:
-	LD A,042h
-	JR store_attribute
-
-attribute_white:
-	LD A,047h
-
-store_attribute:
-	; Attribute memory is linear: 32 bytes per character row starting at 5800h.
-	LD (draw_attribute),A
-	LD A,(draw_row)
-	LD L,A
-	LD H,0
-	ADD HL,HL
-	ADD HL,HL
-	ADD HL,HL
-	ADD HL,HL
-	ADD HL,HL
-	LD DE,05800h
-	ADD HL,DE
-	LD A,(draw_column)
-	LD E,A
-	LD D,0
-	ADD HL,DE
-	LD A,(draw_attribute)
-	LD (HL),A
-	POP HL
-	POP DE
-	POP BC
-	RET
-
-print_text:
-	; Print a zero-terminated string from HL, advancing horizontally from D/E.
-	LD A,(HL)
-	OR A
-	RET Z
-	CALL print_at
-	INC HL
-	INC E
-	JR print_text
-
-clear_screen:
-	; Clear 6144 bitmap bytes, then initialize all 768 attribute cells to bright
-	; white ink on black paper.
-	LD HL,04000h
-	LD BC,01800h
-
-clear_bitmap:
-	LD (HL),0
-	INC HL
-	DEC BC
-	LD A,B
-	OR C
-	JR NZ,clear_bitmap
-	LD HL,05800h
-	LD BC,00300h
-
-clear_attributes:
-	LD (HL),047h
-	INC HL
-	DEC BC
-	LD A,B
-	OR C
-	JR NZ,clear_attributes
-	RET
-
-frame_delay:
-	; A small CPU-speed delay controls the main loop without relying on ROM calls
-	; or interrupts (the game runs with interrupts disabled).
-	LD C,20
-
-frame_delay_outer:
-	LD B,0
-
-frame_delay_inner:
-	DJNZ frame_delay_inner
-	DEC C
-	JR NZ,frame_delay_outer
-	RET
+PlaySheet:
+    ; Draw the static scene, place all actors, and disable the bonus ship until
+    ; its countdown expires. Writing C9h over MoveShip is a one-byte RET patch.
+    CALL CLS
+    CALL DrawShields
+    CALL ORBase
+    CALL DisplayInvs
+    XOR A
+    LD (EndF),A
+    LD A,$C9
+    LD (MoveShip),A
+    LD HL,ShipTime
+    LD (NextShipT),HL
+PlayLoop:
+    ; Cooperative update loop: each subsystem performs one small step and
+    ; returns. Reading keyboard row EFFEh lets key 0 return to the ROM.
+    CALL MoveBase
+    CALL MoveProj
+    CALL MoveInvs
+    CALL MoveShip
+    CALL NextShip
+    LD BC,61438
+    IN A,(C)
+    BIT 0,A
+    JP Z,0
+    LD A,(EndF)
+    OR A
+    RET NZ
+    JR PlayLoop
+EndF:
+    NOP
+CLS:
+    ; Clear the 6144-byte bitmap, then paint broad attribute bands for the
+    ; playfield. Port FEh sets a black border.
+    LD HL,$4000
+    LD DE,$4001
+    LD BC,$1800
+    LD (HL),0
+    LDIR
+    LD (HL),$06
+    LD BC,32
+    LDIR
+    LD (HL),$07
+    LD BC,$240
+    LDIR
+    LD (HL),$04
+    LD BC,$9F
+    LDIR
+    LD A,0
+    OUT ($FE),A
+    RET
+DrawShields:
+    ; Draw four copies of the 28-row shield, eight character columns apart.
+    LD B,4
+    LD A,2
+DS1:
+    CALL Shield
+    ADD A,8
+    DJNZ DS1
+    RET
+Shield:
+    ; A is the shield's character-column offset. ShieldYs maps each logical
+    ; row to its physical Spectrum bitmap address.
+    PUSH BC
+    LD IX,ShieldYs
+    LD HL,ShieldDefn
+    LD B,28
+Shield1:
+    PUSH BC
+    EX DE,HL
+    LD C,A
+    LD B,0
+    LD L,(IX)
+    LD H,(IX+1)
+    ADD HL,BC
+    EX DE,HL
+    LD BC,4
+    LDIR
+    POP BC
+    INC IX
+    INC IX
+    DJNZ Shield1
+    POP BC
+    RET
+ORShip:
+    ; Select the bonus ship's pre-shifted bitmap and merge it onto the screen.
+    LD A,(ShipX)
+    SUB 12
+    AND $7
+    RRCA
+    RRCA
+    RRCA
+    LD HL,Ship1
+    LD E,A
+    LD D,0
+    ADD HL,DE
+    EX DE,HL
+    LD A,(ShipX)
+    SUB 12
+    RRCA
+    RRCA
+    RRCA
+    AND $1F
+    LD IX,ShipYs
+    JR ORIt
+ANDShip:
+    ; Erase the bonus ship by ANDing the screen with the inverse sprite mask.
+    LD A,(ShipX)
+    SUB 12
+    AND $7
+    RRCA
+    RRCA
+    RRCA
+    LD HL,Ship1
+    LD E,A
+    LD D,0
+    ADD HL,DE
+    EX DE,HL
+    LD A,(ShipX)
+    SUB 12
+    RRCA
+    RRCA
+    RRCA
+    AND $1F
+    LD IX,ShipYs
+    JP ANDIt
+ORBase:
+    ; Draw the player's base at BaseX.
+    LD A,(BaseX)
+    SUB 12
+    AND $7
+    RRCA
+    RRCA
+    RRCA
+    LD HL,BaseDefn
+    LD E,A
+    LD D,0
+    ADD HL,DE
+    EX DE,HL
+    LD A,(BaseX)
+    SUB 12
+    RRCA
+    RRCA
+    RRCA
+    AND $1F
+    LD IX,BaseYs
+ORIt:
+    ; Common 8-row, 4-byte-wide sprite merge. DE is sprite data, IX is a table
+    ; of screen row addresses, and A is the byte-column offset.
+    LD B,8
+DBlp:
+    PUSH BC
+    LD L,(IX)
+    LD H,(IX+1)
+    LD C,A
+    LD B,0
+    ADD HL,BC
+    LD B,4
+    LD C,A
+DBlp1:
+    LD A,(DE)
+    OR (HL)
+    LD (HL),A
+    INC DE
+    INC HL
+    DJNZ DBlp1
+    LD A,C
+    POP BC
+    INC IX
+    INC IX
+    DJNZ DBlp
+    RET
+ORInvRows:
+    ; Invaders are 11 rows high; otherwise this is the same merge as ORIt.
+    LD B,11
+OIlp:
+    PUSH BC
+    LD L,(IX)
+    LD H,(IX+1)
+    LD C,A
+    LD B,0
+    ADD HL,BC
+    LD B,4
+    LD C,A
+OIlp1:
+    LD A,(DE)
+    OR (HL)
+    LD (HL),A
+    INC DE
+    INC HL
+    DJNZ OIlp1
+    LD A,C
+    POP BC
+    INC IX
+    INC IX
+    DJNZ OIlp
+    RET
+ANDBase:
+    ; Select the player's shifted mask, then fall through to the common eraser.
+    LD A,(BaseX)
+    SUB 12
+    AND $7
+    RRCA
+    RRCA
+    RRCA
+    LD HL,BaseDefn
+    LD E,A
+    LD D,0
+    ADD HL,DE
+    EX DE,HL
+    LD A,(BaseX)
+    SUB 12
+    RRCA
+    RRCA
+    RRCA
+    AND $1F
+    LD IX,BaseYs
+ANDIt:
+    ; Common 8-row eraser: screen = screen AND NOT sprite.
+    LD B,8
+Dilp:
+    PUSH BC
+    LD L,(IX)
+    LD H,(IX+1)
+    LD C,A
+    LD B,0
+    ADD HL,BC
+    LD B,4
+    LD C,A
+Dilp1:
+    LD A,(DE)
+    CPL
+    AND (HL)
+    LD (HL),A
+    INC DE
+    INC HL
+    DJNZ Dilp1
+    LD A,C
+    POP BC
+    INC IX
+    INC IX
+    DJNZ Dilp
+    RET
+ANDInvRows:
+    ; Eleven-row version of the common sprite eraser.
+    LD B,11
+AIlp:
+    PUSH BC
+    LD L,(IX)
+    LD H,(IX+1)
+    LD C,A
+    LD B,0
+    ADD HL,BC
+    LD B,4
+    LD C,A
+AIlp1:
+    LD A,(DE)
+    CPL
+    AND (HL)
+    LD (HL),A
+    INC DE
+    INC HL
+    DJNZ AIlp1
+    LD A,C
+    POP BC
+    INC IX
+    INC IX
+    DJNZ AIlp
+    RET
+DisplayInvs:
+    ; Walk all 45 records and draw entries whose TgAlive byte is nonzero.
+    LD B,nInv
+    LD IX,InvTable
+DisplayInvsLoop:
+    LD A,(IX+TgAlive)
+    OR A
+    CALL NZ,ORInv
+    LD DE,lInv
+    ADD IX,DE
+    DJNZ DisplayInvsLoop
+    RET
+ORInv:
+    ; Draw one invader. CalcInvAdd selects its animation frame and horizontal
+    ; shift; LineYs supplies the non-linear screen addresses for its Y position.
+    PUSH BC
+    PUSH IX
+    CALL CalcInvAdd
+    PUSH HL
+    LD A,(IX+TgY)
+    ADD A,A
+    LD C,A
+    LD A,0
+    ADC A,0
+    LD B,A
+    LD HL,LineYs
+    ADD HL,BC
+    PUSH HL
+    LD A,(IX+TgX)
+    SUB 12
+    RRCA
+    RRCA
+    RRCA
+    AND $1F
+    POP IX
+    POP DE
+    CALL ORInvRows
+    POP IX
+    POP BC
+    RET
+ANDInv:
+    ; Erase one invader using the same address calculation as ORInv.
+    PUSH BC
+    PUSH IX
+    CALL CalcInvAdd
+    PUSH HL
+    LD A,(IX+TgY)
+    ADD A,A
+    LD C,A
+    LD A,0
+    ADC A,0
+    LD B,A
+    LD HL,LineYs
+    ADD HL,BC
+    PUSH HL
+    LD A,(IX+TgX)
+    SUB 12
+    RRCA
+    RRCA
+    RRCA
+    AND $1F
+    POP IX
+    POP DE
+    CALL ANDInvRows
+    POP IX
+    POP BC
+    RET
+CalcInvAdd:
+    ; Return HL = shifted invader bitmap:
+    ;   InvShapes + TgType * 352 + ((TgX - 12) & 7) * 44
+    LD A,(IX+TgType)
+    LD DE,352
+    LD HL,InvShapes
+CIA:
+    OR A
+    JR Z,CIA1
+    ADD HL,DE
+    DEC A
+    JR CIA
+CIA1:
+    LD A,(IX+TgX)
+    SUB 12
+    AND $7
+    LD DE,44
+CIA2:
+    OR A
+    RET Z
+    ADD HL,DE
+    DEC A
+    JR CIA2
+BaseAlive:
+    DB 1
+BaseX:
+    DB 10
+BaseY:
+    DB 191-8
+BaseSpeed:
+    DB 1
+FireP:
+    DB 0
 
 ; ---------------------------------------------------------------------------
-; 48K beeper effects. Bit 4 of port FEh drives the speaker; bits 0-2 remain zero
-; so playing a sound never changes the black border.
+; Player input and movement
 
-fire_sound:
-	; Decreasing pulse delays create a short rising laser sweep.
-	PUSH BC
-	LD C,120
-
-fire_sound_pulse:
-	LD B,C
-
-fire_sound_delay:
-	DJNZ fire_sound_delay
-	LD A,(sound_phase)
-	XOR 10h
-	LD (sound_phase),A
-	OUT (0FEh),A
-	DEC C
-	JR NZ,fire_sound_pulse
-	XOR A
-	LD (sound_phase),A
-	OUT (0FEh),A
-	POP BC
-	RET
-
-hit_sound:
-	; Fixed-width pulses produce a harsher impact tone.
-	PUSH BC
-	LD C,48
-
-hit_sound_loop:
-	LD B,60
-
-hit_sound_delay:
-	DJNZ hit_sound_delay
-	LD A,(sound_phase)
-	XOR 10h
-	LD (sound_phase),A
-	OUT (0FEh),A
-	DEC C
-	JR NZ,hit_sound_loop
-	XOR A
-	LD (sound_phase),A
-	OUT (0FEh),A
-	POP BC
-	RET
-
-explosion_sound:
-	; A longer sequence of irregular pulse widths gives destroyed invaders and
-	; player hits a rough, descending explosion instead of the short impact beep.
-	PUSH BC
-	LD C,96
-
-explosion_sound_pulse:
-	LD A,C
-	AND 31
-	ADD A,24
-	LD B,A
-
-explosion_sound_delay:
-	DJNZ explosion_sound_delay
-	LD A,(sound_phase)
-	XOR 10h
-	LD (sound_phase),A
-	OUT (0FEh),A
-	DEC C
-	JR NZ,explosion_sound_pulse
-	XOR A
-	LD (sound_phase),A
-	OUT (0FEh),A
-	POP BC
-	RET
-
-move_sound:
-	; Low, short pulses accompany each completed formation step.
-	PUSH BC
-	LD C,12
-
-move_sound_pulse:
-	LD B,110
-
-move_sound_delay:
-	DJNZ move_sound_delay
-	LD A,(sound_phase)
-	XOR 10h
-	LD (sound_phase),A
-	OUT (0FEh),A
-	DEC C
-	JR NZ,move_sound_pulse
-	XOR A
-	LD (sound_phase),A
-	OUT (0FEh),A
-	POP BC
-	RET
-
-bomb_sound:
-	; A separate mid-pitch burst marks each alien bomb launch.
-	PUSH BC
-	LD C,24
-
-bomb_sound_pulse:
-	LD B,75
-
-bomb_sound_delay:
-	DJNZ bomb_sound_delay
-	LD A,(sound_phase)
-	XOR 10h
-	LD (sound_phase),A
-	OUT (0FEh),A
-	DEC C
-	JR NZ,bomb_sound_pulse
-	XOR A
-	LD (sound_phase),A
-	OUT (0FEh),A
-	POP BC
-	RET
-
-show_game_over:
-	; Replace the playfield with the defeat and restart prompts.
-	CALL clear_screen
-	LD D,9
-	LD E,10
-	LD HL,game_over_text
-	CALL print_text
-	LD D,12
-	LD E,4
-	LD HL,restart_text
-	CALL print_text
-	JR wait_restart
-
-show_win:
-	; Replace the playfield with the victory and restart prompts.
-	CALL clear_screen
-	LD D,9
-	LD E,11
-	LD HL,you_win_text
-	CALL print_text
-	LD D,12
-	LD E,4
-	LD HL,restart_text
-	CALL print_text
-
-wait_restart:
-	; Fire restarts through start so every array and counter is initialized again.
-	CALL frame_delay
-	CALL key_fire
-	JR NZ,wait_restart
-	JP start
+MoveBase:
+    ; Rate-limit movement, then read SPACE from keyboard row 7FFEh. FireP
+    ; prevents auto-repeat while the key remains held.
+    LD A,(BaseSpeed)
+    DEC A
+    LD (BaseSpeed),A
+    JR NZ,MB4
+    LD A,25
+    LD (BaseSpeed),A
+    CALL MB3
+MB4:
+    LD BC,32766
+    IN A,(C)
+    BIT 0,A
+    JR NZ,MB1
+    LD A,(FireP)
+    OR A
+    LD A,1
+    LD (FireP),A
+    RET NZ
+    LD D,0-3&$FF
+    LD E,191-15
+    LD B,20
+    LD C,0
+    LD IX,BaseAlive
+    CALL FireProjB
+    RET
+MB1:
+    XOR A
+    LD (FireP),A
+    RET
+MB3:
+    ; Read Z and X from keyboard row FEFEh. The sprite is erased before BaseX
+    ; changes and redrawn afterward.
+    LD BC,65278
+    IN A,(C)
+    AND $06
+    JP PE,ORBase
+    BIT 1,A
+    JR NZ,MBRight
+    LD A,(BaseX)
+    CP BLeft
+    RET Z
+    CALL ANDBase
+    LD A,(BaseX)
+    DEC A
+    LD (BaseX),A
+    JP ORBase
+MBRight:
+    LD A,(BaseX)
+    CP BRight
+    RET Z
+    CALL ANDBase
+    LD A,(BaseX)
+    INC A
+    LD (BaseX),A
+    JP ORBase
+InvDir:
+    DB 0
+InvSpeed:
+    DB 1
+NoInv1:
+    DB 0
+NoInv2:
+    DB 0
+cInv:
+    DB 0
+pcInv:
+    DW InvTable
+ChangeDir:
+    DB 0
 
 ; ---------------------------------------------------------------------------
-; Text, mutable game state, collision work values, and renderer work values.
-; Boolean values use zero for inactive/dead and one for active/alive.
+; Invader movement and alien fire
 
-header_text:
-	DB "SCORE 000   LIVES 3   ALIENS 18",0
+MoveInvs:
+    ; Update one live invader per call. Spreading the work across frames keeps
+    ; animation responsive even with the full 45-member formation.
+    LD A,(InvSpeed)
+    DEC A
+    LD (InvSpeed),A
+    RET NZ
+    LD A,InvSp
+    LD (InvSpeed),A
+MI1:
+    LD A,(cInv)
+    LD HL,(pcInv)
+    CP nInv
+    JP Z,LastInv
+    INC A
+    LD (cInv),A
+    LD DE,lInv
+    ADD HL,DE
+    LD (pcInv),HL
+MI1a:
+    ; Erase, move, toggle the two-frame animation bit, then redraw.
+    LD A,(HL)
+    OR A
+    JR Z,MI1
+    LD A,(NoInv1)
+    INC A
+    LD (NoInv1),A
+    PUSH HL
+    POP IX
+    CALL ANDInv
+    CALL DoMoveInv
+    LD A,(IX+TgType)
+    XOR $01
+    LD (IX+TgType),A
+    CALL ORInv
+Rnd1:
+    ; Use the Z80 refresh register as a lightweight pseudo-random source.
+    ; Pick one of the nine formation columns and search upward for a live alien.
+    LD A,R
+    AND $F
+    CP 9
+    JR NC,Rnd1
+    ADD A,A
+    ADD A,A
+    ADD A,A
+    ADD A,A
+    ADD A,A
+    LD E,A
+    LD A,0
+    ADC A,0
+    LD D,A
+    LD HL,InvTable+1024+128
+    ADD HL,DE
+    LD B,5
+    LD DE,0-288
+FindItLp:
+    ; Entries in a column are 9 * 32 = 288 bytes apart.
+    LD A,(HL)
+    OR A
+    JR NZ,FILx
+    ADD HL,DE
+    DJNZ FindItLp
+    RET
+FILx:
+    PUSH HL
+    POP IX
+    LD A,R
+    AND $50
+    RET NZ
+FireIN:
+    ; Launch an alien projectile below the chosen invader. D is its horizontal
+    ; drift, E its initial Y, B its speed, and C its projectile type.
+    LD A,(IX+TgY)
+    ADD A,20
+    LD E,A
+    LD A,R
+    AND $01
+    LD C,A
+    NEG
+    ADD A,4
+    LD D,A
+    LD A,R
+    AND $3F
+    ADD A,20
+    LD B,A
+    CALL FireProj
+    RET C
+    LD (IY+TgMissInv),1
+    RET
+DoMoveInv:
+    ; InvDir bit 0 selects horizontal direction; bit 7 requests a downward step
+    ; after the formation reaches a margin.
+    LD A,(InvDir)
+    BIT 7,A
+    CALL NZ,DMIDown
+    BIT 0,A
+    JR NZ,DMIRight
+    LD A,(IX+TgX)
+    SUB InvStep
+    LD (IX+TgX),A
+    CP InvLeftMar
+    RET NC
+    LD A,1
+    LD (ChangeDir),A
+    RET
+    RET
+DMIRight:
+    LD A,(IX+TgX)
+    ADD A,InvStep
+    LD (IX+TgX),A
+    CP InvRightMar
+    RET C
+    LD A,1
+    LD (ChangeDir),A
+    RET
+DMIDown:
+    EX AF,AF'
+    LD A,(IX+TgY)
+    ADD A,InvVStep
+    LD (IX+TgY),A
+    EX AF,AF'
+    RET
+LastInv:
+    ; End the wave if no live invader was visited. Otherwise begin another
+    ; table pass and reverse/drop the formation when ChangeDir is set.
+    LD A,(NoInv1)
+    LD (NoInv2),A
+    OR A
+    JR NZ,MI2
+    LD A,1
+    LD (EndF),A
+    RET
+MI2:
+    XOR A
+    LD (NoInv1),A
+    INC A
+    LD (cInv),A
+    LD A,(InvDir)
+    AND $1
+    LD (InvDir),A
+    LD HL,InvTable
+    LD (pcInv),HL
+    LD A,(ChangeDir)
+    OR A
+    JP Z,MI1a
+    XOR A
+    LD (ChangeDir),A
+    LD A,(InvDir)
+    OR $80
+    XOR $01
+    LD (InvDir),A
+    JP MI1a
+MoveShip:
+    ; Bonus-ship update. The first byte is self-modified between NOP (active)
+    ; and RET (inactive) by NextShip, MSexit, and the hit handler.
+    NOP
+    LD A,(ShipSpeed)
+    DEC A
+    LD (ShipSpeed),A
+    RET NZ
+    LD A,ShipVel
+    LD (ShipSpeed),A
+    CALL ANDShip
+    LD A,(ShipDelX)
+    LD B,A
+    LD A,(ShipX)
+    ADD A,B
+    LD (ShipX),A
+    LD B,A
+    LD A,(TargetMargin)
+    CP B
+    JR Z,MSexit
+    CALL ORShip
+    RET
+MSexit:
+    LD A,$C9
+    LD (MoveShip),A
+    RET
+ShipSpeed:
+    DB 1
+ShipX:
+    DB SLeft
+ShipDelX:
+    DB 1
+TargetMargin:
+    DB SRight
+NextShip:
+    ; Periodically enable a bonus ship once the formation has been reduced.
+    ; Its starting edge and travel direction are selected from R bit 0.
+    LD HL,(NextShipT)
+    DEC HL
+    LD (NextShipT),HL
+    LD A,L
+    OR H
+    RET NZ
+    LD HL,ShipTime
+    LD (NextShipT),HL
+    LD A,(NoInv2)
+    CP 8
+    RET C
+    XOR A
+    LD (MoveShip),A
+    LD A,R
+    AND $01
+    JR Z,NSRight
+    LD A,SLeft
+    LD (TargetMargin),A
+    LD A,SRight
+    LD (ShipX),A
+    LD A,1
+    LD (ShipSpeed),A
+    LD A,0-1&$FF
+    LD (ShipDelX),A
+    RET
+NSRight:
+    LD A,SRight
+    LD (TargetMargin),A
+    LD A,SLeft
+    LD (ShipX),A
+    LD A,1
+    LD (ShipSpeed),A
+    LD A,1
+    LD (ShipDelX),A
+    RET
+NextShipT:
+    DW ShipTime
 
-help_text:
-	DB "5/8 MOVE       0 FIRE",0
+; ---------------------------------------------------------------------------
+; Projectile and explosion updates
 
-game_over_text:
-	DB "GAME OVER",0
+MoveProj:
+    ; Slot zero is the player's shot; the following nProj slots belong to the
+    ; invaders. Each active entry is erased, advanced, and redrawn.
+    LD B,nProj+1
+    LD IX,ProjTable
+MPlp:
+    LD A,(IX+TgAlive)
+    OR A
+    CALL NZ,MP1
+    LD DE,lInv
+    ADD IX,DE
+    DJNZ MPlp
+    RET
+MP1:
+    ; TgSpeed counts down to the next movement. TgMissCount cycles through the
+    ; three zigzag masks used by guided alien shots.
+    DEC (IX+TgSpeed)
+    RET NZ
+    LD A,(IX+TgSpeedI)
+    LD (IX+TgSpeed),A
+    PUSH BC
+    CALL RemoveProj
+    LD A,(IX+TgMissCount)
+    INC A
+    CP 3
+    JR NZ,MP1z
+    XOR A
+MP1z:
+    LD (IX+TgMissCount),A
+    BIT 7,(IX+TgType)
+    JR NZ,MP1a
+    LD A,(IX+TgY)
+    ADD A,(IX+TgMissDisp)
+    LD (IX+TgY),A
+    CP 4
+    JR C,MP2
+    CP 191-4
+    JR NC,MP2
+MP1a:
+    CALL PlaceProj
+    POP BC
+    RET
+MP2:
+    CALL Explode
+    POP BC
+    RET
+Explode:
+    ; Replace a projectile with a four-tick explosion actor.
+    CALL RemoveProj
+    LD (IX+TgAlive),4
+    LD (IX+TgType),$80
+    LD (IX+TgSpeed),50
+    LD (IX+TgSpeedI),50
+    RET
+ANDBar:
+    ; Erase a straight one-pixel-wide projectile from eight bitmap rows.
+    LD A,(IX+TgX)
+    AND $07
+    LD HL,BitTable
+    LD E,A
+    LD D,0
+    ADD HL,DE
+    LD A,(HL)
+    CPL
+    LD C,A
+    LD A,(IX+TgY)
+    LD L,A
+    LD H,0
+    ADD HL,HL
+    LD DE,LineYs
+    ADD HL,DE
+    PUSH HL
+    POP IY
+    LD A,(IX+TgX)
+    RRCA
+    RRCA
+    RRCA
+    AND $1F
+    LD E,A
+    LD D,0
+    LD B,8
+RPlp:
+    LD L,(IY)
+    LD H,(IY+1)
+    ADD HL,DE
+    EX AF,AF'
+    LD A,(HL)
+    AND C
+    LD (HL),A
+    EX AF,AF'
+    INC IY
+    INC IY
+    DJNZ RPlp
+    RET
+ORBar:
+    ; Draw a straight projectile. Any occupied destination pixel is a collision,
+    ; so the shot becomes an explosion and TestAndKill identifies the target.
+    XOR A
+    LD (ProjHit),A
+    LD A,(IX+TgX)
+    AND $07
+    LD HL,BitTable
+    LD E,A
+    LD D,0
+    ADD HL,DE
+    LD A,(HL)
+    LD C,A
+    LD A,(IX+TgY)
+    LD L,A
+    LD H,0
+    ADD HL,HL
+    LD DE,LineYs
+    ADD HL,DE
+    PUSH HL
+    POP IY
+    LD A,(IX+TgX)
+    RRCA
+    RRCA
+    RRCA
+    AND $1F
+    LD E,A
+    LD D,0
+    LD B,8
+PPlp:
+    LD L,(IY)
+    LD H,(IY+1)
+    ADD HL,DE
+    EX AF,AF'
+    LD A,(HL)
+    AND C
+    JR NZ,PPlp1
+    LD A,(HL)
+    OR C
+    LD (HL),A
+    EX AF,AF'
+    INC IY
+    INC IY
+    DJNZ PPlp
+    RET
+PPlp1:
+    CALL Explode
+    PUSH IX
+    CALL TestAndKill
+    POP IX
+    RET
+ProjHit:
+    NOP
+ZigCalc:
+    ; Select one of three 128-byte zigzag phases and calculate the screen byte
+    ; and row-address pointer shared by the zigzag draw/erase routines.
+    LD A,(IX+TgX)
+    SUB 4
+    AND $07
+    ADD A,A
+    ADD A,A
+    ADD A,A
+    ADD A,A
+    LD HL,ZigTable
+    LD E,A
+    LD D,0
+    LD A,(IX+TgMissCount)
+    OR A
+    JR Z,ZC1
+    LD HL,ZigTable+128
+    DEC A
+    JR Z,ZC1
+    LD HL,ZigTable+256
+ZC1:
+    ADD HL,DE
+    PUSH HL
+    LD A,(IX+TgY)
+    LD L,A
+    LD H,0
+    ADD HL,HL
+    LD DE,LineYs
+    ADD HL,DE
+    PUSH HL
+    POP IY
+    LD A,(IX+TgX)
+    SUB 4
+    RRCA
+    RRCA
+    RRCA
+    AND $1F
+    LD E,A
+    LD D,0
+    LD B,8
+    EXX
+    POP HL
+    EXX
+    RET
+ANDZig:
+    ; Erase an eight-row, two-byte-wide zigzag projectile.
+    CALL ZigCalc
+ZAlp:
+    LD L,(IY)
+    LD H,(IY+1)
+    ADD HL,DE
+    EX AF,AF'
+    EXX
+    LD A,(HL)
+    INC HL
+    EXX
+    CPL
+    AND (HL)
+    LD (HL),A
+    INC HL
+    EXX
+    LD A,(HL)
+    INC HL
+    EXX
+    CPL
+    AND (HL)
+    LD (HL),A
+    EX AF,AF'
+    INC IY
+    INC IY
+    DJNZ ZAlp
+    RET
+ORZig:
+    ; Draw the zigzag mask, branching to the normal collision handler when
+    ; either destination byte is already occupied.
+    CALL ZigCalc
+ZOlp:
+    LD L,(IY)
+    LD H,(IY+1)
+    ADD HL,DE
+    EX AF,AF'
+    EXX
+    LD A,(HL)
+    EXX
+    AND (HL)
+    JP NZ,PPlp1
+    EXX
+    LD A,(HL)
+    INC HL
+    EXX
+    OR (HL)
+    LD (HL),A
+    INC HL
+    EXX
+    LD A,(HL)
+    EXX
+    AND (HL)
+    JP NZ,PPlp1
+    EXX
+    LD A,(HL)
+    INC HL
+    EXX
+    OR (HL)
+    LD (HL),A
+    EX AF,AF'
+    INC IY
+    INC IY
+    DJNZ ZOlp
+    RET
+ZigTable:
+    ; Three animation phases. Each phase contains eight horizontal alignments;
+    ; each alignment is an 8-row by 2-byte mask (8 * 8 * 2 = 128 bytes).
+    DB $08,$00
+    DB $10,$00
+    DB $08,$00
+    DB $04,$00
+    DB $08,$00
+    DB $10,$00
+    DB $08,$00
+    DB $04,$00
+;0
+    DB $04,$00
+    DB $08,$00
+    DB $04,$00
+    DB $02,$00
+    DB $04,$00
+    DB $08,$00
+    DB $04,$00
+    DB $02,$00
+;1
+    DB $02,$00
+    DB $04,$00
+    DB $02,$00
+    DB $01,$00
+    DB $02,$00
+    DB $04,$00
+    DB $02,$00
+    DB $01,$00
+;2
+    DB $01,$00
+    DB $02,$00
+    DB $01,$00
+    DB $00,$80
+    DB $01,$00
+    DB $02,$00
+    DB $01,$00
+    DB $00,$80
+;3
+    DB $00,$80
+    DB $01,$00
+    DB $00,$80
+    DB $00,$40
+    DB $00,$80
+    DB $01,$00
+    DB $00,$80
+    DB $00,$40
+;4
+    DB $00,$40
+    DB $00,$80
+    DB $00,$40
+    DB $00,$20
+    DB $00,$40
+    DB $00,$80
+    DB $00,$40
+    DB $00,$20
+;5
+    DB $00,$20
+    DB $00,$40
+    DB $00,$20
+    DB $00,$10
+    DB $00,$20
+    DB $00,$40
+    DB $00,$20
+    DB $00,$10
+;6
+    DB $00,$10
+    DB $00,$20
+    DB $00,$10
+    DB $00,$08
+    DB $00,$10
+    DB $00,$20
+    DB $00,$10
+    DB $00,$08
+;7
+    DB $10,$00
+    DB $08,$00
+    DB $04,$00
+    DB $08,$00
+    DB $10,$00
+    DB $08,$00
+    DB $04,$00
+    DB $08,$00
+;0
+    DB $08,$00
+    DB $04,$00
+    DB $02,$00
+    DB $04,$00
+    DB $08,$00
+    DB $04,$00
+    DB $02,$00
+    DB $04,$00
+;1
+    DB $04,$00
+    DB $02,$00
+    DB $01,$00
+    DB $02,$00
+    DB $04,$00
+    DB $02,$00
+    DB $01,$00
+    DB $02,$00
+;2
+    DB $02,$00
+    DB $01,$00
+    DB $00,$80
+    DB $01,$00
+    DB $02,$00
+    DB $01,$00
+    DB $00,$80
+    DB $01,$00
+;3
+    DB $01,$00
+    DB $00,$80
+    DB $00,$40
+    DB $00,$80
+    DB $01,$00
+    DB $00,$80
+    DB $00,$40
+    DB $00,$80
+;4
+    DB $00,$80
+    DB $00,$40
+    DB $00,$20
+    DB $00,$40
+    DB $00,$80
+    DB $00,$40
+    DB $00,$20
+    DB $00,$40
+;5
+    DB $00,$40
+    DB $00,$20
+    DB $00,$10
+    DB $00,$20
+    DB $00,$40
+    DB $00,$20
+    DB $00,$10
+    DB $00,$20
+;6
+    DB $00,$20
+    DB $00,$10
+    DB $00,$08
+    DB $00,$10
+    DB $00,$20
+    DB $00,$10
+    DB $00,$08
+    DB $00,$10
+;7
+    DB $08,$00
+    DB $04,$00
+    DB $08,$00
+    DB $10,$00
+    DB $08,$00
+    DB $04,$00
+    DB $08,$00
+    DB $10,$00
+;0
+    DB $04,$00
+    DB $02,$00
+    DB $04,$00
+    DB $08,$00
+    DB $04,$00
+    DB $02,$00
+    DB $04,$00
+    DB $08,$00
+;1
+    DB $02,$00
+    DB $01,$00
+    DB $02,$00
+    DB $04,$00
+    DB $02,$00
+    DB $01,$00
+    DB $02,$00
+    DB $04,$00
+;2
+    DB $01,$00
+    DB $00,$80
+    DB $01,$00
+    DB $02,$00
+    DB $01,$00
+    DB $00,$80
+    DB $01,$00
+    DB $02,$00
+;3
+    DB $00,$80
+    DB $00,$40
+    DB $00,$80
+    DB $01,$00
+    DB $00,$80
+    DB $00,$40
+    DB $00,$80
+    DB $01,$00
+;4
+    DB $00,$40
+    DB $00,$20
+    DB $00,$40
+    DB $00,$80
+    DB $00,$40
+    DB $00,$20
+    DB $00,$40
+    DB $00,$80
+;5
+    DB $00,$20
+    DB $00,$10
+    DB $00,$20
+    DB $00,$40
+    DB $00,$20
+    DB $00,$10
+    DB $00,$20
+    DB $00,$40
+;6
+    DB $00,$10
+    DB $00,$08
+    DB $00,$10
+    DB $00,$20
+    DB $00,$10
+    DB $00,$08
+    DB $00,$10
+    DB $00,$20
+;7
 
-you_win_text:
-	DB "YOU WIN!",0
+RemoveProj:
+    ; Dispatch erasing by TgType: bit 7 = explosion, bit 0 = zigzag, otherwise
+    ; use the straight vertical bar.
+    LD A,(IX+TgType)
+    BIT 7,A
+    JR NZ,RemExpl
+    BIT 0,(IX+TgType)
+    JP NZ,ANDZig
+    JP ANDBar
+PlaceProj:
+    ; Matching draw dispatcher for explosions, zigzags, and straight shots.
+    LD A,(IX+TgType)
+    BIT 7,A
+    JR NZ,PlaceExpl
+    BIT 0,(IX+TgType)
+    JP NZ,ORZig
+    JP ORBar
+RemExpl:
+    ; TgType low bits select one of four explosion frames.
+    AND $3
+    LD HL,Expl1
+    OR A
+    JR Z,RE1
+    LD HL,Expl2
+    DEC A
+    JR Z,RE1
+    LD HL,Expl3
+    DEC A
+    JR Z,RE1
+    LD HL,Expl4
+RE1:
+    PUSH IX
+    CALL CalcExplAdd
+    CALL ANDIt
+    POP IX
+    RET
+PlaceExpl:
+    ; Count down TgAlive and choose a pseudo-random explosion frame.
+    DEC (IX+TgAlive)
+    RET Z
+    LD A,R
+    AND $3
+    LD (IX+TgType),A
+    SET  7,(IX+TgType)
+    LD HL,Expl1
+    OR A
+    JR Z,PE1
+    LD HL,Expl2
+    DEC A
+    JR Z,PE1
+    LD HL,Expl3
+    DEC A
+    JR Z,PE1
+    LD HL,Expl4
+PE1:
+    PUSH IX
+    CALL CalcExplAdd
+    CALL ORIt
+    POP IX
+    RET
+KillExpl:
+    LD (IX+TgAlive),0
+    RET
+CalcExplAdd:
+    ; Convert an explosion's X/Y position to a shifted sprite pointer in DE,
+    ; an X byte offset in A, and a screen-row table pointer in IX.
+    LD A,(IX+TgX)
+    SUB 8
+    AND $7
+    RRCA
+    RRCA
+    RRCA
+    LD E,A
+    LD D,0
+    ADD HL,DE
+    EX DE,HL
+    LD BC,LineYs
+    LD L,(IX+TgY)
+    LD H,0
+    ADD HL,HL
+    ADD HL,BC
+    PUSH HL
+    LD A,(IX+TgX)
+    SUB 8
+    RRCA
+    RRCA
+    RRCA
+    AND $1F
+    POP IX
+    RET
 
-restart_text:
-	DB "PRESS 0 TO PLAY AGAIN",0
+TestAndKill:
+    ; Resolve a projectile collision. Alien missiles test the player's base;
+    ; the player shot first tests the bonus ship, then scans all invaders.
+    LD A,(IX+TgMissInv)
+    OR A
+    JR NZ,HBase
+    LD L,(IX+TgX)
+    LD A,(IX+TgY)
+    CP 8
+    JP C,HShip
+    LD H,A
+    LD B,nInv
+    LD IY,InvTable
+TAKlp:
+    ; A live invader is hit when the projectile lies within its 9-by-16 pixel
+    ; collision box.
+    LD A,(IY+TgAlive)
+    OR A
+    JR Z,TAKlpx
+    LD A,(IY+TgX)
+    SUB L
+    JP P,TAK1
+    NEG
+TAK1:
+    CP 9
+    JR NC,TAKlpx
+    LD A,H
+    SUB (IY+TgY)
+    JR C,TAKlpx
+    CP 16
+    JR NC,TAKlpx
+             ; Found an invader: erase it and clear its live flag.
+    PUSH IY
+    POP IX
+    CALL ANDInv
+    LD (IY+TgAlive),0
+    RET
+TAKlpx:
+    LD DE,lInv
+    ADD IY,DE
+    DJNZ TAKlp
+    RET
+HBase:
+    ; Alien projectile reached the player's Y band. A horizontal overlap
+    ; restarts the game from its entry point.
+    LD A,(IX+TgY)
+    CP 191-13
+    RET C
+    LD A,(BaseX)
+    SUB (IX+TgX)
+    JP P,HB1
+    NEG
+HB1:
+    CP 14
+    RET NC
+    JP $8000
+HShip:
+    ; The bonus ship can only be hit while MoveShip is active (first byte NOP).
+    LD A,(MoveShip)
+    OR A
+    RET NZ
+    LD A,(ShipX)
+    SUB (IX+TgX)
+    JP P,HSp1
+    NEG
+HSp1:
+    CP 10
+    RET NC
+             ; Hit: erase and disable the bonus ship.
+    CALL ANDShip
+    LD A,$C9
+    LD (MoveShip),A
+    RET
+FireProjB:
+    ; Allocate the dedicated player-shot slot, if it is free.
+    LD IY,ProjTable
+    LD A,(IY+TgAlive)
+    OR A
+    JR Z,FPB
+    RET
+FireProj:
+    ; Allocate an alien-shot slot. Carry is returned set when all slots are busy.
+    PUSH DE ; D = Disp E = Y
+    PUSH BC ; B = Speed C = Type
+    CALL FPS
+    POP BC
+    POP DE
+    RET C
+FPB:
+    ; Initialize the slot selected in IY from the caller's B/C/D/E parameters.
+    LD (IY+TgSpeed),1
+    LD (IY+TgMissCount),0
+    LD (IY+TgSpeedI),B
+    LD (IY+TgType),C
+    LD A,(IX+TgX)
+    LD (IY+TgX),A
+    LD (IY+TgY),E
+    LD (IY+TgAlive),1
+    LD (IY+TgMissDisp),D
+    LD (IY+TgMissInv),0
+    OR A
+    RET
+FPS:
+    ; Search only the nProj alien slots; slot zero is reserved for the player.
+    LD IY,ProjTable+lInv
+    LD B,nProj
+    LD DE,lInv
+FPS1:
+    LD A,(IY+TgAlive)
+    OR A
+    RET Z
+    ADD IY,DE
+    DJNZ FPS1
+    SCF
+    RET
+BitTable:
+    ; Pixel masks for X coordinates within a screen byte.
+    DB $80,$40,$20,$10,$08,$04,$02,$01
+    DW 0,0,0,0,0,0,0,0,0,0,0,0
+    DW 0,0,0,0,0,0,0,0,0,0,0,0
+    DW 0,0,0,0,0,0,0,0,0,0,0,0
+LineYs:
+    ; Spectrum bitmap memory is interleaved rather than linear. This table maps
+    ; each pixel row to the address of its first screen byte. ShipYs, ShieldYs,
+    ; and BaseYs are aliases/pointers into the appropriate vertical regions.
+    DW $4000,$4100,$4200,$4300
+    ShipYs       EQU LineYs
+    DW $4400,$4500,$4600,$4700
+    DW $4020,$4120,$4220,$4320
+    DW $4420,$4520,$4620,$4720
+    DW $4040,$4140,$4240,$4340
+    DW $4440,$4540,$4640,$4740
+    DW $4060,$4160,$4260,$4360
+    DW $4460,$4560,$4660,$4760
+    DW $4080,$4180,$4280,$4380
+    DW $4480,$4580,$4680,$4780
+    DW $40A0,$41A0,$42A0,$43A0
+    DW $44A0,$45A0,$46A0,$47A0
+    DW $40C0,$41C0,$42C0,$43C0
+    DW $44C0,$45C0,$46C0,$47C0
+    DW $40E0,$41E0,$42E0,$43E0
+    DW $44E0,$45E0,$46E0,$47E0
+    DW $4800,$4900,$4A00,$4B00
+    DW $4C00,$4D00,$4E00,$4F00
+    DW $4820,$4920,$4A20,$4B20
+    DW $4C20,$4D20,$4E20,$4F20
+    DW $4840,$4940,$4A40,$4B40
+    DW $4C40,$4D40,$4E40,$4F40
+    DW $4860,$4960,$4A60,$4B60
+    DW $4C60,$4D60,$4E60,$4F60
+    DW $4880,$4980,$4A80,$4B80
+    DW $4C80,$4D80,$4E80,$4F80
+    DW $48A0,$49A0,$4AA0,$4BA0
+    DW $4CA0,$4DA0,$4EA0,$4FA0
+    DW $48C0,$49C0,$4AC0,$4BC0
+    DW $4CC0,$4DC0,$4EC0,$4FC0
+    DW $48E0,$49E0,$4AE0,$4BE0
+    DW $4CE0,$4DE0,$4EE0,$4FE0
+    DW $5000,$5100,$5200,$5300
+    DW $5400,$5500,$5600,$5700
+    DW $5020,$5120,$5220,$5320
+    DW $5420,$5520,$5620,$5720
+    DW $5040,$5140,$5240,$5340
+    DW $5440,$5540,$5640,$5740
+ShieldYs:
+    DW $5060,$5160,$5260,$5360
+    DW $5460,$5560,$5660,$5760
+    DW $5080,$5180,$5280,$5380
+    DW $5480,$5580,$5680,$5780
+    DW $50A0,$51A0,$52A0,$53A0
+    DW $54A0,$55A0,$56A0,$57A0
+    DW $50C0,$51C0,$52C0,$53C0
+    DW $54C0,$55C0,$56C0,$57C0
+BaseYs:
+    DW $50E0,$51E0,$52E0,$53E0
+    DW $54E0,$55E0,$56E0,$57E0
+    ; Padding keeps later sprite-address walks inside a harmless zero table.
+    DW 0,0,0,0,0,0,0,0,0,0,0,0
+    DW 0,0,0,0,0,0,0,0,0,0,0,0
+    DW 0,0,0,0,0,0,0,0,0,0,0,0
+    DW 0,0,0,0,0,0,0,0,0,0,0,0
+ShieldDefn:
+    ; One unshifted shield: 28 rows by 4 bytes. Shield copies are written
+    ; directly to the display and are destructible because shots alter pixels.
+    DB $00,$3F,$FC,$00
+    DB $01,$FF,$FF,$80
+    DB $03,$FF,$FF,$C0
+    DB $07,$FF,$FF,$E0
+    DB $0F,$FF,$FF,$F0
+    DB $1F,$FF,$FF,$F8
+    DB $3F,$FF,$FF,$FC
+    DB $7F,$FF,$FF,$FE
+    DB $FF,$FF,$FF,$FF
+    DB $FF,$FF,$FF,$FF
+    DB $FF,$FF,$FF,$FF
+    DB $FF,$FF,$FF,$FF
+    DB $FF,$FF,$FF,$FF
+    DB $FF,$FF,$FF,$FF
+    DB $FF,$FF,$FF,$FF
+    DB $FF,$FF,$FF,$FF
+    DB $FF,$FF,$FF,$FF
+    DB $FF,$FF,$FF,$FF
+    DB $FF,$FF,$FF,$FF
+    DB $FF,$FF,$FF,$FF
+    DB $FF,$FF,$FF,$FF
+    DB $FF,$E0,$07,$FF
+    DB $FF,$80,$01,$FF
+    DB $FF,$00,$00,$FF
+    DB $FE,$00,$00,$7F
+    DB $FC,$00,$00,$3F
+    DB $F8,$00,$00,$1F
+    DB $F0,$00,$00,$0F
+BaseDef1:
+    ; Unshifted 8-row player base. InitBaseSh expands this to eight alignments.
+    DB $00,$08,$00,$00
+    DB $00,$08,$00,$00
+    DB $00,$08,$00,$00
+    DB $00,$7F,$00,$00
+    DB $0F,$FF,$F8,$00
+    DB $1F,$FF,$FC,$00
+    DB $1F,$FF,$FC,$00
+    DB $1F,$FF,$FC,$00
+InvDef0:
+    ; Six unshifted invader frames, 11 rows by 4 bytes. Adjacent pairs form the
+    ; two animation poses for each of the three invader row styles.
+    DB $00,$08,$00,$00
+    DB $00,$1C,$00,$00
+    DB $00,$3E,$00,$00
+    DB $00,$7F,$00,$00
+    DB $00,$C9,$80,$00
+    DB $00,$C9,$80,$00
+    DB $00,$FF,$80,$00
+    DB $00,$FF,$80,$00
+    DB $00,$2A,$00,$00
+    DB $00,$41,$00,$00
+    DB $00,$22,$00,$00
+;Inv1
+    DB $00,$08,$00,$00
+    DB $00,$1C,$00,$00
+    DB $00,$3E,$00,$00
+    DB $00,$7F,$00,$00
+    DB $00,$C9,$80,$00
+    DB $00,$C9,$80,$00
+    DB $00,$FF,$80,$00
+    DB $00,$FF,$80,$00
+    DB $00,$14,$00,$00
+    DB $00,$2A,$00,$00
+    DB $00,$55,$00,$00
+;Inv2
+    DB $00,$63,$00,$00
+    DB $00,$14,$00,$00
+    DB $00,$3E,$00,$00
+    DB $00,$7F,$00,$00
+    DB $00,$C9,$80,$00
+    DB $01,$C9,$C0,$00
+    DB $02,$FF,$A0,$00
+    DB $02,$FF,$A0,$00
+    DB $02,$E3,$A0,$00
+    DB $00,$80,$80,$00
+    DB $00,$63,$00,$00
+;Inv3
+    DB $00,$63,$00,$00
+    DB $00,$14,$00,$00
+    DB $02,$3E,$20,$00
+    DB $02,$7F,$20,$00
+    DB $02,$C9,$A0,$00
+    DB $01,$C9,$C0,$00
+    DB $00,$FF,$80,$00
+    DB $00,$FF,$80,$00
+    DB $00,$E3,$80,$00
+    DB $00,$80,$80,$00
+    DB $01,$00,$C0,$00
+;Inv4
+    DB $00,$3E,$00,$00
+    DB $01,$FF,$C0,$00
+    DB $03,$FF,$E0,$00
+    DB $03,$08,$60,$00
+    DB $03,$08,$60,$00
+    DB $03,$FF,$E0,$00
+    DB $03,$F7,$E0,$00
+    DB $03,$E3,$E0,$00
+    DB $00,$DD,$80,$00
+    DB $01,$80,$C0,$00
+    DB $00,$E3,$80,$00
+;Inv5
+    DB $00,$3E,$00,$00
+    DB $01,$FF,$C0,$00
+    DB $03,$FF,$E0,$00
+    DB $03,$08,$60,$00
+    DB $03,$08,$60,$00
+    DB $03,$FF,$E0,$00
+    DB $03,$F7,$E0,$00
+    DB $03,$E3,$E0,$00
+    DB $00,$DD,$80,$00
+    DB $01,$80,$C0,$00
+    DB $03,$00,$60,$00
+ExplDefn1:
+    ; Four 8-row explosion frames stored consecutively.
+    DB $00,$80,$00,$00
+    DB $01,$40,$00,$00
+    DB $02,$C0,$00,$00
+    DB $05,$E0,$00,$00
+    DB $03,$A8,$00,$00
+    DB $02,$40,$00,$00
+    DB $01,$C0,$00,$00
+    DB $00,$80,$00,$00
+    DB $00,$80,$00,$00 ;expl 2
+    DB $02,$A0,$00,$00
+    DB $04,$88,$00,$00
+    DB $05,$96,$00,$00
+    DB $09,$DC,$00,$00
+    DB $04,$A0,$00,$00
+    DB $03,$B0,$00,$00
+    DB $00,$80,$00,$00
+    DB $00,$80,$00,$00 ;expl 3
+    DB $01,$D8,$00,$00
+    DB $05,$74,$00,$00
+    DB $0A,$78,$00,$00
+    DB $03,$E4,$00,$00
+    DB $09,$58,$00,$00
+    DB $05,$E0,$00,$00
+    DB $00,$80,$00,$00
+    DB $00,$80,$00,$00 ;expl 4
+    DB $02,$40,$00,$00
+    DB $05,$10,$00,$00
+    DB $02,$20,$00,$00
+    DB $03,$10,$00,$00
+    DB $01,$50,$00,$00
+    DB $01,$20,$00,$00
+    DB $00,$80,$00,$00
+ShipDefn:
+    ; Unshifted 10-row bonus-ship graphic.
+    DB $00,$00,$00,$00
+    DB $00,$00,$00,$00
+    DB $00,$08,$00,$00
+    DB $00,$FF,$80,$00
+    DB $1F,$FF,$FC,$00
+    DB $6A,$AA,$AB,$00
+    DB $1F,$FF,$FC,$00
+    DB $00,$FF,$80,$00
+    DB $00,$08,$00,$00
+    DB $00,$00,$00,$00
 
-player_x:
-	DB 15
-lives:
-	DB 3
-score:
-	DB 0
-game_state:
-	DB 0
-player_delay:
-	DB 0
-laser_active:
-	DB 0
-laser_x:
-	DB 0
-laser_y:
-	DB 0
-laser_delay:
-	DB 0
-bomb_active:
-	DB 0
-bomb_x:
-	DB 0
-bomb_y:
-	DB 0
-bomb_delay:
-	DB 0
-bomb_timer:
-	DB 35
-bomb_column:
-	DB 0
-swarm_x:
-	DB 2
-swarm_y:
-	DB 4
-swarm_dir:
-	DB 1
-swarm_paint:
-	DB 0
-move_timer:
-	DB 10
-remaining:
-	DB 18
-row_char:
-	DB INVADER_TOP
-animation_frame:
-	DB 0
-base_hit:
-	DB 0
-collision_x:
-	DB 0
-draw_char:
-	DB 0
-draw_row:
-	DB 0
-draw_column:
-	DB 0
-draw_attribute:
-	DB 047h
-sound_phase:
-	DB 0
-
-invaders:
-	; Row-major alive flags: top six, middle six, then bottom six.
-	DB 1,1,1,1,1,1
-	DB 1,1,1,1,1,1
-	DB 1,1,1,1,1,1
-
-bases:
-	; Row-major shield flags: four groups of three cells.
-	DB 1,1,1,1,1,1
-	DB 1,1,1,1,1,1
-
-; Top pixel address of each of the Spectrum's 24 character rows. Spectrum bitmap
-; scanlines are interleaved, so print_at uses this table before stepping H.
-screen_rows:
-	DW 04000h,04020h,04040h,04060h,04080h,040A0h,040C0h,040E0h
-	DW 04800h,04820h,04840h,04860h,04880h,048A0h,048C0h,048E0h
-	DW 05000h,05020h,05040h,05060h,05080h,050A0h,050C0h,050E0h
-; Eleven 8x8 UDG bitmaps, mapped to character codes 144 through 154:
-; three primary aliens, player, laser, bomb, explosion, three alternate aliens,
-; and one shield-base cell.
-udg_data:
-	DB 018h,03Ch,07Eh,0DBh,0FFh,024h,05Ah,0A5h
-	DB 018h,07Eh,0DBh,0FFh,03Ch,066h,0C3h,042h
-	DB 03Ch,07Eh,0FFh,0DBh,07Eh,024h,042h,081h
-	DB 018h,03Ch,07Eh,0FFh,0FFh,07Eh,024h,024h
-	DB 018h,018h,018h,018h,018h,018h,018h,018h
-	DB 024h,018h,024h,018h,024h,018h,024h,018h
-	DB 081h,042h,024h,018h,018h,024h,042h,081h
-	DB 018h,03Ch,07Eh,0DBh,0FFh,042h,024h,05Ah
-	DB 018h,07Eh,0DBh,0FFh,03Ch,0C3h,066h,024h
-	DB 03Ch,07Eh,0FFh,0DBh,07Eh,042h,024h,081h
-	DB 03Ch,07Eh,0FFh,0FFh,0FFh,0E7h,0C3h,0C3h
+BaseDefn:
+    ; Runtime-generated, horizontally shifted sprite data. These buffers are
+    ; filled during InitGame and are deliberately part of the assembled image.
+    DS 256
+InvShapes:
+    DS 352 * 6
+Expl1:
+    DS 256
+Expl2:
+    DS 256
+Expl3:
+    DS 256
+Expl4:
+    DS 256
+Ship1:
+    DS 256
+    ; Address immediately after the program and generated-data buffers.
+    ENDY EQU $

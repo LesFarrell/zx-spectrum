@@ -2116,8 +2116,8 @@ static bool app_load_tape_file(
     AppTapeLoadJob *job;
     HANDLE thread_handle;
 
-    if (app->tape_load_in_progress) {
-        snprintf(error_buffer, error_buffer_size, "A tape is already loading.");
+    if (app->tape_load_in_progress || app->snapshot_load_in_progress) {
+        snprintf(error_buffer, error_buffer_size, "A tape or snapshot is already loading.");
         return false;
     }
 
@@ -2433,8 +2433,8 @@ static bool app_load_snapshot_file(
     AppSnapshotLoadJob *job;
     HANDLE thread_handle;
 
-    if (app->snapshot_load_in_progress) {
-        snprintf(error_buffer, error_buffer_size, "A snapshot is already loading.");
+    if (app->snapshot_load_in_progress || app->tape_load_in_progress) {
+        snprintf(error_buffer, error_buffer_size, "A tape or snapshot is already loading.");
         return false;
     }
 
@@ -2564,10 +2564,6 @@ static bool app_apply_loaded_tape(
         ? SPECTRUM_MODEL_128K
         : app->spec.model;
 
-    tape_discard(&app->tape);
-    app->tape = *loaded_tape;
-    app_stop_tape(app);
-
     if (app->tape_autoload_enabled) {
         if (!assume_128k) {
             if (autoload_target == TAPE_AUTOLOAD_TARGET_128_MENU) {
@@ -2579,9 +2575,6 @@ static bool app_apply_loaded_tape(
             }
         }
 
-        app_autotype_clear(app);
-        app_release_all_keys(app);
-        app_audio_flush(app);
         if (autoload_model != app->spec.model) {
             const RomSet *set = app_rom_set_for_model_const(&app->roms, autoload_model);
             if (!app_load_model_roms(app, autoload_model, set, error_buffer, error_buffer_size)) {
@@ -2591,6 +2584,18 @@ static bool app_apply_loaded_tape(
             app_update_model_menu(hwnd, app->spec.model);
             app_update_microdrive_menu(hwnd, app);
         }
+    }
+
+    /* Take ownership only after every operation which can fail has succeeded. */
+    tape_discard(&app->tape);
+    app->tape = *loaded_tape;
+    tape_init(loaded_tape);
+    app_stop_tape(app);
+
+    if (app->tape_autoload_enabled) {
+        app_autotype_clear(app);
+        app_release_all_keys(app);
+        app_audio_flush(app);
         spectrum_reset(&app->spec);
         app_sync_tape_stop_mode(app);
         tape_rewind(&app->tape, (uint32_t)app->spec.machine.freq_hz);
@@ -3334,10 +3339,8 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                                    job->assume_128k,
                                    job->error,
                                    sizeof(job->error))) {
-                        tape_init(&job->tape);
                         app_show_error(job->error);
                     } else {
-                        tape_init(&job->tape);
                         app_add_recent_media(app, job->path);
                         app_rewind_clear(app);
                     }
