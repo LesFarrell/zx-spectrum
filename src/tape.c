@@ -18,6 +18,7 @@ enum {
     TAPE_TZX_HEADER_SIZE = 10,
     TAPE_TZX_LOOP_DEPTH = 16,
     TAPE_TZX_MAX_BLOCK_EXECUTIONS = 1000000,
+    TAPE_TZX_MAX_GENERALIZED_SYMBOLS = 4000000,
     TAPE_PILOT_PULSE_TICKS = 2168,
     TAPE_SYNC1_PULSE_TICKS = 667,
     TAPE_SYNC2_PULSE_TICKS = 735,
@@ -1062,6 +1063,7 @@ static bool tape_append_generalized_data(
     size_t offset = 14;
     size_t pilot_definition_size;
     size_t data_definition_size;
+    size_t symbols_appended = 0;
 
     if (payload_length < 14) {
         return false;
@@ -1088,12 +1090,17 @@ static bool tape_append_generalized_data(
             const uint8_t symbol = payload[offset];
             const uint16_t repetitions = tape_read_u16(&payload[offset + 1u]);
             if (symbol >= pilot_alphabet_size) return false;
+            /* Cap each record's repetitions (and the running block total) so a
+               crafted alphabet with tiny records cannot force billions of
+               symbol appends as a CPU/memory denial of service. */
+            if (repetitions > TAPE_TZX_MAX_GENERALIZED_SYMBOLS - symbols_appended) return false;
             for (uint16_t repeat = 0; repeat < repetitions; ++repeat) {
                 if (!tape_append_generalized_symbol(
                         builder,
                         &definitions[(size_t)symbol * pilot_definition_size],
                         pilot_pulses)) return false;
             }
+            symbols_appended += repetitions;
             offset += 3;
         }
     }
@@ -1120,10 +1127,12 @@ static bool tape_append_generalized_data(
                 bit_offset++;
             }
             if (symbol >= data_alphabet_size ||
+                symbols_appended >= TAPE_TZX_MAX_GENERALIZED_SYMBOLS ||
                 !tape_append_generalized_symbol(
                     builder,
                     &definitions[(size_t)symbol * data_definition_size],
                     data_pulses)) return false;
+            symbols_appended++;
         }
         offset += (size_t)stream_bytes;
     }
@@ -1159,6 +1168,13 @@ static bool tape_parse_tzx(
 
     if (size < TAPE_TZX_HEADER_SIZE || memcmp(data, "ZXTape!\x1A", 8) != 0) {
         tape_set_error(error_buffer, error_buffer_size, "Invalid TZX header", path);
+        return false;
+    }
+
+    /* Byte 8 is the TZX major version; only 1.x files are understood and a
+       newer revision would be silently mis-parsed, so reject it clearly. */
+    if (data[8] > 1) {
+        tape_set_error(error_buffer, error_buffer_size, "Unsupported TZX major version", path);
         return false;
     }
 
@@ -1619,7 +1635,7 @@ bool tape_load_file_with_options(
 ) {
     FILE *file;
     uint8_t *data = NULL;
-    long file_size;
+    int64_t file_size;
     bool ok = false;
     const char *extension;
 
@@ -1638,7 +1654,7 @@ bool tape_load_file_with_options(
         tape_set_error(error_buffer, error_buffer_size, "Could not size tape file", path);
         return false;
     }
-    file_size = ftell(file);
+    file_size = _ftelli64(file);
     if (file_size <= 0) {
         fclose(file);
         tape_set_error(error_buffer, error_buffer_size, "Tape file is empty", path);

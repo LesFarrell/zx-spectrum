@@ -543,10 +543,22 @@ static bool app_parse_equ_definition(
         }
         return false;
     }
-    if (app_read_operand_strict(&operand_cursor, directive, sizeof(directive), error_buffer, error_buffer_size) > 0)
     {
-        snprintf(error_buffer, error_buffer_size, "EQU expects 1 operand.");
-        return false;
+        const int extra_result = app_read_operand_strict(
+            &operand_cursor,
+            directive,
+            sizeof(directive),
+            error_buffer,
+            error_buffer_size);
+        if (extra_result > 0)
+        {
+            snprintf(error_buffer, error_buffer_size, "EQU expects 1 operand.");
+            return false;
+        }
+        if (extra_result < 0)
+        {
+            return false;
+        }
     }
     if (!app_parse_value(ctx, operand, &value))
     {
@@ -662,6 +674,15 @@ static bool app_assembler_find_source_org(const char *source, uint16_t *out_addr
         }
         while (app_parse_leading_label(&text, label, sizeof(label)))
         {
+            char label_error[256];
+
+            /* Register the stripped label just like pass 1 does so a later
+               `NAME EQU earlierLabel` on the ORG scan can resolve it. */
+            if (!app_define_label(&ctx, label, ctx.address, label_error, sizeof(label_error)))
+            {
+                free(mutable_source);
+                return false;
+            }
             text = app_trim_inplace(text);
             if (*text == '\0')
             {
@@ -787,7 +808,39 @@ static bool app_parse_value(
         memcpy(atom, start, atom_length);
         atom[atom_length] = '\0';
 
-        if (app_parse_number(atom, &numeric_value))
+        const bool is_number = app_parse_number(atom, &numeric_value);
+        const bool is_symbol = app_is_symbol_name(atom);
+
+        if (is_symbol)
+        {
+            constant_index = app_find_constant_index(ctx, atom);
+            label_index = app_find_label_index(ctx, atom);
+            if (constant_index >= 0 || label_index >= 0)
+            {
+                atom_value.value = constant_index >= 0
+                    ? ctx->constants[constant_index].value
+                    : ctx->labels[label_index].address;
+                atom_value.resolved = true;
+                atom_value.numeric_literal = false;
+            }
+            else if (ctx->pass == 1)
+            {
+                /* A name that is not defined yet is an unresolved forward
+                   reference (estimated at zero) rather than a hex/binary
+                   constant, so a genuinely undefined symbol such as `BADH`
+                   cannot silently assemble as 0xBAD. */
+                atom_value.value = 0;
+                atom_value.resolved = false;
+                atom_value.numeric_literal = false;
+            }
+            else
+            {
+                /* Still undefined on the final pass: fail the assembly so the
+                   user gets a diagnostic instead of a wrong constant. */
+                return false;
+            }
+        }
+        else if (is_number)
         {
             atom_value.value = numeric_value;
             atom_value.resolved = true;
@@ -801,32 +854,7 @@ static bool app_parse_value(
         }
         else
         {
-            if (!app_is_symbol_name(atom))
-            {
-                return false;
-            }
-            constant_index = app_find_constant_index(ctx, atom);
-            label_index = app_find_label_index(ctx, atom);
-            if (constant_index >= 0)
-            {
-                atom_value.value = ctx->constants[constant_index].value;
-                atom_value.resolved = true;
-            }
-            else if (label_index >= 0)
-            {
-                atom_value.value = ctx->labels[label_index].address;
-                atom_value.resolved = true;
-            }
-            else if (ctx->pass == 1)
-            {
-                atom_value.value = 0;
-                atom_value.resolved = false;
-            }
-            else
-            {
-                return false;
-            }
-            atom_value.numeric_literal = false;
+            return false;
         }
         if (value_count >= sizeof(values) / sizeof(values[0]))
         {

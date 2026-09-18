@@ -40,14 +40,14 @@ static bool microdrive_read_file(
 {
     FILE *file;
     uint8_t *data;
-    long file_size;
+    int64_t file_size;
 
     file = fopen(path, "rb");
     if (file == NULL) {
         snprintf(error_buffer, error_buffer_size, "Could not open Microdrive cartridge: %s", path);
         return false;
     }
-    if (fseek(file, 0, SEEK_END) != 0 || (file_size = ftell(file)) < 0) {
+    if (fseek(file, 0, SEEK_END) != 0 || (file_size = _ftelli64(file)) < 0) {
         fclose(file);
         snprintf(error_buffer, error_buffer_size, "Could not determine Microdrive cartridge size: %s", path);
         return false;

@@ -263,7 +263,7 @@ bool dsk_load_file(
 {
     FILE *file;
     uint8_t *data;
-    long file_size;
+    int64_t file_size;
     bool loaded;
 
     if (path == NULL || path[0] == '\0') {
@@ -275,12 +275,12 @@ bool dsk_load_file(
         snprintf(error_buffer, error_buffer_size, "Could not open DSK image: %s", path);
         return false;
     }
-    if (fseek(file, 0, SEEK_END) != 0 || (file_size = ftell(file)) <= 0) {
+    if (fseek(file, 0, SEEK_END) != 0 || (file_size = _ftelli64(file)) <= 0) {
         fclose(file);
         snprintf(error_buffer, error_buffer_size, "Could not determine DSK image size: %s", path);
         return false;
     }
-    if ((unsigned long)file_size > DSK_MAX_IMAGE_SIZE) {
+    if (file_size > (int64_t)DSK_MAX_IMAGE_SIZE) {
         fclose(file);
         snprintf(error_buffer, error_buffer_size, "DSK image exceeds the 64 MB safety limit: %s", path);
         return false;

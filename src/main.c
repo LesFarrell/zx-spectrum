@@ -2027,6 +2027,50 @@ static int app_tzx_select_callback(
     return request.selection;
 }
 
+/* Single completion path for a tape load job: hands ownership of the job to
+   the UI thread message queue or, when the window is already gone and no
+   handler can ever run, finalizes the job here. The completion handler frees
+   the job and clears the in-flight flag in every handled case. */
+static bool app_post_tape_load_complete(AppTapeLoadJob *job) {
+    if (PostMessageA(job->hwnd, APP_MSG_TAPE_LOAD_COMPLETE, 0, (LPARAM)job)) {
+        return true;
+    }
+    /* The window was destroyed before the worker finished: the message queue
+       is gone, so free the job here. tape_discard is idempotent, so this is
+       safe whether or not a failed load already discarded the media. */
+    tape_discard(&job->tape);
+    free(job);
+    return false;
+}
+
+/* Single completion path for a snapshot load job, mirroring the tape worker.
+   On a failed load the worker has already freed the decoded buffer. */
+static bool app_post_snapshot_load_complete(AppSnapshotLoadJob *job) {
+    if (PostMessageA(job->hwnd, APP_MSG_SNAPSHOT_LOAD_COMPLETE, 0, (LPARAM)job)) {
+        return true;
+    }
+    free(job->data);
+    free(job);
+    return false;
+}
+
+/* Drains pending tape/snapshot load completion messages so their handlers can
+   free the jobs and clear the in-flight flags, then clears both flags for any
+   worker that could not post its completion. Must run on the UI thread while
+   the main window is still alive or the handlers cannot be dispatched. */
+static void app_drain_load_completions(AppState *app) {
+    MSG drain_msg;
+    while (PeekMessageA(&drain_msg, NULL, 0, 0, PM_REMOVE)) {
+        if (drain_msg.message == APP_MSG_TAPE_LOAD_COMPLETE ||
+            drain_msg.message == APP_MSG_SNAPSHOT_LOAD_COMPLETE) {
+            TranslateMessage(&drain_msg);
+            DispatchMessageA(&drain_msg);
+        }
+    }
+    app->tape_load_in_progress = false;
+    app->snapshot_load_in_progress = false;
+}
+
 /* Runs tape file I/O and decode work away from the window thread so opening
    larger TAP/TZX files does not stall input or trigger the busy cursor. */
 static DWORD WINAPI app_tape_load_worker(void *param) {
@@ -2041,13 +2085,14 @@ static DWORD WINAPI app_tape_load_worker(void *param) {
         job->error,
         sizeof(job->error),
         &options
-    );
-    if (!PostMessageA(job->hwnd, APP_MSG_TAPE_LOAD_COMPLETE, 0, (LPARAM)job)) {
-        if (job->ok) {
-            tape_discard(&job->tape);
-        }
-        free(job);
+);
+    /* A failed load discards the decoded tape data here but keeps the job
+       struct (ok=false) alive so the completion handler that follows always
+       has an owner to free and an in-flight flag to clear. */
+    if (!job->ok) {
+        tape_discard(&job->tape);
     }
+    app_post_tape_load_complete(job);
     return 0;
 }
 
@@ -2096,10 +2141,13 @@ static DWORD WINAPI app_snapshot_load_worker(void *param) {
             job->ok = false;
         }
     }
-    if (!PostMessageA(job->hwnd, APP_MSG_SNAPSHOT_LOAD_COMPLETE, 0, (LPARAM)job)) {
+    /* Keep the job struct (ok=false) for the completion handler to free, but
+       drop the decoded buffer here on failure. */
+    if (!job->ok) {
         free(job->data);
-        free(job);
+        job->data = NULL;
     }
+    app_post_snapshot_load_complete(job);
     return 0;
 }
 
@@ -2127,20 +2175,23 @@ static bool app_load_tape_file(
         return false;
     }
 
-    job->hwnd = hwnd;
+job->hwnd = hwnd;
     job->tick_hz = (uint32_t)app->spec.machine.freq_hz;
     job->assume_128k = assume_128k;
     snprintf(job->path, sizeof(job->path), "%s", path);
 
+    /* Set the in-flight flag before the worker can run so a completion the
+       worker posts is always matched by a handler that clears the flag. */
+    app->tape_load_in_progress = true;
     thread_handle = CreateThread(NULL, 0, app_tape_load_worker, job, 0, NULL);
     if (thread_handle == NULL) {
+        app->tape_load_in_progress = false;
         free(job);
         snprintf(error_buffer, error_buffer_size, "Could not create tape loading thread.");
         return false;
     }
 
     CloseHandle(thread_handle);
-    app->tape_load_in_progress = true;
     return true;
 }
 
@@ -2443,18 +2494,21 @@ static bool app_load_snapshot_file(
         snprintf(error_buffer, error_buffer_size, "Out of memory while starting snapshot load.");
         return false;
     }
-    job->hwnd = hwnd;
+job->hwnd = hwnd;
     snprintf(job->path, sizeof(job->path), "%s", path);
 
+    /* Set the in-flight flag before the worker can run so a completion the
+       worker posts is always matched by a handler that clears the flag. */
+    app->snapshot_load_in_progress = true;
     thread_handle = CreateThread(NULL, 0, app_snapshot_load_worker, job, 0, NULL);
     if (thread_handle == NULL) {
+        app->snapshot_load_in_progress = false;
         free(job);
         snprintf(error_buffer, error_buffer_size, "Could not create snapshot loading thread.");
         return false;
     }
 
     CloseHandle(thread_handle);
-    app->snapshot_load_in_progress = true;
     return true;
 }
 
@@ -3055,15 +3109,28 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
             DragFinish(drop);
 
             if (app != NULL && path_ready) {
-                /* Treat drag-and-drop media as targeting a 128K Spectrum unless
-                   the media loader subsequently requires a specific model. */
-                app_switch_model(hwnd, app, SPECTRUM_MODEL_128K);
-                if (app->spec.model == SPECTRUM_MODEL_128K &&
+                const char *extension = strrchr(path, '.');
+                const bool wants_128k = extension != NULL &&
+                    (_stricmp(extension, ".tap") == 0 ||
+                     _stricmp(extension, ".tzx") == 0 ||
+                     _stricmp(extension, ".pzx") == 0 ||
+                     _stricmp(extension, ".z80") == 0 ||
+                     _stricmp(extension, ".sna") == 0 ||
+                     _stricmp(extension, ".szx") == 0);
+                bool can_load = true;
+                if (wants_128k) {
+                    /* Treat drag-and-drop tape/snapshot media as targeting a
+                       128K Spectrum unless the media loader subsequently
+                       requires a specific model. */
+                    app_switch_model(hwnd, app, SPECTRUM_MODEL_128K);
+                    can_load = app->spec.model == SPECTRUM_MODEL_128K;
+                }
+                if (can_load &&
                     !app_load_media_path(
                         hwnd,
                         app,
                         path,
-                        true,
+                        wants_128k,
                         error_buffer,
                         sizeof(error_buffer))) {
                     app_show_error(error_buffer);
@@ -3339,12 +3406,16 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                                    job->assume_128k,
                                    job->error,
                                    sizeof(job->error))) {
-                        app_show_error(job->error);
+app_show_error(job->error);
                     } else {
                         app_add_recent_media(app, job->path);
                         app_rewind_clear(app);
                     }
-                    tape_discard(&job->tape);
+                    /* The worker already discarded the media for a failed
+                       load; only the success path discards here. */
+                    if (job->ok) {
+                        tape_discard(&job->tape);
+                    }
                     free(job);
                 }
                 return 0;
@@ -3358,12 +3429,16 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                     if (!job->ok) {
                         app_show_error(job->error);
                     } else if (!app_apply_loaded_snapshot(hwnd, app, job, job->error, sizeof(job->error))) {
-                        app_show_error(job->error);
+app_show_error(job->error);
                     } else {
                         app_add_recent_media(app, job->path);
                         app_rewind_clear(app);
                     }
-                    free(job->data);
+                    /* The worker already freed the buffer for a failed load;
+                       only the success path frees it here. */
+                    if (job->ok) {
+                        free(job->data);
+                    }
                     free(job);
                 }
                 return 0;
@@ -3944,11 +4019,18 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
             if (app != NULL) {
                 app_video_backbuffer_discard(app);
                 app_set_modal_loop_timer(app, hwnd, false);
+                /* Drain completion messages while the window is still alive so
+                   the handlers free their jobs and clear the in-flight flags
+                   before the queue dies with the teardown. */
+                app_drain_load_completions(app);
                 if (app->debug.debugger_hwnd != NULL) {
                     DestroyWindow(app->debug.debugger_hwnd);
                 }
                 if (app->debug.assembler_hwnd != NULL) {
                     DestroyWindow(app->debug.assembler_hwnd);
+                }
+                if (app->debug.poke_hwnd != NULL) {
+                    DestroyWindow(app->debug.poke_hwnd);
                 }
                 app->running = false;
             }
@@ -4028,6 +4110,20 @@ static void app_print_usage(void) {
     fprintf(stderr, "\nAutodetects ROM images in the roms folder.\n");
 }
 
+/* Copies the module file path only when it fits the buffer without
+   truncation. GetModuleFileNameA leaves the buffer unterminated when it
+   truncates, so a full-length return must be rejected before the string is
+   used. */
+static bool app_get_module_file_name(char *out, size_t out_size) {
+    DWORD length;
+
+    if (out == NULL || out_size == 0 || out_size > (size_t)MAX_PATH) {
+        return false;
+    }
+    length = GetModuleFileNameA(NULL, out, (DWORD)out_size);
+    return length > 0 && length < (DWORD)out_size;
+}
+
 /* Resolves the persisted settings file path, preferring `%APPDATA%` so the
    user's selected model survives rebuilds and different working folders. */
 static bool app_settings_path(char *out_path, size_t out_size) {
@@ -4038,7 +4134,7 @@ static bool app_settings_path(char *out_path, size_t out_size) {
         return written > 0 && (size_t)written < out_size;
     }
 
-    if (GetModuleFileNameA(NULL, appdata, MAX_PATH) == 0 || appdata[0] == '\0') {
+    if (!app_get_module_file_name(appdata, sizeof(appdata))) {
         return false;
     }
     if (!app_parent_dir(appdata)) {
@@ -4409,7 +4505,7 @@ static bool app_find_rom(char *out_path, size_t out_size, const char *filename) 
         return true;
     }
 
-    if (GetModuleFileNameA(NULL, module_path, MAX_PATH) == 0 || module_path[0] == '\0') {
+    if (!app_get_module_file_name(module_path, sizeof(module_path))) {
         return false;
     }
 
@@ -4762,7 +4858,7 @@ static bool app_read_file_all(
 ) {
     FILE *file = fopen(path, "rb");
     uint8_t *data = NULL;
-    long file_size;
+    int64_t file_size;
 
     if (file == NULL) {
         snprintf(error_buffer, error_buffer_size, "Could not read %s file: %s", kind, path);
@@ -4773,7 +4869,7 @@ static bool app_read_file_all(
         snprintf(error_buffer, error_buffer_size, "Could not size %s file: %s", kind, path);
         return false;
     }
-    file_size = ftell(file);
+    file_size = _ftelli64(file);
     if (file_size <= 0) {
         fclose(file);
         snprintf(error_buffer, error_buffer_size, "%s file is empty: %s", kind, path);
@@ -5155,7 +5251,21 @@ int main(int argc, char **argv) {
         app_tick_emulator(&app);
         /* Yield to Windows between timing slices, but wake immediately when
            input or window work arrives instead of polling at full speed. */
-        MsgWaitForMultipleObjectsEx(0, NULL, 2, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+MsgWaitForMultipleObjectsEx(0, NULL, 2, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+    }
+
+    /* A tape/snapshot worker may have posted a completion message without the
+       handler running yet. Drain remaining completion messages and clear any
+       in-flight flags a worker that could not post left set, so a load cannot
+       wedge a later launch path. The WM_DESTROY drain already ran the handlers
+       while the window was alive; this is the belt-and-braces pass. */
+    app_drain_load_completions(&app);
+
+    /* The menu bar is normally destroyed with the window, but destroy it here
+       too if it is still alive so the handle never leaks at exit. */
+    if (app.main_menu != NULL && IsMenu(app.main_menu)) {
+        DestroyMenu(app.main_menu);
+        app.main_menu = NULL;
     }
 
     app_controller_shutdown(&app);

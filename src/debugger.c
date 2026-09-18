@@ -227,6 +227,20 @@ static void app_debug_decode_instruction(
                 *instruction_length = 4;
                 snprintf(out, out_size, "LD %s,(%04Xh)", index_reg, app_debug_mem_rd16(spec, (uint16_t)(addr + 2)));
                 return;
+            case 0xCB: {
+                const uint8_t cb_op = app_debug_mem_rd(spec, (uint16_t)(addr + 3));
+                const int8_t cb_disp = (int8_t)app_debug_mem_rd(spec, (uint16_t)(addr + 2));
+                const uint8_t cb_x = cb_op >> 6;
+                const uint8_t cb_bit = (cb_op >> 3) & 7;
+                *instruction_length = 4;
+                if (cb_x == 1 || cb_x == 2 || cb_x == 3) {
+                    const char *cb_name = (cb_x == 1) ? "BIT" : (cb_x == 2) ? "RES" : "SET";
+                    snprintf(out, out_size, "%s %u,(%s%+d)", cb_name, cb_bit, index_reg, (int)cb_disp);
+                } else {
+                    snprintf(out, out_size, "DB %02Xh,%02Xh,%02Xh,%02Xh", op, next, (uint8_t)cb_disp, cb_op);
+                }
+                return;
+            }
             case 0x23:
                 snprintf(out, out_size, "INC %s", index_reg);
                 return;
@@ -267,9 +281,55 @@ static void app_debug_decode_instruction(
             case 0xF9:
                 snprintf(out, out_size, "LD SP,%s", index_reg);
                 return;
-            default:
+            default: {
+                /* Keep the byte count honest for the indexed class: the total
+                   length is the unpitched second-byte opcode's length plus the
+                   DD/FD prefix byte, plus a displacement byte whenever the op
+                   normally addresses (HL) and therefore becomes (IX/IY+d).
+                   LD r,n / ALU n / JR keep their immediate (3 bytes total);
+                   LD rr,nn / JP / CALL stay 4; 2-byte ops stay 2. */
+                const uint8_t nx = next >> 6;
+                const uint8_t ny = (next >> 3) & 7;
+                const uint8_t nz = next & 7;
+                uint8_t base_len = 1;
+                uint8_t disp = 0;
+                switch (nx) {
+                    case 0:
+                        if (nz == 0) {
+                            base_len = (ny >= 2) ? 2 : 1;
+                        } else if (nz == 1) {
+                            base_len = ((ny & 1) == 0) ? 3 : 1;
+                        } else if (nz == 2) {
+                            base_len = (ny >= 4) ? 3 : 1;
+                        } else if (nz == 6) {
+                            base_len = 2;
+                        }
+                        break;
+                    case 1:
+                        if ((nz == 6 && ny != 6) || (ny == 6 && nz != 6)) {
+                            disp = 1;
+                        }
+                        break;
+                    case 2:
+                        if (nz == 6) {
+                            disp = 1;
+                        }
+                        break;
+                    default:
+                        if (nz == 6) {
+                            base_len = 2;
+                        } else if (nz == 2 || nz == 4 || (nz == 3 && ny == 0) ||
+                                   (nz == 5 && ny == 1)) {
+                            base_len = 3;
+                        } else if (nz == 3 && (ny == 2 || ny == 3)) {
+                            base_len = 2;
+                        }
+                        break;
+                }
+                *instruction_length = (uint8_t)(1 + base_len + disp);
                 snprintf(out, out_size, "DB %02Xh,%02Xh", op, next);
                 return;
+            }
         }
     }
 
