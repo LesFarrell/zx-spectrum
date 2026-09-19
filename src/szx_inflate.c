@@ -53,9 +53,8 @@ static void szx_align_byte(SzxBitReader *reader)
 }
 
 /* Builds the canonical code tables in the reversed-bit ordering used by
-   DEFLATE. Incomplete and empty alphabets are valid (an all-zero distance
-   alphabet encodes "one distance code of zero bits"); oversubscribed trees
-   are not. */
+   DEFLATE. Incomplete alphabets are valid, as is an empty distance alphabet
+   for an all-literal block; oversubscribed trees are not. */
 static bool szx_build_huffman(SzxHuffman *table, const uint8_t *lengths, size_t count)
 {
     uint16_t offsets[SZX_INFLATE_MAX_BITS + 1] = {0};
@@ -99,10 +98,8 @@ static bool szx_build_huffman(SzxHuffman *table, const uint8_t *lengths, size_t 
     return true;
 }
 
-/* RFC 1951 3.2.6 permits "one distance code of zero bits": a distance
-   alphabet whose symbol lengths are all zero (an empty table). Such a
-   table must decode to a fixed distance of 1 without consuming any bits
-   from the stream. */
+/* RFC 1951 permits an empty distance alphabet only when the block contains
+   literals and an end marker, with no length/distance pairs. */
 static bool szx_huffman_is_empty(const SzxHuffman *table)
 {
     for (unsigned length = 1; length <= SZX_INFLATE_MAX_BITS; ++length)
@@ -285,10 +282,7 @@ static bool szx_expand_codes(
             length = length_base[length_index] + szx_read_bits(reader, length_extra[length_index]);
             if (szx_huffman_is_empty(distance_table))
             {
-                /* RFC 1951 3.2.6: an all-zero distance alphabet is the
-                   "one distance code of zero bits" case. No bits are read
-                   and the distance is fixed at 1. */
-                distance = 1;
+                return false;
             }
             else
             {
@@ -374,6 +368,10 @@ static bool szx_expand_deflate(
         {
             return false;
         }
+    }
+    if (reader.position != reader.size)
+    {
+        return false;
     }
     *actual_size = destination_position;
     return true;

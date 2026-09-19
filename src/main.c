@@ -347,6 +347,7 @@ typedef struct DebugState {
     bool debugger_run_to_hit;
     bool debugger_watchpoint_pending;
     bool debugger_skip_breakpoint_once;
+    bool debugger_step_left_boundary;
     uint16_t debugger_view_address;
     uint16_t last_breakpoint_address;
     uint16_t debugger_run_to_address;
@@ -616,6 +617,7 @@ static bool app_debug_remove_selected_point(AppState *app);
 static void app_debug_free_storage(AppState *app);
 static void app_debug_append_point_summary(char *buffer, size_t buffer_size, size_t *used, const AppState *app);
 static bool app_debug_is_step_over_candidate(const Spectrum *spec, uint16_t address);
+static void app_debug_pause(AppState *app);
 static void app_debug_resume(AppState *app);
 static void app_debug_step_over_instruction(AppState *app);
 static void app_debug_navigate_view(AppState *app, int delta);
@@ -2766,6 +2768,32 @@ static bool app_is_supported_media_name(const char *name) {
          _stricmp(extension, ".szx") == 0);
 }
 
+static void app_zip_entry_short_name(
+    char *output,
+    size_t output_size,
+    const char *name)
+{
+    const size_t name_length = strlen(name);
+    if (output_size == 0) {
+        return;
+    }
+    if (name_length < output_size) {
+        memcpy(output, name, name_length + 1);
+        return;
+    }
+    if (output_size <= 4) {
+        memcpy(output, name + name_length - (output_size - 1), output_size - 1);
+        output[output_size - 1] = '\0';
+        return;
+    }
+    memcpy(output, "...", 3);
+    memcpy(
+        output + 3,
+        name + name_length - (output_size - 4),
+        output_size - 4);
+    output[output_size - 1] = '\0';
+}
+
 static int app_choose_zip_entry(
     HWND hwnd,
     const ZipArchive *archive,
@@ -2789,13 +2817,15 @@ static int app_choose_zip_entry(
     AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
     for (size_t index = 0; index < match_count; ++index) {
         const char *name = archive->entries[matches[index]].name;
+        char short_name[ZIP_ENTRY_NAME_CAPACITY];
         char label[ZIP_ENTRY_NAME_CAPACITY * 2];
         size_t output = 0;
-        for (size_t input = 0; name[input] != '\0' && output + 2 < sizeof(label); ++input) {
-            if (name[input] == '&') {
+        app_zip_entry_short_name(short_name, sizeof(short_name), name);
+        for (size_t input = 0; short_name[input] != '\0' && output + 2 < sizeof(label); ++input) {
+            if (short_name[input] == '&') {
                 label[output++] = '&';
             }
-            label[output++] = name[input];
+            label[output++] = short_name[input];
         }
         label[output] = '\0';
         AppendMenuA(menu, MF_STRING, (UINT_PTR)(index + 1), label);
@@ -2874,7 +2904,10 @@ static bool app_load_zip_file(
         return false;
     }
     entry_index = matches[choice];
-    snprintf(entry_name, sizeof(entry_name), "%s", archive.entries[entry_index].name);
+    app_zip_entry_short_name(
+        entry_name,
+        sizeof(entry_name),
+        archive.entries[entry_index].name);
     free(matches);
     if (!zip_extract_entry(
             &archive,
@@ -4125,7 +4158,11 @@ app_show_error(job->error);
                         app_switch_model(hwnd, app, SPECTRUM_MODEL_PLUS3);
                         return 0;
                     case APP_MENU_MACHINE_PAUSE:
-                        app->debug.paused = !app->debug.paused;
+                        if (app->debug.paused) {
+                            app_debug_resume(app);
+                        } else {
+                            app_debug_pause(app);
+                        }
                         app->emulation_accumulator_ms = 0.0;
                         app_audio_flush(app);
                         QueryPerformanceCounter(&app->last_tick);

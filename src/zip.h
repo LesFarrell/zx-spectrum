@@ -11,7 +11,8 @@ enum {
 };
 
 typedef struct ZipEntry {
-    char name[ZIP_ENTRY_NAME_CAPACITY];
+    char *name;
+    size_t name_length;
     uint32_t crc32;
     uint32_t compressed_size;
     uint32_t uncompressed_size;

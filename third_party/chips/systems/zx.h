@@ -37,7 +37,6 @@
     TODO!
 
     ## TODO:
-    - 'contended memory' timing and IO port timing
     - reads from port 0xFF must return 'current VRAM bytes
     - video decoding only has scanline accuracy, not pixel accuracy
 
@@ -69,7 +68,7 @@ extern "C" {
 #endif
 
 // bump this whenever the zx_t struct layout changes
-#define ZX_SNAPSHOT_VERSION (0x0009)
+#define ZX_SNAPSHOT_VERSION (0x000A)
 
 #define ZX_MAX_AUDIO_SAMPLES (1024)      // max number of audio samples in internal sample buffer
 #define ZX_DEFAULT_AUDIO_SAMPLES (128)   // default number of samples in internal sample buffer
@@ -257,8 +256,8 @@ typedef struct {
         uint8_t value;
     } ulaplus_line_events[ZX_ULAPLUS_MAX_SCANLINE_EVENTS];
     uint8_t ulaplus_line_event_count;
-    bool ulaplus_io_cycle_active;
-    uint8_t ulaplus_io_wait_remaining;
+    bool contention_cycle_active;
+    uint8_t contention_wait_remaining;
     int frame_scan_lines;
     int top_border_scanlines;
     int scanline_period;
@@ -362,6 +361,8 @@ chips_display_info_t zx_display_info(zx_t* sys);
 uint32_t zx_display_color(const zx_t* sys, int y, uint8_t color_index);
 // run ZX Spectrum instance for a given number of microseconds, return number of ticks
 uint32_t zx_exec(zx_t* sys, uint32_t micro_seconds);
+// run ZX Spectrum instance for an exact number of CPU T-states
+uint32_t zx_exec_ticks(zx_t* sys, uint32_t num_ticks);
 // send a key-down event
 void zx_key_down(zx_t* sys, int key_code);
 // send a key-up event
@@ -416,7 +417,9 @@ bool zx_load_snapshot(zx_t* sys, uint32_t version, zx_t* src);
 
 static void _zx_init_memory_map(zx_t* sys);
 static void _zx_init_keyboard_matrix(zx_t* sys);
-static uint8_t _zx_contention_delay(zx_t* sys);
+static uint8_t _zx_contention_delay_at(const zx_t* sys, uint32_t tstate);
+static uint8_t _zx_contention_delay(const zx_t* sys);
+static uint8_t _zx_io_contention_delay(const zx_t* sys, uint16_t port);
 static void _zx_multiface_page(zx_t* sys);
 static bool _zx_is_contended_addr(zx_t* sys, uint16_t addr);
 static bool _zx_should_apply_memory_contention(zx_t* sys, uint64_t pins);
@@ -491,8 +494,6 @@ static void _zx_ulaplus_reset(zx_t* sys) {
     sys->ulaplus_register = 0;
     sys->ulaplus_mode = 0;
     sys->ulaplus_enabled = false;
-    sys->ulaplus_io_cycle_active = false;
-    sys->ulaplus_io_wait_remaining = 0;
     memcpy(
         sys->ulaplus_palette,
         _zx_ulaplus_default_palette,
@@ -697,6 +698,8 @@ void zx_reset(zx_t* sys) {
     sys->multiface_paged = false;
     sys->multiface_software_lockout = false;
     sys->multiface_nmi_ticks = 0;
+    sys->contention_cycle_active = false;
+    sys->contention_wait_remaining = 0;
     sys->scanline_counter = sys->scanline_period;
     sys->scanline_y = 0;
     sys->blink_counter = 0;
@@ -1790,41 +1793,96 @@ static void _zx_interface1_port_out(zx_t* sys, uint16_t port, uint8_t value) {
     }
 }
 
-/* Returns the current machine's active contention delay for the current
-   frame t-state, or zero when the ULA/gate array is not stealing the bus. */
-static uint8_t _zx_contention_delay(zx_t* sys) {
+/* Returns the contention delay at an arbitrary frame T-state. The +2A/+3
+   gate array has a different phase and a seven-state maximum delay. */
+static uint8_t _zx_contention_delay_at(const zx_t* sys, uint32_t tstate) {
     static const uint8_t ula_pattern[8] = { 6, 5, 4, 3, 2, 1, 0, 0 };
-    const uint32_t t = sys->frame_tstate;
+    static const uint8_t plus3_pattern[8] = { 1, 0, 7, 6, 5, 4, 3, 2 };
+    uint32_t start;
+    uint32_t line_period;
+    uint32_t active_tstates;
+    const uint8_t* pattern;
 
     if (sys->type == ZX_TYPE_48K) {
-        if (t >= 14335) {
-            const uint32_t rel = t - 14335;
-            if (rel < (192u * 224u)) {
-                const uint32_t line_pos = rel % 224u;
-                if (line_pos < 128u) {
-                    return ula_pattern[line_pos & 7u];
-                }
-            }
-        }
+        start = 14335u;
+        line_period = 224u;
+        active_tstates = 128u;
+        pattern = ula_pattern;
+    }
+    else if (sys->type == ZX_TYPE_128) {
+        start = 14361u;
+        line_period = 228u;
+        active_tstates = 128u;
+        pattern = ula_pattern;
+    }
+    else if (sys->type == ZX_TYPE_PLUS2A || sys->type == ZX_TYPE_PLUS3) {
+        start = 14361u;
+        line_period = 228u;
+        /* Accesses begin during 14361..14488; the final delay ends at 14490. */
+        active_tstates = 128u;
+        pattern = plus3_pattern;
+    }
+    else {
         return 0;
     }
 
-    if (sys->type == ZX_TYPE_128 ||
-        sys->type == ZX_TYPE_PLUS2A ||
-        sys->type == ZX_TYPE_PLUS3) {
-        if (t >= 14361) {
-            const uint32_t rel = t - 14361;
-            if (rel < (192u * 228u)) {
-                const uint32_t line_pos = rel % 228u;
-                if (line_pos < 128u) {
-                    return ula_pattern[line_pos & 7u];
-                }
+    if (tstate >= start) {
+        const uint32_t rel = tstate - start;
+        if (rel < (192u * line_period)) {
+            const uint32_t line_pos = rel % line_period;
+            if (line_pos < active_tstates) {
+                return pattern[line_pos & 7u];
             }
         }
-        return 0;
     }
-
     return 0;
+}
+
+static uint8_t _zx_contention_delay(const zx_t* sys) {
+    return _zx_contention_delay_at(sys, sys->frame_tstate);
+}
+
+/* Computes the total clock-stretching required by a complete four-T-state
+   Ferranti-ULA I/O cycle. Delays are accumulated in their documented C:1 /
+   N:1 sequence before the bus cycle is held for the resulting duration. */
+static uint8_t _zx_io_contention_delay(const zx_t* sys, uint16_t port) {
+    uint32_t tstate;
+    uint8_t total = 0;
+    unsigned contended_steps;
+    bool first_contended;
+
+    /* The +2A/+3 gate array does not contend port FE; contention of its paging
+       ports is undocumented, so do not invent Ferranti-ULA behaviour here. */
+    if (sys->type == ZX_TYPE_PLUS2A || sys->type == ZX_TYPE_PLUS3) {
+        return 0;
+    }
+
+    const bool high_byte_contended =
+        ((port & 0xC000u) == 0x4000u) ||
+        (sys->type == ZX_TYPE_128 && (port & 0xC000u) == 0xC000u &&
+         ((sys->last_mem_config & 7u) & 1u) != 0);
+    const bool ula_port = (port & 1u) == 0;
+    if (!high_byte_contended && !ula_port) {
+        return 0;
+    }
+
+    /* IORQ is visible to the host at the end of I/O T1; frame_tstate therefore
+       points at T2 when this helper is called. */
+    tstate = sys->frame_tstate - 1u;
+    first_contended = high_byte_contended;
+    contended_steps = high_byte_contended ? (ula_port ? 2u : 4u) : 1u;
+
+    if (!first_contended) {
+        tstate += 1u; /* N:1 */
+    }
+    for (unsigned step = 0; step < contended_steps; step++) {
+        const uint8_t delay = _zx_contention_delay_at(sys, tstate);
+        total = (uint8_t)(total + delay);
+        tstate += (uint32_t)delay;
+        tstate += (step + 1u == contended_steps) ?
+            (high_byte_contended && !ula_port ? 1u : 3u) : 1u;
+    }
+    return total;
 }
 
 /* Reports whether the supplied address currently maps to a RAM page that is
@@ -1907,35 +1965,45 @@ static uint8_t _zx_multiface_page_out_port(const zx_t* sys) {
 
 static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
     bool new_frame = false;
+    bool cpu_stalled = false;
+    const bool io_cycle =
+        (pins & Z80_IORQ) && !(pins & Z80_M1) &&
+        ((pins & (Z80_RD | Z80_WR)) != 0);
+    const uint16_t bus_addr = Z80_GET_ADDR(pins);
+    const bool ulaplus_io_cycle = io_cycle &&
+        ((bus_addr == 0xBF3B) || (bus_addr == 0xFF3B));
 
-    const bool ulaplus_io_cycle =
-        (pins & Z80_IORQ) &&
-        ((Z80_GET_ADDR(pins) == 0xBF3B) || (Z80_GET_ADDR(pins) == 0xFF3B));
-    /* ULAplus I/O uses the same bus-contention slots as the ULA. Keep the
-       complete delay after chips' Z80 temporarily drops IORQ while repeating
-       its WAIT sampling state. */
-    if (!ulaplus_io_cycle && (sys->ulaplus_io_wait_remaining == 0)) {
-        sys->ulaplus_io_cycle_active = false;
-    }
-    else if (!sys->ulaplus_io_cycle_active) {
-        sys->ulaplus_io_cycle_active = true;
-        sys->ulaplus_io_wait_remaining =
-            _zx_contention_delay(sys);
+    /* The Spectrum ULA stretches the CPU clock itself. Latch and hold the
+       current bus cycle for the complete delay; relying on the Z80 WAIT input
+       cannot cover every read/write phase exposed by this cycle-stepped core. */
+    if (!sys->contention_cycle_active) {
+        uint8_t delay = 0;
+        if (ulaplus_io_cycle) {
+            delay = _zx_contention_delay(sys);
+        }
+        else if (_zx_should_apply_memory_contention(sys, pins)) {
+            delay = _zx_contention_delay(sys);
+        }
+        else if (io_cycle) {
+            delay = _zx_io_contention_delay(sys, bus_addr);
+        }
+        if (delay > 0) {
+            sys->contention_cycle_active = true;
+            sys->contention_wait_remaining = delay;
+        }
     }
 
-    if (sys->ulaplus_io_cycle_active &&
-        (sys->ulaplus_io_wait_remaining > 0)) {
-        pins |= Z80_WAIT;
-        sys->ulaplus_io_wait_remaining--;
-    }
-    else if (!ulaplus_io_cycle && _zx_contention_delay(sys) > 0 &&
-        _zx_should_apply_memory_contention(sys, pins)) {
-        pins |= Z80_WAIT;
+    if (sys->contention_cycle_active && sys->contention_wait_remaining > 0) {
+        sys->contention_wait_remaining--;
+        cpu_stalled = true;
     }
     else {
-        pins &= ~Z80_WAIT;
+        sys->contention_cycle_active = false;
     }
-    pins = z80_tick(&sys->cpu, pins);
+    pins &= ~Z80_WAIT;
+    if (!cpu_stalled) {
+        pins = z80_tick(&sys->cpu, pins);
+    }
     if (sys->multiface_nmi_ticks > 0 && --sys->multiface_nmi_ticks == 0) {
         pins &= ~Z80_NMI;
     }
@@ -1969,9 +2037,8 @@ static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
         }
     }
 
-    if (pins & Z80_MREQ) {
+    if (!cpu_stalled && (pins & Z80_MREQ)) {
         // a memory request
-        // FIXME: 'contended memory'
         const uint16_t addr = Z80_GET_ADDR(pins);
         if (pins & Z80_RD) {
             if (sys->interface1_enabled && (pins & Z80_M1) &&
@@ -1990,7 +2057,7 @@ static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
             mem_wr(&sys->mem, addr, Z80_GET_DATA(pins));
         }
     }
-    else if ((pins & Z80_IORQ) && !(pins & Z80_M1)) {
+    else if (!cpu_stalled && (pins & Z80_IORQ) && !(pins & Z80_M1)) {
         const uint16_t io_addr = Z80_GET_ADDR(pins);
         if (sys->interface1_enabled && (io_addr & 1) != 0 &&
             (io_addr & 0x0018) != 0x0018) {
@@ -2192,9 +2259,8 @@ static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
     return pins;
 }
 
-uint32_t zx_exec(zx_t* sys, uint32_t micro_seconds) {
+static uint32_t _zx_exec_ticks(zx_t* sys, uint32_t num_ticks, uint32_t micro_seconds) {
     CHIPS_ASSERT(sys && sys->valid);
-    const uint32_t num_ticks = clk_us_to_ticks(sys->freq_hz, micro_seconds);
     uint64_t pins = sys->pins;
     if (0 == sys->debug.callback.func) {
         // run without debug hook
@@ -2226,6 +2292,23 @@ uint32_t zx_exec(zx_t* sys, uint32_t micro_seconds) {
     sys->pins = pins;
     kbd_update(&sys->kbd, micro_seconds);
     return num_ticks;
+}
+
+uint32_t zx_exec(zx_t* sys, uint32_t micro_seconds) {
+    CHIPS_ASSERT(sys && sys->valid);
+    return _zx_exec_ticks(
+        sys,
+        clk_us_to_ticks(sys->freq_hz, micro_seconds),
+        micro_seconds);
+}
+
+uint32_t zx_exec_ticks(zx_t* sys, uint32_t num_ticks) {
+    uint32_t micro_seconds;
+    CHIPS_ASSERT(sys && sys->valid);
+    micro_seconds = (uint32_t)(
+        (((uint64_t)num_ticks * 1000000u) + (sys->freq_hz / 2u)) /
+        sys->freq_hz);
+    return _zx_exec_ticks(sys, num_ticks, micro_seconds);
 }
 
 void zx_key_down(zx_t* sys, int key_code) {

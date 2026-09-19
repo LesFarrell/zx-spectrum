@@ -727,6 +727,11 @@ static bool tape_parse_pzx(
 
         if (memcmp(tag, "PZXT", 4) == 0)
         {
+            if (saw_header)
+            {
+                tape_set_error(error_buffer, error_buffer_size, "Duplicate PZX header", path);
+                return false;
+            }
             if (payload_size < 2 || payload[0] != 1)
             {
                 tape_set_error(error_buffer, error_buffer_size, "Unsupported PZX version", path);
@@ -1173,7 +1178,7 @@ static bool tape_parse_tzx(
 
     /* Byte 8 is the TZX major version; only 1.x files are understood and a
        newer revision would be silently mis-parsed, so reject it clearly. */
-    if (data[8] > 1) {
+    if (data[8] != 1) {
         tape_set_error(error_buffer, error_buffer_size, "Unsupported TZX major version", path);
         return false;
     }

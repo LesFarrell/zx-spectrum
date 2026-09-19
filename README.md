@@ -56,7 +56,9 @@ Small ZX Spectrum emulator in C for Windows. It uses the Win32 API for display, 
 ## Not implemented
 
 - 128K SNA snapshots captured with the TR-DOS ROM paged in
-- Full ULA I/O contention timing
+- Floating-bus reads and selectable early/late ULA timing variants
+- Pixel-accurate mid-scanline border and screen changes (the current renderer
+  is scanline-granular)
 - Optional ULAplus Timex hi-colour and hi-resolution video modes
 - SZX machine variants outside the five currently emulated Sinclair models;
   unrelated peripheral blocks are skipped while core state is restored
@@ -154,7 +156,9 @@ Spectrum +3 with one combined 64 KB ROM:
   load it through the same media handling
 - ZIP archives support stored and deflated entries. Disk and Microdrive images
   opened from an archive are mounted read-only so the archive cannot be
-  overwritten accidentally.
+  overwritten accidentally. Multi-disk, encrypted, ZIP64-sized, and
+  compression methods other than stored/Deflate are rejected with a clear
+  error.
 - Opening a `.dsk` inserts it as +3 drive `A:`, switches to the +3 model,
   and starts the ROM Loader so bootable disks run automatically
 - `Disk -> Save Disk` writes sector changes back to the inserted DSK

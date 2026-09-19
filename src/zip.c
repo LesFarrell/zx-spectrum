@@ -46,6 +46,11 @@ void zip_discard(ZipArchive *archive) {
     if (archive == NULL) {
         return;
     }
+    if (archive->entries != NULL) {
+        for (size_t index = 0; index < archive->entry_count; ++index) {
+            free(archive->entries[index].name);
+        }
+    }
     free(archive->entries);
     free(archive->data);
     zip_init(archive);
@@ -175,7 +180,6 @@ bool zip_open_file(
         uint16_t extra_length;
         uint16_t comment_length;
         size_t record_size;
-        size_t copy_length;
 
         if (position > central_end || ZIP_CENTRAL_HEADER_SIZE > central_end - position ||
             zip_u32(loaded.data + position) != 0x02014B50u) {
@@ -199,11 +203,31 @@ bool zip_open_file(
         entry->compressed_size = zip_u32(loaded.data + position + 20);
         entry->uncompressed_size = zip_u32(loaded.data + position + 24);
         entry->local_header_offset = zip_u32(loaded.data + position + 42);
-        copy_length = name_length < sizeof(entry->name) - 1
-            ? name_length
-            : sizeof(entry->name) - 1;
-        memcpy(entry->name, loaded.data + position + ZIP_CENTRAL_HEADER_SIZE, copy_length);
-        entry->name[copy_length] = '\0';
+        if (zip_u16(loaded.data + position + 34) != 0) {
+            zip_discard(&loaded);
+            snprintf(error_buffer, error_buffer_size, "A ZIP entry starts on another disk.");
+            return false;
+        }
+        if (memchr(
+                loaded.data + position + ZIP_CENTRAL_HEADER_SIZE,
+                '\0',
+                name_length) != NULL) {
+            zip_discard(&loaded);
+            snprintf(error_buffer, error_buffer_size, "A ZIP entry name contains a null byte.");
+            return false;
+        }
+        entry->name = (char *)malloc((size_t)name_length + 1);
+        if (entry->name == NULL) {
+            zip_discard(&loaded);
+            snprintf(error_buffer, error_buffer_size, "Out of memory while reading ZIP entry names.");
+            return false;
+        }
+        entry->name_length = name_length;
+        memcpy(
+            entry->name,
+            loaded.data + position + ZIP_CENTRAL_HEADER_SIZE,
+            name_length);
+        entry->name[name_length] = '\0';
         entry->is_directory = name_length != 0 &&
             (loaded.data[position + ZIP_CENTRAL_HEADER_SIZE + name_length - 1] == '/' ||
              loaded.data[position + ZIP_CENTRAL_HEADER_SIZE + name_length - 1] == '\\');
@@ -253,6 +277,10 @@ bool zip_extract_entry(
         snprintf(error_buffer, error_buffer_size, "Encrypted ZIP entries are not supported: %s", entry->name);
         return false;
     }
+    if ((entry->flags & (uint16_t)~0x080Eu) != 0) {
+        snprintf(error_buffer, error_buffer_size, "Unsupported ZIP entry flags for %s.", entry->name);
+        return false;
+    }
     if (entry->method != 0 && entry->method != 8) {
         snprintf(
             error_buffer,
@@ -279,6 +307,15 @@ bool zip_extract_entry(
     }
     name_length = zip_u16(archive->data + offset + 26);
     extra_length = zip_u16(archive->data + offset + 28);
+    if (name_length != entry->name_length ||
+        ZIP_LOCAL_HEADER_SIZE + (size_t)name_length > archive->size - offset ||
+        memcmp(
+            archive->data + offset + ZIP_LOCAL_HEADER_SIZE,
+            entry->name,
+            name_length) != 0) {
+        snprintf(error_buffer, error_buffer_size, "ZIP entry names disagree between headers: %s", entry->name);
+        return false;
+    }
     compressed_offset = offset + ZIP_LOCAL_HEADER_SIZE + (size_t)name_length + extra_length;
     if (compressed_offset > archive->size ||
         entry->compressed_size > archive->size - compressed_offset) {

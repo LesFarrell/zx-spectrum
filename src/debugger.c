@@ -58,6 +58,24 @@ static uint16_t app_debug_mem_rd16(const Spectrum *spec, uint16_t addr) {
     return mem_rd16((mem_t *)&spec->machine.mem, addr);
 }
 
+static bool app_debug_at_instruction_boundary(const Spectrum *spec) {
+    const uint64_t pins = spec->machine.pins;
+    return ((pins & (Z80_M1 | Z80_MREQ | Z80_RD)) == (Z80_M1 | Z80_MREQ | Z80_RD)) &&
+        z80_opdone((z80_t *)&spec->machine.cpu);
+}
+
+/* The cycle-stepped Z80 overlaps completion of one instruction with M1/T2 of
+   the next opcode fetch. At that boundary PC has already been incremented;
+   the address bus still carries the debugger-visible address of the next
+   instruction. */
+static uint16_t app_debug_current_pc(const Spectrum *spec) {
+    const uint64_t pins = spec->machine.pins;
+    if (app_debug_at_instruction_boundary(spec)) {
+        return Z80_GET_ADDR(pins);
+    }
+    return spec->machine.cpu.pc;
+}
+
 /* Configures the read-only disassembly editor. Margin 0 carries real Z80
    addresses; margin 1 carries independent PC and breakpoint markers. */
 static void app_debug_configure_disassembly(HWND editor) {
@@ -118,7 +136,7 @@ static void app_debug_set_disassembly(
         snprintf(address_text, sizeof(address_text), "%04X", addresses[line]);
         SendMessageA(editor, SCI_MARGINSETTEXT, (WPARAM)line, (LPARAM)address_text);
         SendMessageA(editor, SCI_MARGINSETSTYLE, (WPARAM)line, STYLE_LINENUMBER);
-        if (app->spec.machine_ready && addresses[line] == app->spec.machine.cpu.pc) {
+        if (app->spec.machine_ready && addresses[line] == app_debug_current_pc(&app->spec)) {
             SendMessageA(editor, SCI_MARKERADD, (WPARAM)line, 0);
             SendMessageA(editor, SCI_MARKERADD, (WPARAM)line, 2);
         }
@@ -177,14 +195,97 @@ static void app_debug_format_flags(uint8_t flags, char *out, size_t out_size) {
     );
 }
 
+/* Returns the complete encoded length, including ignored/repeated DD/FD
+   prefixes.  Prefix trains are legal on a Z80 and must not desynchronise the
+   disassembly or make Step Over stop inside the current instruction. */
+static uint16_t app_debug_instruction_length(const Spectrum *spec, uint16_t addr) {
+    uint32_t prefix_count = 0;
+    uint16_t cursor = addr;
+    uint8_t op;
+    uint8_t x;
+    uint8_t y;
+    uint8_t z;
+    uint8_t p;
+    uint8_t q;
+    uint16_t base_length = 1;
+    bool indexed = false;
+
+    while (prefix_count < 0x10000u) {
+        op = app_debug_mem_rd(spec, cursor);
+        if (op != 0xDD && op != 0xFD) {
+            break;
+        }
+        indexed = true;
+        prefix_count++;
+        cursor = (uint16_t)(cursor + 1);
+    }
+    if (prefix_count == 0x10000u) {
+        /* A full 64K made entirely of index prefixes has no following opcode.
+           Treat one byte as data so the debugger view can still make progress. */
+        return 1;
+    }
+
+    op = app_debug_mem_rd(spec, cursor);
+    if (op == 0xCB) {
+        base_length = indexed ? 3 : 2;
+    } else if (op == 0xED) {
+        const uint8_t ed = app_debug_mem_rd(spec, (uint16_t)(cursor + 1));
+        base_length = ((ed & 0xC7u) == 0x43u) ? 4 : 2;
+    } else {
+        x = op >> 6;
+        y = (op >> 3) & 7;
+        z = op & 7;
+        p = y >> 1;
+        q = y & 1;
+        if (x == 0) {
+            if (z == 0 && y >= 2) {
+                base_length = 2;
+            } else if (z == 1 && q == 0) {
+                base_length = 3;
+            } else if (z == 2 && y >= 4) {
+                base_length = 3;
+            } else if (z == 6) {
+                base_length = 2;
+            }
+        } else if (x == 3) {
+            if (z == 2 || z == 4 || (z == 5 && q == 1 && p == 0)) {
+                base_length = 3;
+            } else if (z == 3) {
+                if (y == 0) {
+                    base_length = 3;
+                } else if (y == 1 || y == 2 || y == 3) {
+                    base_length = 2;
+                }
+            } else if (z == 6) {
+                base_length = 2;
+            }
+        }
+
+        if (indexed) {
+            const bool indexed_memory =
+                (x == 0 && (z == 4 || z == 5 || z == 6) && y == 6) ||
+                (x == 1 && op != 0x76 && (y == 6 || z == 6)) ||
+                (x == 2 && z == 6);
+            if (indexed_memory) {
+                base_length++;
+            }
+        }
+    }
+
+    if (prefix_count + base_length > UINT16_MAX) {
+        return UINT16_MAX;
+    }
+    return (uint16_t)(prefix_count + base_length);
+}
+
 /* Produces a compact mnemonic for one instruction at the supplied address.
    Unsupported prefixes fall back to byte-oriented output instead of guessing. */
-static void app_debug_decode_instruction(
+static void app_debug_decode_instruction_partial(
     const Spectrum *spec,
     uint16_t addr,
     char *out,
     size_t out_size,
-    uint8_t *instruction_length
+    uint16_t *instruction_length
 ) {
     char discard[64];
     static const char *reg8[] = {"B", "C", "D", "E", "H", "L", "(HL)", "A"};
@@ -228,16 +329,28 @@ static void app_debug_decode_instruction(
                 snprintf(out, out_size, "LD %s,(%04Xh)", index_reg, app_debug_mem_rd16(spec, (uint16_t)(addr + 2)));
                 return;
             case 0xCB: {
+                static const char *cb_rot[] = {"RLC", "RRC", "RL", "RR", "SLA", "SRA", "SLL", "SRL"};
                 const uint8_t cb_op = app_debug_mem_rd(spec, (uint16_t)(addr + 3));
                 const int8_t cb_disp = (int8_t)app_debug_mem_rd(spec, (uint16_t)(addr + 2));
                 const uint8_t cb_x = cb_op >> 6;
                 const uint8_t cb_bit = (cb_op >> 3) & 7;
+                const uint8_t cb_reg = cb_op & 7;
                 *instruction_length = 4;
-                if (cb_x == 1 || cb_x == 2 || cb_x == 3) {
-                    const char *cb_name = (cb_x == 1) ? "BIT" : (cb_x == 2) ? "RES" : "SET";
-                    snprintf(out, out_size, "%s %u,(%s%+d)", cb_name, cb_bit, index_reg, (int)cb_disp);
+                if (cb_x == 0) {
+                    if (cb_reg == 6) {
+                        snprintf(out, out_size, "%s (%s%+d)", cb_rot[cb_bit], index_reg, (int)cb_disp);
+                    } else {
+                        snprintf(out, out_size, "%s (%s%+d),%s", cb_rot[cb_bit], index_reg, (int)cb_disp, reg8[cb_reg]);
+                    }
+                } else if (cb_x == 1) {
+                    snprintf(out, out_size, "BIT %u,(%s%+d)", cb_bit, index_reg, (int)cb_disp);
                 } else {
-                    snprintf(out, out_size, "DB %02Xh,%02Xh,%02Xh,%02Xh", op, next, (uint8_t)cb_disp, cb_op);
+                    const char *cb_name = (cb_x == 1) ? "BIT" : (cb_x == 2) ? "RES" : "SET";
+                    if (cb_reg == 6) {
+                        snprintf(out, out_size, "%s %u,(%s%+d)", cb_name, cb_bit, index_reg, (int)cb_disp);
+                    } else {
+                        snprintf(out, out_size, "%s %u,(%s%+d),%s", cb_name, cb_bit, index_reg, (int)cb_disp, reg8[cb_reg]);
+                    }
                 }
                 return;
             }
@@ -334,32 +447,78 @@ static void app_debug_decode_instruction(
     }
 
     if (op == 0xED) {
+        static const uint8_t im_mode[] = {0, 0, 1, 2, 0, 0, 1, 2};
+        static const char *block_ops[4][4] = {
+            {"LDI",  "CPI",  "INI",  "OUTI"},
+            {"LDD",  "CPD",  "IND",  "OUTD"},
+            {"LDIR", "CPIR", "INIR", "OTIR"},
+            {"LDDR", "CPDR", "INDR", "OTDR"}
+        };
+        const uint8_t ed_x = next >> 6;
+        const uint8_t ed_y = (next >> 3) & 7;
+        const uint8_t ed_z = next & 7;
+        const uint8_t ed_p = ed_y >> 1;
+        const uint8_t ed_q = ed_y & 1;
         *instruction_length = 2;
-        switch (next) {
-            case 0x44:
-            case 0x4C:
-            case 0x54:
-            case 0x5C:
-            case 0x64:
-            case 0x6C:
-            case 0x74:
-            case 0x7C:
-                snprintf(out, out_size, "NEG");
-                return;
-            case 0x45:
-            case 0x4D:
-            case 0x55:
-            case 0x5D:
-            case 0x65:
-            case 0x6D:
-            case 0x75:
-            case 0x7D:
-                snprintf(out, out_size, (next == 0x4D) ? "RETI" : "RETN");
-                return;
-            default:
-                snprintf(out, out_size, "DB EDh,%02Xh", next);
-                return;
+        if (ed_x == 1) {
+            switch (ed_z) {
+                case 0:
+                    if (ed_y == 6) snprintf(out, out_size, "IN (C)");
+                    else snprintf(out, out_size, "IN %s,(C)", reg8[ed_y]);
+                    return;
+                case 1:
+                    if (ed_y == 6) snprintf(out, out_size, "OUT (C),0");
+                    else snprintf(out, out_size, "OUT (C),%s", reg8[ed_y]);
+                    return;
+                case 2:
+                    snprintf(out, out_size, "%s HL,%s", ed_q ? "ADC" : "SBC", reg16[ed_p]);
+                    return;
+                case 3:
+                    *instruction_length = 4;
+                    if (ed_q) snprintf(out, out_size, "LD %s,(%04Xh)", reg16[ed_p], app_debug_mem_rd16(spec, (uint16_t)(addr + 2)));
+                    else snprintf(out, out_size, "LD (%04Xh),%s", app_debug_mem_rd16(spec, (uint16_t)(addr + 2)), reg16[ed_p]);
+                    return;
+                case 4:
+                    snprintf(out, out_size, "NEG");
+                    return;
+                case 5:
+                    snprintf(out, out_size, (next == 0x4D) ? "RETI" : "RETN");
+                    return;
+                case 6:
+                    snprintf(out, out_size, "IM %u", (unsigned)im_mode[ed_y]);
+                    return;
+                case 7:
+                    switch (ed_y) {
+                        case 0: snprintf(out, out_size, "LD I,A"); return;
+                        case 1: snprintf(out, out_size, "LD R,A"); return;
+                        case 2: snprintf(out, out_size, "LD A,I"); return;
+                        case 3: snprintf(out, out_size, "LD A,R"); return;
+                        case 4: snprintf(out, out_size, "RRD"); return;
+                        case 5: snprintf(out, out_size, "RLD"); return;
+                        default: break;
+                    }
+                    break;
+            }
+        } else if (ed_x == 2 && ed_y >= 4 && ed_z <= 3) {
+            snprintf(out, out_size, "%s", block_ops[ed_y - 4][ed_z]);
+            return;
         }
+        snprintf(out, out_size, "DB EDh,%02Xh", next);
+        return;
+    }
+
+    if (op == 0xCB) {
+        static const char *cb_rot[] = {"RLC", "RRC", "RL", "RR", "SLA", "SRA", "SLL", "SRL"};
+        const uint8_t cb_x = next >> 6;
+        const uint8_t cb_y = (next >> 3) & 7;
+        const uint8_t cb_z = next & 7;
+        *instruction_length = 2;
+        if (cb_x == 0) {
+            snprintf(out, out_size, "%s %s", cb_rot[cb_y], reg8[cb_z]);
+        } else {
+            snprintf(out, out_size, "%s %u,%s", cb_x == 1 ? "BIT" : cb_x == 2 ? "RES" : "SET", cb_y, reg8[cb_z]);
+        }
+        return;
     }
 
     switch (x) {
@@ -509,6 +668,18 @@ static void app_debug_decode_instruction(
     }
 
     snprintf(out, out_size, "DB %02Xh", op);
+}
+
+static void app_debug_decode_instruction(
+    const Spectrum *spec,
+    uint16_t addr,
+    char *out,
+    size_t out_size,
+    uint16_t *instruction_length
+) {
+    uint16_t partial_length = 1;
+    app_debug_decode_instruction_partial(spec, addr, out, out_size, &partial_length);
+    *instruction_length = app_debug_instruction_length(spec, addr);
 }
 
 /* Refreshes the debugger button captions and enabled state so the current
@@ -918,7 +1089,19 @@ static bool app_debug_apply_address_input(AppState *app, char *error_buffer, siz
 }
 
 static bool app_debug_is_step_over_candidate(const Spectrum *spec, uint16_t address) {
-    const uint8_t op = app_debug_mem_rd(spec, address);
+    uint32_t prefix_count = 0;
+    uint8_t op = app_debug_mem_rd(spec, address);
+
+    /* DD/FD are ignored for CALL and RST, including repeated/mixed prefix
+       trains.  They are nevertheless part of the same Z80 instruction. */
+    while (prefix_count < 0x10000u && (op == 0xDD || op == 0xFD)) {
+        prefix_count++;
+        address = (uint16_t)(address + 1);
+        op = app_debug_mem_rd(spec, address);
+    }
+    if (prefix_count == 0x10000u || op == 0xCB || op == 0xED) {
+        return false;
+    }
 
     switch (op) {
         case 0xC4:
@@ -997,9 +1180,9 @@ static void app_debug_refresh_window(AppState *app) {
 
     cpu = &app->spec.machine.cpu;
     if (!app->debug.debugger_view_initialized) {
-        app_debug_set_view_address(app, cpu->pc, true);
+        app_debug_set_view_address(app, app_debug_current_pc(&app->spec), true);
     } else if (app->debug.debugger_view_sync_pc) {
-        app->debug.debugger_view_address = cpu->pc;
+        app->debug.debugger_view_address = app_debug_current_pc(&app->spec);
         app_debug_sync_view_controls(app);
     }
     app_debug_format_flags(cpu->f, flags, sizeof(flags));
@@ -1017,7 +1200,7 @@ static void app_debug_refresh_window(AppState *app) {
         buffer_size,
         &used,
         "PC:%04X  SP:%04X  IX:%04X  IY:%04X\r\n",
-        cpu->pc,
+        app_debug_current_pc(&app->spec),
         cpu->sp,
         cpu->ix,
         cpu->iy
@@ -1078,12 +1261,12 @@ static void app_debug_refresh_window(AppState *app) {
     for (int i = 0; i < APP_DEBUG_DISASSEMBLY_LINE_COUNT; ++i) {
         char mnemonic[128];
         char bytes[32];
-        uint8_t len;
+        uint16_t len;
         size_t byte_used = 0;
         disassembly_addresses[i] = addr;
 
         app_debug_decode_instruction(&app->spec, addr, mnemonic, sizeof(mnemonic), &len);
-        for (uint8_t byte_index = 0; byte_index < len; ++byte_index) {
+        for (uint16_t byte_index = 0; byte_index < len; ++byte_index) {
             byte_used += (size_t)snprintf(
                 bytes + byte_used,
                 sizeof(bytes) - byte_used,
@@ -1176,6 +1359,13 @@ static void app_debug_callback(void *user_data, uint64_t pins) {
         return;
     }
     app->debug.last_pins = pins;
+    /* Spectrum contention holds the Z80 clock while the system timing keeps
+       advancing.  The system hook still runs on those outer ticks, but the
+       CPU and its bus state have not advanced, so they must not be mistaken
+       for another instruction boundary or memory write. */
+    if (app->spec.machine.contention_cycle_active) {
+        return;
+    }
     if ((pins & (Z80_MREQ | Z80_WR)) == (Z80_MREQ | Z80_WR)) {
         const uint16_t addr = Z80_GET_ADDR(pins);
         if (app_debug_has_watchpoint(app, addr)) {
@@ -1184,8 +1374,14 @@ static void app_debug_callback(void *user_data, uint64_t pins) {
             app->debug.pending_watchpoint_value = Z80_GET_DATA(pins);
         }
     }
-    if (z80_opdone(&app->spec.machine.cpu)) {
-        uint16_t next_pc = app->spec.machine.cpu.pc;
+    if (!z80_opdone(&app->spec.machine.cpu)) {
+        if (app->debug.stepping) {
+            app->debug.debugger_step_left_boundary = true;
+        }
+        return;
+    }
+    {
+        const uint16_t next_pc = Z80_GET_ADDR(pins);
         bool reached_run_to = app->debug.debugger_run_to_active && app->debug.debugger_run_to_address == next_pc;
         bool skip_breakpoint = app->debug.debugger_skip_breakpoint_once && app->debug.debugger_skip_breakpoint_address == next_pc;
         if (skip_breakpoint) {
@@ -1212,7 +1408,7 @@ static void app_debug_callback(void *user_data, uint64_t pins) {
             app->debug.last_run_to_address = next_pc;
             app->debug.stop_requested = true;
         }
-        if (app->debug.stepping) {
+        if (app->debug.stepping && app->debug.debugger_step_left_boundary) {
             app->debug.stop_requested = true;
         }
     }
@@ -1230,9 +1426,10 @@ static void app_debug_resume(AppState *app) {
     app->debug.watchpoint_hit = false;
     app->debug.debugger_run_to_hit = false;
     app->debug.debugger_watchpoint_pending = false;
-    if (app_debug_has_breakpoint(app, app->spec.machine.cpu.pc)) {
+    app->debug.debugger_step_left_boundary = false;
+    if (app_debug_has_breakpoint(app, app_debug_current_pc(&app->spec))) {
         app->debug.debugger_skip_breakpoint_once = true;
-        app->debug.debugger_skip_breakpoint_address = app->spec.machine.cpu.pc;
+        app->debug.debugger_skip_breakpoint_address = app_debug_current_pc(&app->spec);
     } else {
         app->debug.debugger_skip_breakpoint_once = false;
     }
@@ -1255,6 +1452,7 @@ static void app_debug_step_instruction(AppState *app) {
     app->debug.debugger_run_to_active = false;
     app->debug.debugger_run_to_hit = false;
     app->debug.debugger_watchpoint_pending = false;
+    app->debug.debugger_step_left_boundary = false;
     app->spec.machine.debug.callback.func = app_debug_callback;
     app->spec.machine.debug.callback.user_data = app;
     app->spec.machine.debug.stopped = &app->debug.stop_requested;
@@ -1270,14 +1468,14 @@ static void app_debug_step_instruction(AppState *app) {
 }
 
 static void app_debug_step_over_instruction(AppState *app) {
-    uint8_t len;
+    uint16_t len;
     uint16_t pc;
 
     if (!app->spec.machine_ready) {
         return;
     }
 
-    pc = app->spec.machine.cpu.pc;
+    pc = app_debug_current_pc(&app->spec);
     app_debug_decode_instruction(&app->spec, pc, NULL, 0, &len);
     if (!app_debug_is_step_over_candidate(&app->spec, pc)) {
         app_debug_step_instruction(app);
@@ -1313,7 +1511,7 @@ static void app_debug_view_pc(AppState *app) {
     if (app == NULL || !app->spec.machine_ready) {
         return;
     }
-    app_debug_set_view_address(app, app->spec.machine.cpu.pc, true);
+    app_debug_set_view_address(app, app_debug_current_pc(&app->spec), true);
     app_debug_refresh_window(app);
 }
 
@@ -1330,7 +1528,7 @@ static void app_debug_run_to_address(AppState *app, uint16_t address) {
         return;
     }
 
-    if (address == app->spec.machine.cpu.pc) {
+    if (address == app_debug_current_pc(&app->spec)) {
         app->debug.paused = true;
         app->debug.breakpoint_hit = false;
         app->debug.watchpoint_hit = false;
@@ -1351,7 +1549,7 @@ static void app_debug_run_to_address(AppState *app, uint16_t address) {
     app->debug.debugger_run_to_address = address;
     app->debug.last_run_to_address = address;
     if (app->debug.debugger_view_sync_pc) {
-        app->debug.debugger_view_address = app->spec.machine.cpu.pc;
+        app->debug.debugger_view_address = app_debug_current_pc(&app->spec);
         app_debug_sync_view_controls(app);
     }
     InvalidateRect(app->main_hwnd, NULL, FALSE);
@@ -1361,7 +1559,7 @@ static void app_debug_run_to_address(AppState *app, uint16_t address) {
 /* Runs one model-accurate frame slice with debugger breakpoints armed, then
    pauses and refreshes the debugger if any enabled address was reached. */
 static void app_debug_run_frame(AppState *app, bool render_frame) {
-    uint32_t frame_us;
+    uint32_t frame_tstates;
     const bool debugger_active = app->debug.debugger_hwnd != NULL;
 
     if (!app->spec.machine_ready) {
@@ -1371,12 +1569,12 @@ static void app_debug_run_frame(AppState *app, bool render_frame) {
     if (debugger_active &&
         (
         app->debug.debugger_skip_breakpoint_once &&
-        app->debug.debugger_skip_breakpoint_address == app->spec.machine.cpu.pc
+        app->debug.debugger_skip_breakpoint_address == app_debug_current_pc(&app->spec)
     )) {
         app->debug.debugger_skip_breakpoint_once = false;
-    } else if (debugger_active && app_debug_has_breakpoint(app, app->spec.machine.cpu.pc)) {
+    } else if (debugger_active && app_debug_has_breakpoint(app, app_debug_current_pc(&app->spec))) {
         app->debug.breakpoint_hit = true;
-        app->debug.last_breakpoint_address = app->spec.machine.cpu.pc;
+        app->debug.last_breakpoint_address = app_debug_current_pc(&app->spec);
         app->debug.debugger_run_to_active = false;
         app->debug.debugger_watchpoint_pending = false;
         app->debug.paused = true;
@@ -1400,8 +1598,10 @@ static void app_debug_run_frame(AppState *app, bool render_frame) {
         app->spec.machine.debug.callback.user_data = app;
         app->spec.machine.debug.stopped = &app->debug.stop_requested;
     }
-    frame_us = (uint32_t)(app_model_frame_duration_ms(app->spec.model) * 1000.0 + 0.5);
-    zx_exec(&app->spec.machine, frame_us);
+    frame_tstates = app->spec.model == SPECTRUM_MODEL_48K
+        ? 312u * 224u
+        : 311u * 228u;
+    zx_exec_ticks(&app->spec.machine, frame_tstates);
     if (debugger_active &&
         (app->debug.breakpoint_count > 0 ||
          app->debug.watchpoint_count > 0 ||
@@ -1418,7 +1618,7 @@ static void app_debug_run_frame(AppState *app, bool render_frame) {
     if (app->debug.breakpoint_hit || app->debug.watchpoint_hit || app->debug.debugger_run_to_hit) {
         app->debug.paused = true;
         if (app->debug.debugger_view_sync_pc) {
-            app->debug.debugger_view_address = app->spec.machine.cpu.pc;
+            app->debug.debugger_view_address = app_debug_current_pc(&app->spec);
             app_debug_sync_view_controls(app);
         }
         InvalidateRect(app->main_hwnd, NULL, FALSE);
@@ -1457,6 +1657,7 @@ static void app_debug_machine_changed(AppState *app) {
     app->debug.debugger_run_to_hit = false;
     app->debug.debugger_watchpoint_pending = false;
     app->debug.debugger_skip_breakpoint_once = false;
+    app->debug.debugger_step_left_boundary = false;
     app->spec.machine.debug.callback.func = NULL;
     app->spec.machine.debug.callback.user_data = NULL;
     app->spec.machine.debug.stopped = NULL;
@@ -1465,12 +1666,52 @@ static void app_debug_machine_changed(AppState *app) {
         app->debug.debugger_view_initialized = true;
     }
     if (app->spec.machine_ready && app->debug.debugger_view_sync_pc) {
-        app->debug.debugger_view_address = app->spec.machine.cpu.pc;
+        app->debug.debugger_view_address = app_debug_current_pc(&app->spec);
     }
     app_debug_sync_view_controls(app);
     app_debug_refresh_window(app);
     app_assembler_refresh_window(app);
     app_poke_refresh_window(app);
+}
+
+/* A frame slice can end part-way through an opcode. Finish only that opcode
+   before presenting a manual pause, matching instruction-oriented debuggers
+   and ensuring the displayed PC is a real instruction address. */
+static void app_debug_pause(AppState *app) {
+    uint32_t frame_tstates;
+
+    if (!app->spec.machine_ready) {
+        return;
+    }
+
+    app->debug.paused = true;
+    app->debug.stepping = false;
+    app->debug.stop_requested = false;
+    app->debug.breakpoint_hit = false;
+    app->debug.watchpoint_hit = false;
+    app->debug.debugger_run_to_active = false;
+    app->debug.debugger_run_to_hit = false;
+    app->debug.debugger_watchpoint_pending = false;
+    app->debug.debugger_step_left_boundary = false;
+
+    if (app_debug_at_instruction_boundary(&app->spec)) {
+        return;
+    }
+
+    app->debug.stepping = true;
+    app->debug.debugger_step_left_boundary = true;
+    app->spec.machine.debug.callback.func = app_debug_callback;
+    app->spec.machine.debug.callback.user_data = app;
+    app->spec.machine.debug.stopped = &app->debug.stop_requested;
+    frame_tstates = app->spec.model == SPECTRUM_MODEL_48K
+        ? 312u * 224u
+        : 311u * 228u;
+    zx_exec_ticks(&app->spec.machine, frame_tstates);
+    app->spec.machine.debug.callback.func = NULL;
+    app->spec.machine.debug.callback.user_data = NULL;
+    app->spec.machine.debug.stopped = NULL;
+    app->debug.stepping = false;
+    app->debug.debugger_step_left_boundary = false;
 }
 
 /* Sizes the debugger controls to the current client area of the tool window. */
@@ -1888,11 +2129,7 @@ static INT_PTR CALLBACK app_debugger_dlgproc(HWND hwnd, UINT msg, WPARAM wparam,
                     if (app->debug.paused) {
                         app_debug_resume(app);
                     } else {
-                        app->debug.paused = true;
-                        app->debug.debugger_run_to_active = false;
-                        app->debug.debugger_run_to_hit = false;
-                        app->debug.breakpoint_hit = false;
-                        app->debug.watchpoint_hit = false;
+                        app_debug_pause(app);
                     }
                     app_debug_refresh_window(app);
                     return TRUE;
@@ -2027,7 +2264,7 @@ static INT_PTR CALLBACK app_debugger_dlgproc(HWND hwnd, UINT msg, WPARAM wparam,
                     if (HIWORD(wparam) == BN_CLICKED) {
                         bool sync_to_pc = SendMessageA(app->debug.debugger_sync_checkbox, BM_GETCHECK, 0, 0) == BST_CHECKED;
                         if (sync_to_pc && app->spec.machine_ready) {
-                            app_debug_set_view_address(app, app->spec.machine.cpu.pc, true);
+                            app_debug_set_view_address(app, app_debug_current_pc(&app->spec), true);
                         } else {
                             app->debug.debugger_view_sync_pc = sync_to_pc;
                             app_debug_sync_view_controls(app);
@@ -2172,7 +2409,7 @@ static void app_show_debugger_help(HWND hwnd) {
         "Execution:\r\n"
         "  F5 Run/Pause\r\n"
         "  F11 Step one instruction\r\n"
-        "  F10 Step over CALLs\r\n"
+        "  F10 Step over CALLs and RSTs\r\n"
         "  Refresh redraws the current register and memory view.\r\n"
         "\r\n"
         "Address field:\r\n"

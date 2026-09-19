@@ -1723,7 +1723,7 @@ bool spectrum_load_snapshot_z80_data(
     char *error_buffer,
     size_t error_buffer_size)
 {
-    Spectrum previous_spec = *spec;
+    Spectrum *previous_spec;
     SpectrumModel snapshot_model;
 
     if (!spectrum_detect_snapshot_model_data(data, data_size, &snapshot_model))
@@ -1732,17 +1732,32 @@ bool spectrum_load_snapshot_z80_data(
         return false;
     }
 
+    /* Spectrum contains the emulated RAM and framebuffer and is too large for
+       a safe worker-thread stack backup. Keep the transactional rollback copy
+       on the heap in case the core rejects a damaged snapshot after a model
+       rebuild has already taken place. */
+    previous_spec = (Spectrum *)malloc(sizeof(*previous_spec));
+    if (previous_spec == NULL)
+    {
+        snprintf(error_buffer, error_buffer_size,
+            "Out of memory while preparing to load .z80 snapshot.");
+        return false;
+    }
+    *previous_spec = *spec;
+
     if (!spectrum_snapshot_model_compatible(snapshot_model, spec->model))
     {
         if (!spectrum_rebuild_for_model(spec, snapshot_model, error_buffer, error_buffer_size))
         {
+            free(previous_spec);
             return false;
         }
     }
 
     if (!zx_quickload(&spec->machine, (chips_range_t){.ptr = (void *)data, .size = data_size}))
     {
-        *spec = previous_spec;
+        *spec = *previous_spec;
+        free(previous_spec);
         snprintf(
             error_buffer,
             error_buffer_size,
@@ -1750,6 +1765,7 @@ bool spectrum_load_snapshot_z80_data(
         return false;
     }
 
+    free(previous_spec);
     _zx_ulaplus_reset(&spec->machine);
     spectrum_render_frame(spec);
     return true;
