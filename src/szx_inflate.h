@@ -22,4 +22,12 @@ bool szx_inflate_zlib_bounded(
     size_t *destination_size
 );
 
+/* Expands an RFC 1951 raw DEFLATE stream, as used by ZIP entries. */
+bool szx_inflate_raw(
+    const uint8_t *source,
+    size_t source_size,
+    uint8_t *destination,
+    size_t destination_size
+);
+
 #endif

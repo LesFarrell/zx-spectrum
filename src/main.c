@@ -19,6 +19,7 @@
 #include "tape.h"
 #include "disk.h"
 #include "microdrive.h"
+#include "zip.h"
 #include <Scintilla.h>
 
 typedef struct KeyMap {
@@ -201,7 +202,10 @@ typedef struct AutoTypeState {
 
 typedef struct AppTapeLoadJob {
     HWND hwnd;
-    char path[MAX_PATH];
+    char path[ZIP_ENTRY_NAME_CAPACITY];
+    char source_path[MAX_PATH];
+    uint8_t *data;
+    size_t data_size;
     uint32_t tick_hz;
     TapePlayer tape;
     char error[256];
@@ -223,7 +227,8 @@ typedef enum AppSnapshotFormat {
 
 typedef struct AppSnapshotLoadJob {
     HWND hwnd;
-    char path[MAX_PATH];
+    char path[ZIP_ENTRY_NAME_CAPACITY];
+    char source_path[MAX_PATH];
     uint8_t *data;
     size_t size;
     SpectrumModel model;
@@ -536,7 +541,27 @@ static bool app_load_tape_file(
     bool assume_128k,
     char *error_buffer,
     size_t error_buffer_size);
+static bool app_load_tape_data(
+    HWND hwnd,
+    AppState *app,
+    uint8_t *data,
+    size_t data_size,
+    const char *entry_name,
+    const char *source_path,
+    bool assume_128k,
+    char *error_buffer,
+    size_t error_buffer_size);
 static bool app_load_disk_file(HWND hwnd, AppState *app, const char *path, char *error_buffer, size_t error_buffer_size);
+static bool app_load_disk_data(
+    HWND hwnd,
+    AppState *app,
+    const uint8_t *data,
+    size_t data_size,
+    const char *display_path,
+    const char *recent_path,
+    bool source_read_only,
+    char *error_buffer,
+    size_t error_buffer_size);
 static bool app_load_microdrive_file(
     HWND hwnd,
     AppState *app,
@@ -552,6 +577,15 @@ static bool app_apply_loaded_tape(
     char *error_buffer,
     size_t error_buffer_size);
 static bool app_load_snapshot_file(HWND hwnd, AppState *app, const char *path, char *error_buffer, size_t error_buffer_size);
+static bool app_load_snapshot_data(
+    HWND hwnd,
+    AppState *app,
+    uint8_t *data,
+    size_t data_size,
+    const char *entry_name,
+    const char *source_path,
+    char *error_buffer,
+    size_t error_buffer_size);
 static bool app_load_media_path(
     HWND hwnd,
     AppState *app,
@@ -605,7 +639,7 @@ static void app_save_toggle(const char *key, bool enabled);
 static void app_save_speed_multiplier(unsigned multiplier);
 static void app_update_model_menu(HWND hwnd, SpectrumModel model);
 static void app_update_sound_menu(HWND hwnd, const AppState *app);
-static void app_update_disk_menu(HWND hwnd, bool inserted);
+static void app_update_disk_menu(HWND hwnd, bool inserted, bool writable);
 static void app_update_microdrive_menu(HWND hwnd, const AppState *app);
 static void app_update_runtime_menu(HWND hwnd, const AppState *app);
 static void app_update_input_menu(HWND hwnd, const AppState *app);
@@ -940,7 +974,7 @@ static void app_update_sound_menu(HWND hwnd, const AppState *app) {
         (app->covox_enabled ? MF_CHECKED : MF_UNCHECKED));
 }
 
-static void app_update_disk_menu(HWND hwnd, bool inserted) {
+static void app_update_disk_menu(HWND hwnd, bool inserted, bool writable) {
     HMENU menu = GetMenu(hwnd);
     if (menu == NULL) {
         return;
@@ -953,7 +987,7 @@ static void app_update_disk_menu(HWND hwnd, bool inserted) {
     EnableMenuItem(
         menu,
         APP_MENU_DISK_SAVE,
-        MF_BYCOMMAND | (inserted ? MF_ENABLED : MF_GRAYED)
+        MF_BYCOMMAND | (inserted && writable ? MF_ENABLED : MF_GRAYED)
     );
 }
 
@@ -985,11 +1019,17 @@ static void app_update_microdrive_menu(HWND hwnd, const AppState *app) {
         EnableMenuItem(
             menu,
             APP_MENU_MICRODRIVE_SAVE_BASE + drive,
-            MF_BYCOMMAND | (cartridge->inserted ? MF_ENABLED : MF_GRAYED));
+            MF_BYCOMMAND |
+                (cartridge->inserted && !cartridge->source_read_only
+                    ? MF_ENABLED
+                    : MF_GRAYED));
         EnableMenuItem(
             menu,
             APP_MENU_MICRODRIVE_WRITE_PROTECT_BASE + drive,
-            MF_BYCOMMAND | (cartridge->inserted ? MF_ENABLED : MF_GRAYED));
+            MF_BYCOMMAND |
+                (cartridge->inserted && !cartridge->source_read_only
+                    ? MF_ENABLED
+                    : MF_GRAYED));
         CheckMenuItem(
             menu,
             APP_MENU_MICRODRIVE_WRITE_PROTECT_BASE + drive,
@@ -2078,14 +2118,27 @@ static DWORD WINAPI app_tape_load_worker(void *param) {
     TapeLoadOptions options = {app_tzx_select_callback, job->hwnd};
 
     tape_init(&job->tape);
-    job->ok = tape_load_file_with_options(
-        &job->tape,
-        job->path,
-        job->tick_hz,
-        job->error,
-        sizeof(job->error),
-        &options
-);
+    if (job->data != NULL) {
+        job->ok = tape_load_data_with_options(
+            &job->tape,
+            job->data,
+            job->data_size,
+            job->path,
+            job->tick_hz,
+            job->error,
+            sizeof(job->error),
+            &options);
+        free(job->data);
+        job->data = NULL;
+    } else {
+        job->ok = tape_load_file_with_options(
+            &job->tape,
+            job->path,
+            job->tick_hz,
+            job->error,
+            sizeof(job->error),
+            &options);
+    }
     /* A failed load discards the decoded tape data here but keeps the job
        struct (ok=false) alive so the completion handler that follows always
        has an owner to free and an in-flight flag to clear. */
@@ -2110,14 +2163,17 @@ static DWORD WINAPI app_snapshot_load_worker(void *param) {
         job->format = APP_SNAPSHOT_FORMAT_Z80;
     }
 
-    job->ok = app_read_file_all(
-        job->path,
-        &job->data,
-        &job->size,
-        job->error,
-        sizeof(job->error),
-        "snapshot"
-    );
+    if (job->data == NULL) {
+        job->ok = app_read_file_all(
+            job->path,
+            &job->data,
+            &job->size,
+            job->error,
+            sizeof(job->error),
+            "snapshot");
+    } else {
+        job->ok = true;
+    }
     if (job->ok) {
         bool detected;
         const char *format_name;
@@ -2175,10 +2231,11 @@ static bool app_load_tape_file(
         return false;
     }
 
-job->hwnd = hwnd;
+    job->hwnd = hwnd;
     job->tick_hz = (uint32_t)app->spec.machine.freq_hz;
     job->assume_128k = assume_128k;
     snprintf(job->path, sizeof(job->path), "%s", path);
+    snprintf(job->source_path, sizeof(job->source_path), "%s", path);
 
     /* Set the in-flight flag before the worker can run so a completion the
        worker posts is always matched by a handler that clears the flag. */
@@ -2191,6 +2248,49 @@ job->hwnd = hwnd;
         return false;
     }
 
+    CloseHandle(thread_handle);
+    return true;
+}
+
+static bool app_load_tape_data(
+    HWND hwnd,
+    AppState *app,
+    uint8_t *data,
+    size_t data_size,
+    const char *entry_name,
+    const char *source_path,
+    bool assume_128k,
+    char *error_buffer,
+    size_t error_buffer_size)
+{
+    AppTapeLoadJob *job;
+    HANDLE thread_handle;
+
+    if (app->tape_load_in_progress || app->snapshot_load_in_progress) {
+        snprintf(error_buffer, error_buffer_size, "A tape or snapshot is already loading.");
+        return false;
+    }
+    job = (AppTapeLoadJob *)calloc(1, sizeof(*job));
+    if (job == NULL) {
+        snprintf(error_buffer, error_buffer_size, "Out of memory while starting tape load.");
+        return false;
+    }
+    job->hwnd = hwnd;
+    job->tick_hz = (uint32_t)app->spec.machine.freq_hz;
+    job->assume_128k = assume_128k;
+    job->data = data;
+    job->data_size = data_size;
+    snprintf(job->path, sizeof(job->path), "%s", entry_name);
+    snprintf(job->source_path, sizeof(job->source_path), "%s", source_path);
+
+    app->tape_load_in_progress = true;
+    thread_handle = CreateThread(NULL, 0, app_tape_load_worker, job, 0, NULL);
+    if (thread_handle == NULL) {
+        app->tape_load_in_progress = false;
+        free(job);
+        snprintf(error_buffer, error_buffer_size, "Could not create tape loading thread.");
+        return false;
+    }
     CloseHandle(thread_handle);
     return true;
 }
@@ -2226,19 +2326,14 @@ static bool app_confirm_discard_disk_changes(HWND hwnd, AppState *app, const cha
 
 /* Inserts a parsed DSK as drive A:, switches to +3 hardware when needed, and
    resets into the ROM Loader so bootable game disks start automatically. */
-static bool app_load_disk_file(
+static bool app_insert_loaded_disk(
     HWND hwnd,
     AppState *app,
-    const char *path,
+    DskImage *loaded,
+    const char *recent_path,
     char *error_buffer,
     size_t error_buffer_size)
 {
-    DskImage loaded;
-    dsk_init(&loaded);
-    if (!dsk_load_file(&loaded, path, error_buffer, error_buffer_size)) {
-        return false;
-    }
-
     app_autotype_clear(app);
     app_release_all_keys(app);
     app_audio_flush(app);
@@ -2251,14 +2346,15 @@ static bool app_load_disk_file(
                 set,
                 error_buffer,
                 error_buffer_size)) {
-            dsk_discard(&loaded);
+            dsk_discard(loaded);
             return false;
         }
         app_save_model(SPECTRUM_MODEL_PLUS3);
     }
 
     dsk_discard(&app->disk);
-    app->disk = loaded;
+    app->disk = *loaded;
+    dsk_init(loaded);
     spectrum_notify_disk_changed(&app->spec);
     spectrum_reset(&app->spec);
     app_sync_tape_stop_mode(app);
@@ -2271,18 +2367,66 @@ static bool app_load_disk_file(
     app_update_title(hwnd, &app->spec);
     app_update_model_menu(hwnd, app->spec.model);
     app_update_microdrive_menu(hwnd, app);
-    app_update_disk_menu(hwnd, true);
+    app_update_disk_menu(hwnd, true, !app->disk.source_read_only);
     app_debug_machine_changed(app);
-    app_add_recent_media(app, path);
+    app_add_recent_media(app, recent_path);
     app_rewind_clear(app);
     InvalidateRect(hwnd, NULL, FALSE);
     return true;
 }
 
+static bool app_load_disk_file(
+    HWND hwnd,
+    AppState *app,
+    const char *path,
+    char *error_buffer,
+    size_t error_buffer_size)
+{
+    DskImage loaded;
+    dsk_init(&loaded);
+    if (!dsk_load_file(&loaded, path, error_buffer, error_buffer_size)) {
+        return false;
+    }
+    return app_insert_loaded_disk(
+        hwnd,
+        app,
+        &loaded,
+        path,
+        error_buffer,
+        error_buffer_size);
+}
+
+static bool app_load_disk_data(
+    HWND hwnd,
+    AppState *app,
+    const uint8_t *data,
+    size_t data_size,
+    const char *display_path,
+    const char *recent_path,
+    bool source_read_only,
+    char *error_buffer,
+    size_t error_buffer_size)
+{
+    DskImage loaded;
+    dsk_init(&loaded);
+    if (!dsk_load_data(&loaded, data, data_size, error_buffer, error_buffer_size)) {
+        return false;
+    }
+    loaded.source_read_only = source_read_only;
+    snprintf(loaded.path, sizeof(loaded.path), "%s", display_path);
+    return app_insert_loaded_disk(
+        hwnd,
+        app,
+        &loaded,
+        recent_path,
+        error_buffer,
+        error_buffer_size);
+}
+
 static void app_eject_disk(HWND hwnd, AppState *app) {
     dsk_discard(&app->disk);
     spectrum_notify_disk_changed(&app->spec);
-    app_update_disk_menu(hwnd, false);
+    app_update_disk_menu(hwnd, false, false);
 }
 
 static bool app_confirm_microdrive_changes(
@@ -2343,15 +2487,15 @@ static bool app_confirm_all_microdrive_changes(
     return true;
 }
 
-static bool app_load_microdrive_file(
+static bool app_insert_loaded_microdrive(
     HWND hwnd,
     AppState *app,
-    const char *path,
+    MicrodriveBank *loaded,
     int requested_drive,
+    const char *recent_path,
     char *error_buffer,
     size_t error_buffer_size)
 {
-    MicrodriveBank loaded;
     SpectrumModel interface_model;
     const RomSet *set;
     int drive = requested_drive;
@@ -2361,6 +2505,7 @@ static bool app_load_microdrive_file(
             error_buffer,
             error_buffer_size,
             "Interface 1 ROM is not available. Place Interface1-v2.rom in the roms folder.");
+        microdrive_bank_discard(loaded);
         return false;
     }
     if (drive < 0) {
@@ -2368,6 +2513,7 @@ static bool app_load_microdrive_file(
     }
     if (drive < 0 || drive >= MICRODRIVE_COUNT) {
         snprintf(error_buffer, error_buffer_size, "Both Microdrives already contain cartridges.");
+        microdrive_bank_discard(loaded);
         return false;
     }
     if (!app_confirm_microdrive_changes(
@@ -2375,17 +2521,8 @@ static bool app_load_microdrive_file(
             app,
             (uint8_t)drive,
             "inserting another cartridge")) {
+        microdrive_bank_discard(loaded);
         return true;
-    }
-
-    microdrive_bank_init(&loaded);
-    if (!microdrive_load_file(
-            &loaded,
-            0,
-            path,
-            error_buffer,
-            error_buffer_size)) {
-        return false;
     }
 
     if (app->spec.model == SPECTRUM_MODEL_PLUS2A ||
@@ -2400,7 +2537,7 @@ static bool app_load_microdrive_file(
                 set,
                 error_buffer,
                 error_buffer_size)) {
-            microdrive_bank_discard(&loaded);
+            microdrive_bank_discard(loaded);
             return false;
         }
         app_save_model(interface_model);
@@ -2410,12 +2547,74 @@ static bool app_load_microdrive_file(
     }
 
     microdrive_eject(&app->microdrives, (uint8_t)drive);
-    app->microdrives.drives[drive] = loaded.drives[0];
-    memset(&loaded.drives[0], 0, sizeof(loaded.drives[0]));
-    microdrive_bank_discard(&loaded);
+    app->microdrives.drives[drive] = loaded->drives[0];
+    memset(&loaded->drives[0], 0, sizeof(loaded->drives[0]));
+    microdrive_bank_discard(loaded);
     app_update_microdrive_menu(hwnd, app);
-    app_add_recent_media(app, path);
+    app_add_recent_media(app, recent_path);
     return true;
+}
+
+static bool app_load_microdrive_file(
+    HWND hwnd,
+    AppState *app,
+    const char *path,
+    int requested_drive,
+    char *error_buffer,
+    size_t error_buffer_size)
+{
+    MicrodriveBank loaded;
+    microdrive_bank_init(&loaded);
+    if (!microdrive_load_file(
+            &loaded,
+            0,
+            path,
+            error_buffer,
+            error_buffer_size)) {
+        return false;
+    }
+    return app_insert_loaded_microdrive(
+        hwnd,
+        app,
+        &loaded,
+        requested_drive,
+        path,
+        error_buffer,
+        error_buffer_size);
+}
+
+static bool app_load_microdrive_data(
+    HWND hwnd,
+    AppState *app,
+    const uint8_t *data,
+    size_t data_size,
+    const char *display_path,
+    const char *recent_path,
+    int requested_drive,
+    char *error_buffer,
+    size_t error_buffer_size)
+{
+    MicrodriveBank loaded;
+    microdrive_bank_init(&loaded);
+    if (!microdrive_load_data(
+            &loaded,
+            0,
+            data,
+            data_size,
+            display_path,
+            true,
+            error_buffer,
+            error_buffer_size)) {
+        return false;
+    }
+    return app_insert_loaded_microdrive(
+        hwnd,
+        app,
+        &loaded,
+        requested_drive,
+        recent_path,
+        error_buffer,
+        error_buffer_size);
 }
 
 static bool app_create_microdrive_file(
@@ -2494,8 +2693,9 @@ static bool app_load_snapshot_file(
         snprintf(error_buffer, error_buffer_size, "Out of memory while starting snapshot load.");
         return false;
     }
-job->hwnd = hwnd;
+    job->hwnd = hwnd;
     snprintf(job->path, sizeof(job->path), "%s", path);
+    snprintf(job->source_path, sizeof(job->source_path), "%s", path);
 
     /* Set the in-flight flag before the worker can run so a completion the
        worker posts is always matched by a handler that clears the flag. */
@@ -2512,6 +2712,257 @@ job->hwnd = hwnd;
     return true;
 }
 
+static bool app_load_snapshot_data(
+    HWND hwnd,
+    AppState *app,
+    uint8_t *data,
+    size_t data_size,
+    const char *entry_name,
+    const char *source_path,
+    char *error_buffer,
+    size_t error_buffer_size)
+{
+    AppSnapshotLoadJob *job;
+    HANDLE thread_handle;
+
+    if (app->snapshot_load_in_progress || app->tape_load_in_progress) {
+        snprintf(error_buffer, error_buffer_size, "A tape or snapshot is already loading.");
+        return false;
+    }
+    job = (AppSnapshotLoadJob *)calloc(1, sizeof(*job));
+    if (job == NULL) {
+        snprintf(error_buffer, error_buffer_size, "Out of memory while starting snapshot load.");
+        return false;
+    }
+    job->hwnd = hwnd;
+    job->data = data;
+    job->size = data_size;
+    snprintf(job->path, sizeof(job->path), "%s", entry_name);
+    snprintf(job->source_path, sizeof(job->source_path), "%s", source_path);
+
+    app->snapshot_load_in_progress = true;
+    thread_handle = CreateThread(NULL, 0, app_snapshot_load_worker, job, 0, NULL);
+    if (thread_handle == NULL) {
+        app->snapshot_load_in_progress = false;
+        free(job);
+        snprintf(error_buffer, error_buffer_size, "Could not create snapshot loading thread.");
+        return false;
+    }
+    CloseHandle(thread_handle);
+    return true;
+}
+
+static bool app_is_supported_media_name(const char *name) {
+    const char *extension = name != NULL ? strrchr(name, '.') : NULL;
+    return extension != NULL &&
+        (_stricmp(extension, ".tap") == 0 ||
+         _stricmp(extension, ".tzx") == 0 ||
+         _stricmp(extension, ".pzx") == 0 ||
+         _stricmp(extension, ".mdr") == 0 ||
+         _stricmp(extension, ".dsk") == 0 ||
+         _stricmp(extension, ".scr") == 0 ||
+         _stricmp(extension, ".z80") == 0 ||
+         _stricmp(extension, ".sna") == 0 ||
+         _stricmp(extension, ".szx") == 0);
+}
+
+static int app_choose_zip_entry(
+    HWND hwnd,
+    const ZipArchive *archive,
+    const size_t *matches,
+    size_t match_count)
+{
+    HMENU menu;
+    RECT window_rect;
+    UINT command;
+    int x;
+    int y;
+
+    if (match_count == 1) {
+        return 0;
+    }
+    menu = CreatePopupMenu();
+    if (menu == NULL) {
+        return -2;
+    }
+    AppendMenuA(menu, MF_STRING | MF_DISABLED, 0, "Choose a file from the ZIP archive:");
+    AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
+    for (size_t index = 0; index < match_count; ++index) {
+        const char *name = archive->entries[matches[index]].name;
+        char label[ZIP_ENTRY_NAME_CAPACITY * 2];
+        size_t output = 0;
+        for (size_t input = 0; name[input] != '\0' && output + 2 < sizeof(label); ++input) {
+            if (name[input] == '&') {
+                label[output++] = '&';
+            }
+            label[output++] = name[input];
+        }
+        label[output] = '\0';
+        AppendMenuA(menu, MF_STRING, (UINT_PTR)(index + 1), label);
+    }
+    GetWindowRect(hwnd, &window_rect);
+    x = (window_rect.left + window_rect.right) / 2;
+    y = (window_rect.top + window_rect.bottom) / 2;
+    SetForegroundWindow(hwnd);
+    command = TrackPopupMenu(
+        menu,
+        TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN,
+        x,
+        y,
+        0,
+        hwnd,
+        NULL);
+    DestroyMenu(menu);
+    return command == 0 ? -1 : (int)command - 1;
+}
+
+static bool app_load_zip_file(
+    HWND hwnd,
+    AppState *app,
+    const char *path,
+    bool assume_128k,
+    char *error_buffer,
+    size_t error_buffer_size)
+{
+    ZipArchive archive;
+    size_t *matches = NULL;
+    size_t match_count = 0;
+    int choice;
+    size_t entry_index;
+    char entry_name[ZIP_ENTRY_NAME_CAPACITY];
+    char display_path[MAX_PATH];
+    const char *extension;
+    uint8_t *data = NULL;
+    size_t data_size = 0;
+    bool loaded = false;
+
+    zip_init(&archive);
+    if (!zip_open_file(&archive, path, error_buffer, error_buffer_size)) {
+        return false;
+    }
+    matches = (size_t *)malloc(archive.entry_count * sizeof(*matches));
+    if (archive.entry_count != 0 && matches == NULL) {
+        zip_discard(&archive);
+        snprintf(error_buffer, error_buffer_size, "Out of memory while scanning ZIP archive.");
+        return false;
+    }
+    for (size_t index = 0; index < archive.entry_count; ++index) {
+        if (!archive.entries[index].is_directory &&
+            app_is_supported_media_name(archive.entries[index].name)) {
+            matches[match_count++] = index;
+        }
+    }
+    if (match_count == 0) {
+        free(matches);
+        zip_discard(&archive);
+        snprintf(
+            error_buffer,
+            error_buffer_size,
+            "The ZIP archive contains no supported ZX Spectrum media files.");
+        return false;
+    }
+    choice = app_choose_zip_entry(hwnd, &archive, matches, match_count);
+    if (choice == -1) {
+        free(matches);
+        zip_discard(&archive);
+        return true;
+    }
+    if (choice < 0 || (size_t)choice >= match_count) {
+        free(matches);
+        zip_discard(&archive);
+        snprintf(error_buffer, error_buffer_size, "Could not create the ZIP file selection menu.");
+        return false;
+    }
+    entry_index = matches[choice];
+    snprintf(entry_name, sizeof(entry_name), "%s", archive.entries[entry_index].name);
+    free(matches);
+    if (!zip_extract_entry(
+            &archive,
+            entry_index,
+            &data,
+            &data_size,
+            error_buffer,
+            error_buffer_size)) {
+        zip_discard(&archive);
+        return false;
+    }
+    zip_discard(&archive);
+    snprintf(display_path, sizeof(display_path), "%s > %s", path, entry_name);
+    extension = strrchr(entry_name, '.');
+
+    if (_stricmp(extension, ".dsk") == 0) {
+        if (!app_confirm_discard_disk_changes(hwnd, app, "Insert another disk")) {
+            loaded = true;
+        } else {
+            loaded = app_load_disk_data(
+                hwnd,
+                app,
+                data,
+                data_size,
+                display_path,
+                path,
+                true,
+                error_buffer,
+                error_buffer_size);
+        }
+    } else if (_stricmp(extension, ".mdr") == 0) {
+        loaded = app_load_microdrive_data(
+            hwnd,
+            app,
+            data,
+            data_size,
+            display_path,
+            path,
+            -1,
+            error_buffer,
+            error_buffer_size);
+    } else if (_stricmp(extension, ".scr") == 0) {
+        loaded = spectrum_load_screen_scr_data(
+            &app->spec,
+            data,
+            data_size,
+            error_buffer,
+            error_buffer_size);
+        if (loaded) {
+            app_add_recent_media(app, path);
+            app_rewind_clear(app);
+            app_debug_machine_changed(app);
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+    } else if (_stricmp(extension, ".tap") == 0 ||
+               _stricmp(extension, ".tzx") == 0 ||
+               _stricmp(extension, ".pzx") == 0) {
+        loaded = app_load_tape_data(
+            hwnd,
+            app,
+            data,
+            data_size,
+            entry_name,
+            path,
+            assume_128k,
+            error_buffer,
+            error_buffer_size);
+        if (loaded) {
+            data = NULL;
+        }
+    } else {
+        loaded = app_load_snapshot_data(
+            hwnd,
+            app,
+            data,
+            data_size,
+            entry_name,
+            path,
+            error_buffer,
+            error_buffer_size);
+        if (loaded) {
+            data = NULL;
+        }
+    }
+    free(data);
+    return loaded;
+}
+
 /* Routes a media path through the same loaders used by the Open dialog. */
 static bool app_load_media_path(
     HWND hwnd,
@@ -2522,6 +2973,16 @@ static bool app_load_media_path(
     size_t error_buffer_size
 ) {
     const char *extension = strrchr(path, '.');
+
+    if (extension != NULL && _stricmp(extension, ".zip") == 0) {
+        return app_load_zip_file(
+            hwnd,
+            app,
+            path,
+            assume_128k,
+            error_buffer,
+            error_buffer_size);
+    }
 
     if (extension != NULL && _stricmp(extension, ".dsk") == 0) {
         if (!app_confirm_discard_disk_changes(hwnd, app, "Insert another disk")) {
@@ -2598,7 +3059,7 @@ static bool app_load_media_path(
     snprintf(
         error_buffer,
         error_buffer_size,
-        "Unsupported file type. Open or drop a .tap, .tzx, .pzx, .mdr, .dsk, .scr, .z80, .sna, or .szx file.");
+        "Unsupported file type. Open or drop a .zip, .tap, .tzx, .pzx, .mdr, .dsk, .scr, .z80, .sna, or .szx file.");
     return false;
 }
 
@@ -3408,7 +3869,7 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                                    sizeof(job->error))) {
 app_show_error(job->error);
                     } else {
-                        app_add_recent_media(app, job->path);
+                        app_add_recent_media(app, job->source_path);
                         app_rewind_clear(app);
                     }
                     /* The worker already discarded the media for a failed
@@ -3431,7 +3892,7 @@ app_show_error(job->error);
                     } else if (!app_apply_loaded_snapshot(hwnd, app, job, job->error, sizeof(job->error))) {
 app_show_error(job->error);
                     } else {
-                        app_add_recent_media(app, job->path);
+                        app_add_recent_media(app, job->source_path);
                         app_rewind_clear(app);
                     }
                     /* The worker already freed the buffer for a failed load;
@@ -3458,7 +3919,8 @@ app_show_error(job->error);
                         ofn.lStructSize = sizeof(ofn);
                         ofn.hwndOwner = hwnd;
                         ofn.lpstrFilter =
-                            "ZX Spectrum Files (*.tap;*.tzx;*.pzx;*.mdr;*.dsk;*.scr;*.z80;*.sna;*.szx)\0*.tap;*.tzx;*.pzx;*.mdr;*.dsk;*.scr;*.z80;*.sna;*.szx\0"
+                            "ZX Spectrum Files (*.zip;*.tap;*.tzx;*.pzx;*.mdr;*.dsk;*.scr;*.z80;*.sna;*.szx)\0*.zip;*.tap;*.tzx;*.pzx;*.mdr;*.dsk;*.scr;*.z80;*.sna;*.szx\0"
+                            "ZIP Archives (*.zip)\0*.zip\0"
                             "Tape Images (*.tap;*.tzx;*.pzx)\0*.tap;*.tzx;*.pzx\0"
                             "Microdrive Cartridges (*.mdr)\0*.mdr\0"
                             "Spectrum +3 Disks (*.dsk)\0*.dsk\0"
@@ -3909,7 +4371,7 @@ app_show_error(job->error);
                             const uint8_t drive = (uint8_t)(
                                 LOWORD(wparam) - APP_MENU_MICRODRIVE_WRITE_PROTECT_BASE);
                             MicrodriveCartridge *cartridge = &app->microdrives.drives[drive];
-                            if (cartridge->inserted) {
+                            if (cartridge->inserted && !cartridge->source_read_only) {
                                 cartridge->write_protected = !cartridge->write_protected;
                                 cartridge->dirty = true;
                                 app_update_microdrive_menu(hwnd, app);
@@ -5189,7 +5651,7 @@ int main(int argc, char **argv) {
     app_update_model_menu(hwnd, app.spec.model);
     app_update_microdrive_menu(hwnd, &app);
     app_update_sound_menu(hwnd, &app);
-    app_update_disk_menu(hwnd, app.disk.inserted);
+    app_update_disk_menu(hwnd, app.disk.inserted, !app.disk.source_read_only);
     app_update_runtime_menu(hwnd, &app);
     app_update_input_menu(hwnd, &app);
     app_update_recent_menu(hwnd, &app);

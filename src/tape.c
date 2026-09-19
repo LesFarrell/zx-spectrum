@@ -1636,8 +1636,7 @@ bool tape_load_file_with_options(
     FILE *file;
     uint8_t *data = NULL;
     int64_t file_size;
-    bool ok = false;
-    const char *extension;
+    bool ok;
 
     if (player == NULL || path == NULL) {
         tape_set_error(error_buffer, error_buffer_size, "Invalid tape load request", path);
@@ -1676,34 +1675,62 @@ bool tape_load_file_with_options(
     }
     fclose(file);
 
+    ok = tape_load_data_with_options(
+        player,
+        data,
+        (size_t)file_size,
+        path,
+        tick_hz,
+        error_buffer,
+        error_buffer_size,
+        options);
+    free(data);
+    return ok;
+}
+
+bool tape_load_data_with_options(
+    TapePlayer *player,
+    const uint8_t *data,
+    size_t data_size,
+    const char *name,
+    uint32_t tick_hz,
+    char *error_buffer,
+    size_t error_buffer_size,
+    const TapeLoadOptions *options)
+{
+    bool ok = false;
+    const char *extension;
+
+    if (player == NULL || data == NULL || data_size == 0 || name == NULL) {
+        tape_set_error(error_buffer, error_buffer_size, "Invalid tape data", name);
+        return false;
+    }
     tape_discard(player);
     player->tick_hz = tick_hz;
 
-    extension = strrchr(path, '.');
+    extension = strrchr(name, '.');
     if (extension != NULL && _stricmp(extension, ".tap") == 0) {
-        ok = tape_parse_tap(player, data, (size_t)file_size, error_buffer, error_buffer_size, path);
+        ok = tape_parse_tap(player, data, data_size, error_buffer, error_buffer_size, name);
     } else if (extension != NULL && _stricmp(extension, ".tzx") == 0) {
         ok = tape_parse_tzx(
             player,
             data,
-            (size_t)file_size,
+            data_size,
             error_buffer,
             error_buffer_size,
-            path,
+            name,
             options);
     } else if (extension != NULL && _stricmp(extension, ".pzx") == 0) {
         ok = tape_parse_pzx(
             player,
             data,
-            (size_t)file_size,
+            data_size,
             error_buffer,
             error_buffer_size,
-            path);
+            name);
     } else {
-        tape_set_error(error_buffer, error_buffer_size, "Unsupported tape extension", path);
+        tape_set_error(error_buffer, error_buffer_size, "Unsupported tape extension", name);
     }
-
-    free(data);
 
     if (!ok) {
         tape_discard(player);

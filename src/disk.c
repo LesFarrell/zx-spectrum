@@ -316,6 +316,10 @@ bool dsk_save_file(
     FILE *file;
     bool ok;
 
+    if (image != NULL && image->source_read_only) {
+        snprintf(error_buffer, error_buffer_size, "A disk loaded from a ZIP archive is read-only.");
+        return false;
+    }
     if (image == NULL || !image->inserted || image->data == NULL ||
         image->data_size == 0 || image->path[0] == '\0') {
         snprintf(error_buffer, error_buffer_size, "No disk is inserted.");
@@ -390,7 +394,7 @@ bool dsk_write_sector(
 {
     DskImage *image = (DskImage *)user_data;
     DskSector *sector;
-    if (!dsk_drive_ready(image, drive) || buffer == NULL) {
+    if (!dsk_drive_ready(image, drive) || buffer == NULL || image->source_read_only) {
         return false;
     }
     sector = dsk_find_sector(image, c, h, r, n);

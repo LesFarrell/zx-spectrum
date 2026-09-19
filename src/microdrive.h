@@ -18,6 +18,7 @@ typedef struct MicrodriveCartridge {
     bool inserted;
     bool dirty;
     bool write_protected;
+    bool source_read_only;
     char path[260];
 } MicrodriveCartridge;
 
@@ -32,6 +33,17 @@ bool microdrive_load_file(
     MicrodriveBank *bank,
     uint8_t drive,
     const char *path,
+    char *error_buffer,
+    size_t error_buffer_size
+);
+
+bool microdrive_load_data(
+    MicrodriveBank *bank,
+    uint8_t drive,
+    const uint8_t *data,
+    size_t data_size,
+    const char *display_path,
+    bool source_read_only,
     char *error_buffer,
     size_t error_buffer_size
 );

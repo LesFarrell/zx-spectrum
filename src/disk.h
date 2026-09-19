@@ -34,6 +34,7 @@ typedef struct DskImage {
     bool extended;
     bool inserted;
     bool dirty;
+    bool source_read_only;
     char path[260];
 } DskImage;
 

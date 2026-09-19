@@ -45,6 +45,9 @@ Small ZX Spectrum emulator in C for Windows. It uses the Win32 API for display, 
   including zlib-compressed RAM pages, paging, AY, ULAplus `PLTT`, Fuller AY,
   SpecDrum, Covox, and Multiface state
 - `.scr` screen loading and saving for the currently displayed RAM bank
+- `.zip` archive loading for every supported tape, disk, Microdrive, screen,
+  and snapshot format, with an entry picker when an archive contains several
+  supported files
 - Pause, selectable 1x/2x/4x/8x speed, borderless fullscreen, and centered
   integer display scaling
 - A 30-second in-memory rewind history sampled once per second
@@ -142,13 +145,16 @@ Spectrum +3 with one combined 64 KB ROM:
 
 ## Menu
 
-- `File -> Open Media/Snapshot...` opens `.tap`, `.tzx`, `.pzx`, `.mdr`, `.dsk`, `.scr`, `.z80`, `.sna`, or `.szx` files
+- `File -> Open Media/Snapshot...` opens `.zip`, `.tap`, `.tzx`, `.pzx`, `.mdr`, `.dsk`, `.scr`, `.z80`, `.sna`, or `.szx` files
 - `File -> Save Snapshot...` writes every supported model as `.z80`, or writes
   48K/128K/+2 machines as `.sna` when that extension is selected
 - `File -> Save Screen...` writes the visible Spectrum screen as a 6912-byte `.scr`
 - `File -> Recent Media` remembers the eight most recently opened media files
-- Drag one supported tape, disk, or snapshot file onto the emulator window to
+- Drag one supported ZIP, tape, disk, or snapshot file onto the emulator window to
   load it through the same media handling
+- ZIP archives support stored and deflated entries. Disk and Microdrive images
+  opened from an archive are mounted read-only so the archive cannot be
+  overwritten accidentally.
 - Opening a `.dsk` inserts it as +3 drive `A:`, switches to the +3 model,
   and starts the ROM Loader so bootable disks run automatically
 - `Disk -> Save Disk` writes sector changes back to the inserted DSK

@@ -21,6 +21,7 @@ zig cc ^
     main.c ^
     spectrum.c ^
     szx_inflate.c ^
+    zip.c ^
     disk.c ^
     microdrive.c ^
     tape.c ^

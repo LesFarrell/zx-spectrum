@@ -417,6 +417,25 @@ bool szx_inflate_zlib(
     return actual_size == destination_size;
 }
 
+bool szx_inflate_raw(
+    const uint8_t *source,
+    size_t source_size,
+    uint8_t *destination,
+    size_t destination_size)
+{
+    size_t actual_size = 0;
+    if (source == NULL || destination == NULL)
+    {
+        return false;
+    }
+    return szx_expand_deflate(
+        source,
+        source_size,
+        destination,
+        destination_size,
+        &actual_size) && actual_size == destination_size;
+}
+
 bool szx_inflate_zlib_bounded(
     const uint8_t *source,
     size_t source_size,

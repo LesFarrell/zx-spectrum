@@ -79,18 +79,59 @@ bool microdrive_load_file(
     char *error_buffer,
     size_t error_buffer_size)
 {
-    MicrodriveCartridge loaded;
-    size_t sector_bytes;
+    uint8_t *data = NULL;
+    size_t data_size = 0;
+    bool loaded;
 
     if (bank == NULL || drive >= MICRODRIVE_COUNT || path == NULL) {
         snprintf(error_buffer, error_buffer_size, "Invalid Microdrive drive or path.");
         return false;
     }
 
-    memset(&loaded, 0, sizeof(loaded));
-    if (!microdrive_read_file(path, &loaded.data, &loaded.data_size, error_buffer, error_buffer_size)) {
+    if (!microdrive_read_file(path, &data, &data_size, error_buffer, error_buffer_size)) {
         return false;
     }
+
+    loaded = microdrive_load_data(
+        bank,
+        drive,
+        data,
+        data_size,
+        path,
+        false,
+        error_buffer,
+        error_buffer_size);
+    free(data);
+    return loaded;
+}
+
+bool microdrive_load_data(
+    MicrodriveBank *bank,
+    uint8_t drive,
+    const uint8_t *data,
+    size_t data_size,
+    const char *display_path,
+    bool source_read_only,
+    char *error_buffer,
+    size_t error_buffer_size)
+{
+    MicrodriveCartridge loaded;
+    size_t sector_bytes;
+
+    if (bank == NULL || drive >= MICRODRIVE_COUNT || data == NULL ||
+        display_path == NULL) {
+        snprintf(error_buffer, error_buffer_size, "Invalid Microdrive image data.");
+        return false;
+    }
+
+    memset(&loaded, 0, sizeof(loaded));
+    loaded.data = (uint8_t *)malloc(data_size);
+    if (loaded.data == NULL) {
+        snprintf(error_buffer, error_buffer_size, "Out of memory while loading Microdrive cartridge.");
+        return false;
+    }
+    memcpy(loaded.data, data, data_size);
+    loaded.data_size = data_size;
 
     sector_bytes = loaded.data_size - (loaded.data_size % MICRODRIVE_SECTOR_SIZE);
     if ((loaded.data_size % MICRODRIVE_SECTOR_SIZE) > 1 ||
@@ -104,11 +145,12 @@ bool microdrive_load_file(
         return false;
     }
 
-    loaded.write_protected =
-        loaded.data_size == sector_bytes + 1 && loaded.data[sector_bytes] != 0;
+    loaded.source_read_only = source_read_only;
+    loaded.write_protected = source_read_only ||
+        (loaded.data_size == sector_bytes + 1 && loaded.data[sector_bytes] != 0);
     loaded.data_size = sector_bytes;
     loaded.inserted = true;
-    snprintf(loaded.path, sizeof(loaded.path), "%s", path);
+    snprintf(loaded.path, sizeof(loaded.path), "%s", display_path);
 
     microdrive_eject(bank, drive);
     bank->drives[drive] = loaded;
@@ -227,6 +269,10 @@ bool microdrive_save(
         return false;
     }
     cartridge = &bank->drives[drive];
+    if (cartridge->source_read_only) {
+        snprintf(error_buffer, error_buffer_size, "A cartridge loaded from a ZIP archive is read-only.");
+        return false;
+    }
     if (cartridge->path[0] == '\0') {
         snprintf(error_buffer, error_buffer_size, "The cartridge has no destination filename.");
         return false;
@@ -288,7 +334,8 @@ bool microdrive_ready(void *user_data, uint8_t drive) {
 bool microdrive_write_protected(void *user_data, uint8_t drive) {
     MicrodriveBank *bank = (MicrodriveBank *)user_data;
     return bank == NULL || drive >= MICRODRIVE_COUNT ||
-        !bank->drives[drive].inserted || bank->drives[drive].write_protected;
+        !bank->drives[drive].inserted || bank->drives[drive].write_protected ||
+        bank->drives[drive].source_read_only;
 }
 
 uint32_t microdrive_length(void *user_data, uint8_t drive) {
