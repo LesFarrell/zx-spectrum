@@ -3113,13 +3113,15 @@ static bool app_apply_loaded_tape(
         : app->spec.model;
 
     if (app->tape_autoload_enabled) {
-        if (!assume_128k) {
+if (!assume_128k) {
             if (autoload_target == TAPE_AUTOLOAD_TARGET_128_MENU) {
                 autoload_model = app->spec.model == SPECTRUM_MODEL_48K
                     ? SPECTRUM_MODEL_128K
                     : app->spec.model;
             } else if (autoload_target == TAPE_AUTOLOAD_TARGET_48_BASIC) {
                 autoload_model = SPECTRUM_MODEL_48K;
+            } else if (app->spec.model == SPECTRUM_MODEL_48K) {
+                autoload_model = SPECTRUM_MODEL_128K;
             }
         }
 
@@ -4598,14 +4600,14 @@ static bool app_parse_args(
 /* Prints the supported command line forms and the default ROM autodetection
    behavior used when the emulator is started without arguments. */
 static void app_print_usage(void) {
-    fprintf(stderr, "Usage:\n");
-    fprintf(stderr, "  zxspecemu --48  <48k.rom>\n");
-    fprintf(stderr, "  zxspecemu --128 <128k-0.rom> <128k-1.rom>\n");
-    fprintf(stderr, "  zxspecemu --128 <128k-combined-32k.rom>\n");
-    fprintf(stderr, "  zxspecemu --plus2 <plus2-combined-32k.rom>\n");
-    fprintf(stderr, "  zxspecemu --plus2a <plus2a-combined-64k.rom>\n");
-    fprintf(stderr, "  zxspecemu --plus3 <plus3-combined-64k.rom>\n");
-    fprintf(stderr, "  zxspecemu\n");
+fprintf(stderr, "Usage:\n");
+    fprintf(stderr, "  zx-spectrum.exe --48  <48k.rom>\n");
+    fprintf(stderr, "  zx-spectrum.exe --128 <128k-0.rom> <128k-1.rom>\n");
+    fprintf(stderr, "  zx-spectrum.exe --128 <128k-combined-32k.rom>\n");
+    fprintf(stderr, "  zx-spectrum.exe --plus2 <plus2-combined-32k.rom>\n");
+    fprintf(stderr, "  zx-spectrum.exe --plus2a <plus2a-combined-64k.rom>\n");
+    fprintf(stderr, "  zx-spectrum.exe --plus3 <plus3-combined-64k.rom>\n");
+    fprintf(stderr, "  zx-spectrum.exe\n");
     fprintf(stderr, "\nAutodetects ROM images in the roms folder.\n");
 }
 

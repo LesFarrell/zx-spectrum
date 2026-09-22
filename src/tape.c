@@ -82,6 +82,29 @@ static bool tape_program_uses_128_basic_tokens(const TapeBlock *block) {
     return false;
 }
 
+/* Bare 16 KB data blocks without a preceding header are the classic shape of
+   a 128K multi-bank loader; 48K programs have no reason to dump whole RAM
+   banks, so a couple of them pin the machine to a 128K model. */
+static bool tape_has_full_ram_banks(const TapePlayer *player) {
+    size_t bank_count = 0;
+
+    for (size_t i = 0; i < player->block_count; ++i) {
+        const TapeBlock *block = &player->blocks[i];
+        const TapeBlock *previous = i > 0 ? &player->blocks[i - 1] : NULL;
+        if (block->bytes != NULL &&
+            block->bytes[0] == 0xFF &&
+            block->length == 16386u &&
+            (previous == NULL ||
+             previous->length == 0 ||
+             previous->bytes[0] != 0x00)) {
+            if (++bank_count >= 2) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 /* Classifies the likely ROM-side autoload path from the first indexed blocks.
    Ambiguous tapes fall back to 48 BASIC because most TAP/TZX program images
    use a standard 48K loader even when opened from a 128K-capable frontend. */
@@ -96,6 +119,9 @@ static TapeAutoloadTarget tape_detect_autoload_target(const TapePlayer *player) 
     }
     if (player->block_count == 0) {
         return TAPE_AUTOLOAD_TARGET_UNKNOWN;
+    }
+    if (tape_has_full_ram_banks(player)) {
+        return TAPE_AUTOLOAD_TARGET_128_MENU;
     }
     if (!tape_is_standard_header_block(&player->blocks[0], &first_type)) {
         return TAPE_AUTOLOAD_TARGET_48_BASIC;
