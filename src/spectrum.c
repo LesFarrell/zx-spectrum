@@ -10,6 +10,7 @@
 
 #include "spectrum.h"
 #include "szx_inflate.h"
+#include "tape.h"
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -964,6 +965,111 @@ bool spectrum_save_snapshot_z80_file(
         return false;
     }
     return true;
+}
+
+/* Saves the live BASIC program area (PROG..E_LINE, with the variables offset
+   taken from VARS) as a standard SAVE-style TAP program block. */
+bool spectrum_save_program_tap(
+    Spectrum *spec,
+    const char *path,
+    const char *name,
+    char *error_buffer,
+    size_t error_buffer_size)
+{
+    enum {
+        ZX_SYSVAR_VARS = 0x5C4B,
+        ZX_SYSVAR_PROG = 0x5C53,
+        ZX_SYSVAR_E_LINE = 0x5C59,
+        ZX_TAPE_NO_AUTOSTART = 0x8000
+    };
+    uint16_t prog;
+    uint16_t vars;
+    uint16_t e_line;
+    uint16_t length;
+    uint8_t *data;
+    bool ok;
+
+    if (spec == NULL || !spec->machine_ready) {
+        snprintf(error_buffer, error_buffer_size, "No running machine is available to save.");
+        return false;
+    }
+    prog = mem_rd16(&spec->machine.mem, ZX_SYSVAR_PROG);
+    vars = mem_rd16(&spec->machine.mem, ZX_SYSVAR_VARS);
+    e_line = mem_rd16(&spec->machine.mem, ZX_SYSVAR_E_LINE);
+    if (prog < 0x4000u || vars < prog || e_line < vars || vars == prog) {
+        snprintf(error_buffer, error_buffer_size, "No BASIC program has been typed or loaded in RAM.");
+        return false;
+    }
+    length = (uint16_t)(e_line - prog);
+    if (length == 0) {
+        snprintf(error_buffer, error_buffer_size, "The BASIC program is empty.");
+        return false;
+    }
+
+    data = (uint8_t *)malloc(length);
+    if (data == NULL) {
+        snprintf(error_buffer, error_buffer_size, "Out of memory while preparing the tape image.");
+        return false;
+    }
+    for (uint16_t i = 0; i < length; ++i) {
+        data[i] = mem_rd(&spec->machine.mem, (uint16_t)(prog + i));
+    }
+    ok = tape_write_tap(
+        path,
+        TAPE_SAVE_PROG,
+        name,
+        ZX_TAPE_NO_AUTOSTART,
+        length,
+        (uint16_t)(vars - prog),
+        data,
+        error_buffer,
+        error_buffer_size);
+    free(data);
+    return ok;
+}
+
+/* Saves a range of the currently-visible 64K address space as a CODE block. */
+bool spectrum_save_ram_tap(
+    Spectrum *spec,
+    const char *path,
+    const char *name,
+    uint16_t start,
+    uint16_t length,
+    char *error_buffer,
+    size_t error_buffer_size)
+{
+    uint8_t *data;
+    bool ok;
+
+    if (spec == NULL || !spec->machine_ready) {
+        snprintf(error_buffer, error_buffer_size, "No running machine is available to save.");
+        return false;
+    }
+    if (length == 0 || (uint32_t)start + (uint32_t)length > 0x10000u) {
+        snprintf(error_buffer, error_buffer_size, "The memory range does not fit inside the 64K address space.");
+        return false;
+    }
+
+    data = (uint8_t *)malloc(length);
+    if (data == NULL) {
+        snprintf(error_buffer, error_buffer_size, "Out of memory while preparing the tape image.");
+        return false;
+    }
+    for (uint16_t i = 0; i < length; ++i) {
+        data[i] = mem_rd(&spec->machine.mem, (uint16_t)(start + i));
+    }
+    ok = tape_write_tap(
+        path,
+        TAPE_SAVE_CODE,
+        name,
+        start,
+        length,
+        0x8000,
+        data,
+        error_buffer,
+        error_buffer_size);
+    free(data);
+    return ok;
 }
 
 bool spectrum_save_snapshot_sna_file(

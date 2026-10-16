@@ -2,6 +2,7 @@ tmp-ui-check/
 src/*.tzx
 src/*.z80
 src/*.tap
+src/examples/*.tap
 src/*.mdr
 src/*.o
 src/*.res

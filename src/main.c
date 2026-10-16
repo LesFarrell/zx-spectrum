@@ -62,14 +62,16 @@ enum {
     APP_MENU_FILE_AUTOLOAD_TAPES = 1006,
     APP_MENU_FILE_SAVE_SCREEN = 1007,
     APP_MENU_FILE_FAST_TAPE_LOADING = 1008,
-    APP_MENU_FILE_SAVE_SNAPSHOT = 1009,
+APP_MENU_FILE_SAVE_SNAPSHOT = 1009,
+    APP_MENU_FILE_SAVE_PROGRAM_TAPE = 1012,
+    APP_MENU_FILE_SAVE_RAM_TAPE = 1013,
     APP_MENU_DISK_EJECT = 1010,
     APP_MENU_DISK_SAVE = 1011,
     APP_MENU_SOUND_MUTE = 1101,
     APP_MENU_SOUND_FULLER_AY = 1102,
     APP_MENU_SOUND_SPECDRUM = 1103,
     APP_MENU_SOUND_COVOX = 1104,
-    APP_MENU_TOOLS_ASSEMBLER = 1301,
+APP_MENU_TOOLS_ASSEMBLER = 1301,
     APP_MENU_TOOLS_DEBUGGER = 1302,
     APP_MENU_TOOLS_POKE = 1303,
     APP_MENU_MACHINE_48K = 1201,
@@ -83,10 +85,13 @@ enum {
     APP_MENU_MACHINE_SPEED_2X = 1213,
     APP_MENU_MACHINE_SPEED_4X = 1214,
     APP_MENU_MACHINE_SPEED_8X = 1215,
-    APP_MENU_MACHINE_MULTIFACE = 1216,
+APP_MENU_MACHINE_MULTIFACE = 1216,
     APP_MENU_MACHINE_MULTIFACE_NMI = 1217,
+    APP_MENU_MACHINE_RESTART_GAME = 1218,
+    APP_MENU_MACHINE_REPLAY = 1219,
     APP_MENU_VIEW_FULLSCREEN = 1250,
     APP_MENU_VIEW_INTEGER_SCALING = 1251,
+    APP_MENU_VIEW_SCANLINES = 1252,
     APP_MENU_MICRODRIVE_INSERT_BASE = 1400,
     APP_MENU_MICRODRIVE_EJECT_BASE = 1420,
     APP_MENU_MICRODRIVE_WRITE_PROTECT_BASE = 1440,
@@ -140,7 +145,7 @@ enum {
     APP_CTRL_POKE_VALUES = 2111,
     APP_CTRL_POKE_APPLY = 2112,
     APP_CTRL_POKE_STATUS = 2113,
-    APP_CTRL_POKE_ADDRESS_LABEL = 2114,
+APP_CTRL_POKE_ADDRESS_LABEL = 2114,
     APP_CTRL_POKE_VALUES_LABEL = 2115,
     APP_MENU_ASM_FILE_NEW = 2200,
     APP_MENU_ASM_FILE_LOAD = 2201,
@@ -167,7 +172,7 @@ enum {
     APP_TIMER_ASM_FILE_WATCH = 3002,
     APP_DIALOG_DEBUGGER = 4001,
     APP_DIALOG_ASSEMBLER = 4002,
-    APP_DIALOG_POKE = 4003,
+APP_DIALOG_POKE = 4003,
     APP_MSG_TAPE_LOAD_COMPLETE = WM_APP + 1,
     APP_MSG_SNAPSHOT_LOAD_COMPLETE = WM_APP + 2,
     APP_MSG_TZX_SELECT_REQUEST = WM_APP + 3
@@ -460,11 +465,13 @@ struct AppState {
     uint8_t mouse_buttons;
     POINT mouse_last_position;
     bool mouse_tracking;
-    unsigned speed_multiplier;
+unsigned speed_multiplier;
     bool fullscreen;
     bool integer_scaling;
+    bool crt_scanlines;
     bool running;
     bool modal_loop_timer_active;
+    uint32_t *crt_framebuffer;
 };
 
 typedef struct AssemblerSourceLocation {
@@ -596,6 +603,7 @@ static bool app_load_media_path(
     size_t error_buffer_size);
 static bool app_apply_loaded_snapshot(HWND hwnd, AppState *app, AppSnapshotLoadJob *job, char *error_buffer, size_t error_buffer_size);
 static void app_play_tape(AppState *app);
+static void app_tape_begin_autoload(AppState *app);
 static void app_stop_tape(AppState *app);
 static void app_start_tape_playback(AppState *app);
 static bool app_update_tape_loader_activity(AppState *app);
@@ -853,6 +861,8 @@ static HMENU app_create_menu(void) {
     AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_OPEN_SNAPSHOT, "&Open Media/Snapshot...\tCtrl+O");
     AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_SAVE_SNAPSHOT, "&Save Snapshot...\tCtrl+S");
     AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_SAVE_SCREEN, "Save Sc&reen...");
+    AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_SAVE_PROGRAM_TAPE, "Save &Program To Tape...");
+    AppendMenuA(file_menu, MF_STRING, APP_MENU_FILE_SAVE_RAM_TAPE, "Save &RAM To Tape...");
     for (int recent = 0; recent < APP_RECENT_MEDIA_COUNT; ++recent) {
         AppendMenuA(
             recent_menu,
@@ -921,10 +931,14 @@ static HMENU app_create_menu(void) {
     AppendMenuA(machine_menu, MF_POPUP, (UINT_PTR)speed_menu, "&Speed (F6 cycles)");
     AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_REWIND, "&Rewind 5 Seconds\tCtrl+Backspace");
     AppendMenuA(machine_menu, MF_SEPARATOR, 0, NULL);
-    AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_MULTIFACE, "Enable &Multiface");
+AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_MULTIFACE, "Enable &Multiface");
     AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_MULTIFACE_NMI, "Multiface &NMI\tAlt+F5");
+    AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_RESTART_GAME, "Restart &Game\tF9");
+    AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_REPLAY, "&Replay 4 Seconds\tF8");
     AppendMenuA(view_menu, MF_STRING, APP_MENU_VIEW_FULLSCREEN, "&Fullscreen\tF11");
     AppendMenuA(view_menu, MF_STRING, APP_MENU_VIEW_INTEGER_SCALING, "&Integer Scaling");
+    AppendMenuA(view_menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(view_menu, MF_STRING, APP_MENU_VIEW_SCANLINES, "&Scanlines");
     AppendMenuA(joystick_menu, MF_STRING, APP_MENU_INPUT_JOYSTICK_NONE, "&None");
     AppendMenuA(joystick_menu, MF_STRING, APP_MENU_INPUT_JOYSTICK_CURSOR, "&Cursor Keys + Space");
     AppendMenuA(joystick_menu, MF_STRING, APP_MENU_INPUT_JOYSTICK_WASD, "&WASD + Space");
@@ -942,7 +956,7 @@ static HMENU app_create_menu(void) {
     AppendMenuA(sound_menu, MF_STRING, APP_MENU_SOUND_FULLER_AY, "Fuller &AY (48K)");
     AppendMenuA(sound_menu, MF_STRING, APP_MENU_SOUND_SPECDRUM, "&SpecDrum DAC");
     AppendMenuA(sound_menu, MF_STRING, APP_MENU_SOUND_COVOX, "&Covox DAC");
-    AppendMenuA(tools_menu, MF_STRING, APP_MENU_TOOLS_ASSEMBLER, "&Assembler...\tCtrl+Shift+A");
+AppendMenuA(tools_menu, MF_STRING, APP_MENU_TOOLS_ASSEMBLER, "&Assembler...\tCtrl+Shift+A");
     AppendMenuA(tools_menu, MF_STRING, APP_MENU_TOOLS_DEBUGGER, "&Debugger...\tCtrl+Shift+D");
     AppendMenuA(tools_menu, MF_STRING, APP_MENU_TOOLS_POKE, "&Poke...\tCtrl+Shift+P");
     AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)file_menu, "&File");
@@ -1116,10 +1130,12 @@ static void app_update_runtime_menu(HWND hwnd, const AppState *app) {
         menu,
         APP_MENU_VIEW_FULLSCREEN,
         MF_BYCOMMAND | (app->fullscreen ? MF_CHECKED : MF_UNCHECKED));
-    CheckMenuItem(
+CheckMenuItem(
         menu,
         APP_MENU_VIEW_INTEGER_SCALING,
         MF_BYCOMMAND | (app->integer_scaling ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(menu, APP_MENU_VIEW_SCANLINES, MF_BYCOMMAND |
+        (app->crt_scanlines ? MF_CHECKED : MF_UNCHECKED));
 }
 
 static void app_update_input_menu(HWND hwnd, const AppState *app) {
@@ -1706,6 +1722,7 @@ static void app_apply_flat_control_style(HWND parent) {
 #include "assembler_ui.c"
 #include "assembler_core.c"
 #include "poke.c"
+#include "crt.c"
 
 
 /* Appends converted 16-bit PCM samples into the frontend's audio ring buffer,
@@ -3099,6 +3116,44 @@ static bool app_load_media_path(
 /* Inserts an already decoded TAP/TZX image, then either auto-starts a standard
    ROM load or leaves the tape inserted for manual control depending on user
    preference. This runs on the main thread after background file decode ends. */
+static void app_tape_begin_autoload(AppState *app) {
+    app_autotype_clear(app);
+    app_release_all_keys(app);
+    app_audio_flush(app);
+    spectrum_reset(&app->spec);
+    app_sync_tape_stop_mode(app);
+    tape_rewind(&app->tape, (uint32_t)app->spec.machine.freq_hz);
+    if (app->spec.model != SPECTRUM_MODEL_48K) {
+        app->tape_autoplay_pending = app_start_autotype(app, L"\r");
+    } else {
+        app->tape_autoplay_pending = app_start_autotype(app, L"j\"\"\r");
+    }
+    if (app->tape_autoplay_pending) {
+        app->auto_type.cooldown_frames = APP_AUTOTYPE_BOOT_DELAY_FRAMES;
+    }
+    if (!app->tape_autoplay_pending) {
+        app_start_tape_playback(app);
+    }
+}
+
+static void app_restart_current_tape(HWND hwnd, AppState *app) {
+    if (app == NULL || !tape_has_tape(&app->tape)) {
+        MessageBeep(MB_ICONINFORMATION);
+        return;
+    }
+
+    app_tape_begin_autoload(app);
+    app_apply_joystick_mask(app);
+    spectrum_set_mouse(
+        &app->spec,
+        app->mouse_x,
+        app->mouse_y,
+        app->mouse_buttons);
+    app_rewind_clear(app);
+    app_debug_machine_changed(app);
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
 static bool app_apply_loaded_tape(
     HWND hwnd,
     AppState *app,
@@ -3142,24 +3197,8 @@ if (!assume_128k) {
     tape_init(loaded_tape);
     app_stop_tape(app);
 
-    if (app->tape_autoload_enabled) {
-        app_autotype_clear(app);
-        app_release_all_keys(app);
-        app_audio_flush(app);
-        spectrum_reset(&app->spec);
-        app_sync_tape_stop_mode(app);
-        tape_rewind(&app->tape, (uint32_t)app->spec.machine.freq_hz);
-        if (autoload_model != SPECTRUM_MODEL_48K) {
-            app->tape_autoplay_pending = app_start_autotype(app, L"\r");
-        } else {
-            app->tape_autoplay_pending = app_start_autotype(app, L"j\"\"\r");
-        }
-        if (app->tape_autoplay_pending) {
-            app->auto_type.cooldown_frames = APP_AUTOTYPE_BOOT_DELAY_FRAMES;
-        }
-        if (!app->tape_autoplay_pending) {
-            app_start_tape_playback(app);
-        }
+if (app->tape_autoload_enabled) {
+        app_tape_begin_autoload(app);
     } else {
         app_sync_tape_stop_mode(app);
         tape_rewind(&app->tape, (uint32_t)app->spec.machine.freq_hz);
@@ -3249,7 +3288,7 @@ static void app_run_autotype(AppState *app) {
         spectrum_key_up(&app->spec, app->auto_type.active_key_code);
         app->auto_type.active_key_code = 0;
         app->auto_type.cooldown_frames = APP_AUTOTYPE_COOLDOWN_FRAMES;
-        if (app->auto_type.position >= app->auto_type.length) {
+if (app->auto_type.position >= app->auto_type.length) {
             app->auto_type.length = 0;
             app->auto_type.position = 0;
             if (app->tape_autoplay_pending) {
@@ -3325,7 +3364,7 @@ static bool app_update_tape_loader_activity(AppState *app) {
     }
     app->tape_input_reads_this_frame = 0;
 
-    if (app->tape_loader_idle_frames >= APP_TAPE_LOADER_IDLE_FRAMES) {
+if (app->tape_loader_idle_frames >= APP_TAPE_LOADER_IDLE_FRAMES) {
         app_stop_tape(app);
         return true;
     }
@@ -3555,6 +3594,69 @@ static void app_set_modal_loop_timer(AppState *app, HWND hwnd, bool enabled) {
     } else if (app->modal_loop_timer_active) {
         KillTimer(hwnd, APP_TIMER_MODAL_LOOP);
         app->modal_loop_timer_active = false;
+    }
+}
+
+/* Prompts for a .tap destination and writes either the current BASIC program
+   or a CODE block of the visible 48K memory range. */
+static void app_save_to_tap(HWND hwnd, AppState *app, bool program) {
+    OPENFILENAMEA ofn;
+    char path[MAX_PATH];
+    char name[11];
+    char error_buffer[256];
+
+    if (app == NULL) {
+        return;
+    }
+    if (!app->spec.machine_ready) {
+        app_show_error("No running machine is available to save.");
+        return;
+    }
+    snprintf(name, sizeof(name), "%s", "PROGRAM");
+    if (program) {
+        char tape_name[11];
+        if (tape_first_header_name(&app->tape, tape_name, sizeof(tape_name))) {
+            snprintf(name, sizeof(name), "%s", tape_name);
+        }
+    }
+
+    path[0] = '\0';
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = hwnd;
+    ofn.lpstrFilter =
+        "TAP Tapes (*.tap)\0*.tap\0"
+        "All Files (*.*)\0*.*\0";
+    ofn.lpstrFile = path;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.Flags =
+        OFN_OVERWRITEPROMPT |
+        OFN_PATHMUSTEXIST |
+        OFN_NOCHANGEDIR;
+    ofn.lpstrDefExt = "tap";
+
+    if (GetSaveFileNameA(&ofn)) {
+        bool saved;
+        if (program) {
+            saved = spectrum_save_program_tap(
+                &app->spec,
+                path,
+                name,
+                error_buffer,
+                sizeof(error_buffer));
+        } else {
+            saved = spectrum_save_ram_tap(
+                &app->spec,
+                path,
+                name,
+                0x4000,
+                0xC000,
+                error_buffer,
+                sizeof(error_buffer));
+        }
+        if (!saved) {
+            app_show_error(error_buffer);
+        }
     }
 }
 
@@ -3802,8 +3904,14 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                                 SendMessageA(hwnd, WM_COMMAND, speed_command, 0);
                             }
                             return 0;
-                        case VK_F11:
+case VK_F11:
                             SendMessageA(hwnd, WM_COMMAND, APP_MENU_VIEW_FULLSCREEN, 0);
+                            return 0;
+                        case VK_F8:
+                            SendMessageA(hwnd, WM_COMMAND, APP_MENU_MACHINE_REPLAY, 0);
+                            return 0;
+                        case VK_F9:
+                            SendMessageA(hwnd, WM_COMMAND, APP_MENU_MACHINE_RESTART_GAME, 0);
                             return 0;
                         case VK_ESCAPE:
                             if (app->fullscreen) {
@@ -4033,7 +4141,7 @@ app_show_error(job->error);
                             OFN_PATHMUSTEXIST |
                             OFN_NOCHANGEDIR;
                         ofn.lpstrDefExt = "scr";
-                        if (GetSaveFileNameA(&ofn) &&
+if (GetSaveFileNameA(&ofn) &&
                             !spectrum_save_screen_scr_file(
                                 &app->spec,
                                 path,
@@ -4043,6 +4151,12 @@ app_show_error(job->error);
                         }
                         return 0;
                     }
+                    case APP_MENU_FILE_SAVE_PROGRAM_TAPE:
+                        app_save_to_tap(hwnd, app, true);
+                        return 0;
+                    case APP_MENU_FILE_SAVE_RAM_TAPE:
+                        app_save_to_tap(hwnd, app, false);
+                        return 0;
                     case APP_MENU_DISK_SAVE: {
                         char error_buffer[256];
                         if (!dsk_save_file(
@@ -4190,10 +4304,18 @@ app_show_error(job->error);
                         app_save_speed_multiplier(app->speed_multiplier);
                         app_update_runtime_menu(hwnd, app);
                         return 0;
-                    case APP_MENU_MACHINE_REWIND:
+case APP_MENU_MACHINE_REWIND:
                         if (!app_rewind_seconds(app, 5)) {
                             MessageBeep(MB_ICONINFORMATION);
                         }
+                        return 0;
+                    case APP_MENU_MACHINE_REPLAY:
+                        if (!app_rewind_seconds(app, 4)) {
+                            MessageBeep(MB_ICONINFORMATION);
+                        }
+                        return 0;
+                    case APP_MENU_MACHINE_RESTART_GAME:
+                        app_restart_current_tape(hwnd, app);
                         return 0;
                     case APP_MENU_MACHINE_MULTIFACE:
                         if (app->spec.multiface_rom_loaded ||
@@ -4217,8 +4339,14 @@ app_show_error(job->error);
                     case APP_MENU_VIEW_FULLSCREEN:
                         app_set_fullscreen(hwnd, app, !app->fullscreen);
                         return 0;
-                    case APP_MENU_VIEW_INTEGER_SCALING:
+case APP_MENU_VIEW_INTEGER_SCALING:
                         app->integer_scaling = !app->integer_scaling;
+                        app_update_runtime_menu(hwnd, app);
+                        InvalidateRect(hwnd, NULL, FALSE);
+                        return 0;
+                    case APP_MENU_VIEW_SCANLINES:
+                        app->crt_scanlines = !app->crt_scanlines;
+                        app_save_toggle("crt_scanlines", app->crt_scanlines);
                         app_update_runtime_menu(hwnd, app);
                         InvalidateRect(hwnd, NULL, FALSE);
                         return 0;
@@ -4447,7 +4575,11 @@ app_show_error(job->error);
                 if (buffered) {
                     draw_dc = app->video_backbuffer.dc;
                 }
-                PatBlt(draw_dc, 0, 0, target_width, target_height, BLACKNESS);
+PatBlt(draw_dc, 0, 0, target_width, target_height, BLACKNESS);
+                app_crt_apply_effects(app);
+                const uint32_t *render_pixels = app->crt_framebuffer != NULL
+                    ? app->crt_framebuffer
+                    : app->spec.framebuffer;
                 if (app->integer_scaling) {
                     int scale_x = target_width / ZX_SCREEN_WIDTH;
                     int scale_y = target_height / ZX_SCREEN_HEIGHT;
@@ -4473,9 +4605,9 @@ app_show_error(job->error);
                     target_height,
                     0,
                     0,
-                    ZX_SCREEN_WIDTH,
+ZX_SCREEN_WIDTH,
                     ZX_SCREEN_HEIGHT,
-                    app->spec.framebuffer,
+                    render_pixels,
                     &app->bitmap_info,
                     DIB_RGB_COLORS,
                     SRCCOPY
@@ -5581,8 +5713,12 @@ int main(int argc, char **argv) {
     app.multiface_enabled = has_saved_multiface_enabled
         ? saved_multiface_enabled : false;
     app.mouse_x = 128;
-    app.mouse_y = 96;
+app.mouse_y = 96;
     app.integer_scaling = true;
+    app.crt_scanlines = false;
+    app_load_saved_toggle("crt_scanlines", &app.crt_scanlines);
+    app.crt_framebuffer = (uint32_t *)malloc(
+        (size_t)ZX_SCREEN_WIDTH * (size_t)ZX_SCREEN_HEIGHT * sizeof(uint32_t));
     app_load_recent_media(&app);
     tape_init(&app.tape);
     dsk_init(&app.disk);
@@ -5689,7 +5825,7 @@ int main(int argc, char **argv) {
     app_update_title(hwnd, &app.spec);
     app_update_model_menu(hwnd, app.spec.model);
     app_update_microdrive_menu(hwnd, &app);
-    app_update_sound_menu(hwnd, &app);
+app_update_sound_menu(hwnd, &app);
     app_update_disk_menu(hwnd, app.disk.inserted, !app.disk.source_read_only);
     app_update_runtime_menu(hwnd, &app);
     app_update_input_menu(hwnd, &app);
@@ -5738,7 +5874,7 @@ int main(int argc, char **argv) {
                 IsDialogMessageA(app.debug.debugger_panel, &msg)) {
                 continue;
             }
-            if (app.debug.poke_hwnd != NULL &&
+if (app.debug.poke_hwnd != NULL &&
                 app.debug.poke_panel != NULL &&
                 (msg.hwnd == app.debug.poke_panel || IsChild(app.debug.poke_panel, msg.hwnd)) &&
                 msg.message == WM_KEYDOWN &&
@@ -5769,12 +5905,13 @@ MsgWaitForMultipleObjectsEx(0, NULL, 2, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
         app.main_menu = NULL;
     }
 
-    app_controller_shutdown(&app);
+app_controller_shutdown(&app);
     app_audio_shutdown(&app);
     tape_discard(&app.tape);
     dsk_discard(&app.disk);
     microdrive_bank_discard(&app.microdrives);
     app_rewind_discard(&app);
     app_debug_free_storage(&app);
+    free(app.crt_framebuffer);
     return 0;
 }

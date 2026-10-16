@@ -209,6 +209,26 @@ bool spectrum_save_snapshot_sna_file(
     size_t error_buffer_size
 );
 
+/* Saves the live BASIC program area as a standard SAVE-style TAP file. */
+bool spectrum_save_program_tap(
+    Spectrum *spec,
+    const char *path,
+    const char *name,
+    char *error_buffer,
+    size_t error_buffer_size
+);
+
+/* Saves a range of the currently-visible 64K address space as a CODE block. */
+bool spectrum_save_ram_tap(
+    Spectrum *spec,
+    const char *path,
+    const char *name,
+    uint16_t start,
+    uint16_t length,
+    char *error_buffer,
+    size_t error_buffer_size
+);
+
 /* Saves any supported machine as an uncompressed version-3 Z80 snapshot. */
 bool spectrum_save_snapshot_z80_file(
     Spectrum *spec,

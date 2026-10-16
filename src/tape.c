@@ -1,3 +1,5 @@
+#include <windows.h>
+
 #include "tape.h"
 
 #include "chips/chips_common.h"
@@ -80,6 +82,158 @@ static bool tape_program_uses_128_basic_tokens(const TapeBlock *block) {
         }
     }
     return false;
+}
+
+bool tape_first_header_name(const TapePlayer *player, char *name, size_t name_size) {
+    if (player == NULL || name == NULL || name_size == 0) {
+        return false;
+    }
+    name[0] = '\0';
+    for (size_t i = 0; i < player->block_count; ++i) {
+        const TapeBlock *block = &player->blocks[i];
+        if (block == NULL || block->bytes == NULL || block->length < 19 ||
+            block->bytes[0] != 0x00) {
+            continue;
+        }
+        size_t copy = 10;
+        if (copy >= name_size) {
+            copy = name_size - 1;
+        }
+        memcpy(name, &block->bytes[2], copy);
+        name[copy] = '\0';
+        while (copy > 0 && (name[copy - 1] == ' ' || name[copy - 1] == '\0')) {
+            name[--copy] = '\0';
+        }
+        return copy > 0;
+    }
+    return false;
+}
+
+bool tape_write_tap(
+    const char *path,
+    TapeSaveKind kind,
+    const char *name,
+    uint16_t header_param1,
+    uint16_t length,
+    uint16_t header_param2,
+    const uint8_t *data,
+    char *error_buffer,
+    size_t error_buffer_size)
+{
+    static const size_t TAPE_HEADER_BLOCK_LENGTH = 19;
+    FILE *file;
+    char directory[MAX_PATH];
+    char temporary_path[MAX_PATH];
+    const char *last_forward_slash;
+    const char *last_backslash;
+    const char *last_separator;
+    uint8_t header[TAPE_HEADER_BLOCK_LENGTH];
+    uint8_t block_length[2];
+    uint8_t checksum;
+    size_t data_payload;
+    bool ok = false;
+
+    if (path == NULL || path[0] == '\0') {
+        snprintf(error_buffer, error_buffer_size, "No tape file path was supplied.");
+        return false;
+    }
+    if (data == NULL || (size_t)length + 2u > 0xFFFFu) {
+        snprintf(error_buffer, error_buffer_size, "The requested data cannot be represented as a TAP block.");
+        return false;
+    }
+
+    last_forward_slash = strrchr(path, '/');
+    last_backslash = strrchr(path, '\\');
+    last_separator = last_forward_slash;
+    if (last_separator == NULL ||
+        (last_backslash != NULL && last_backslash > last_separator)) {
+        last_separator = last_backslash;
+    }
+    if (last_separator == NULL) {
+        snprintf(directory, sizeof(directory), ".");
+    } else {
+        const size_t directory_length = (size_t)(last_separator - path) + 1u;
+        if (directory_length >= sizeof(directory)) {
+            snprintf(error_buffer, error_buffer_size, "The tape file path is too long.");
+            return false;
+        }
+        memcpy(directory, path, directory_length);
+        directory[directory_length] = '\0';
+    }
+    if (GetTempFileNameA(directory, "zxt", 0, temporary_path) == 0) {
+        snprintf(error_buffer, error_buffer_size, "Could not create a temporary tape file.");
+        return false;
+    }
+
+    header[0] = 0x00;
+    header[1] = (kind == TAPE_SAVE_PROG) ? 0x00u : 0x03u;
+    memset(&header[2], ' ', 10);
+    if (name != NULL) {
+        size_t copy = strlen(name);
+        if (copy > 10) {
+            copy = 10;
+        }
+        memcpy(&header[2], name, copy);
+    }
+    header[12] = (uint8_t)(length & 0xFFu);
+    header[13] = (uint8_t)(length >> 8);
+    header[14] = (uint8_t)(header_param1 & 0xFFu);
+    header[15] = (uint8_t)(header_param1 >> 8);
+    header[16] = (uint8_t)(header_param2 & 0xFFu);
+    header[17] = (uint8_t)(header_param2 >> 8);
+    checksum = 0;
+    for (size_t i = 0; i < 18; ++i) {
+        checksum ^= header[i];
+    }
+    header[18] = checksum;
+
+    file = fopen(temporary_path, "wb");
+    if (file == NULL) {
+        DeleteFileA(temporary_path);
+        snprintf(error_buffer, error_buffer_size, "Could not open the tape file for writing.");
+        return false;
+    }
+
+    block_length[0] = (uint8_t)(TAPE_HEADER_BLOCK_LENGTH & 0xFFu);
+    block_length[1] = (uint8_t)(TAPE_HEADER_BLOCK_LENGTH >> 8);
+    if (fwrite(block_length, 1, sizeof(block_length), file) != sizeof(block_length) ||
+        fwrite(header, 1, sizeof(header), file) != sizeof(header)) {
+        ok = false;
+    }
+    else {
+        data_payload = (size_t)length + 2u;
+        block_length[0] = (uint8_t)(data_payload & 0xFFu);
+        block_length[1] = (uint8_t)(data_payload >> 8);
+        checksum = 0xFF;
+        ok = fwrite(block_length, 1, sizeof(block_length), file) == sizeof(block_length);
+        if (ok) {
+            ok = fputc(0xFF, file) != EOF;
+        }
+        for (size_t i = 0; ok && i < (size_t)length; ++i) {
+            checksum ^= data[i];
+            ok = fputc(data[i], file) != EOF;
+        }
+        if (ok) {
+            ok = fputc(checksum, file) != EOF;
+        }
+    }
+    if (fclose(file) != 0) {
+        ok = false;
+    }
+    if (!ok) {
+        DeleteFileA(temporary_path);
+        snprintf(error_buffer, error_buffer_size, "Could not save the complete tape file.");
+        return false;
+    }
+    if (!MoveFileExA(
+            temporary_path,
+            path,
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileA(temporary_path);
+        snprintf(error_buffer, error_buffer_size, "Could not replace the destination tape file.");
+        return false;
+    }
+    return true;
 }
 
 /* Bare 16 KB data blocks without a preceding header are the classic shape of

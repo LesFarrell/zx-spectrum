@@ -36,6 +36,11 @@ typedef int (*TapeSelectCallback)(
     size_t count
 );
 
+typedef enum TapeSaveKind {
+    TAPE_SAVE_CODE = 0,
+    TAPE_SAVE_PROG
+} TapeSaveKind;
+
 typedef struct TapeLoadOptions {
     TapeSelectCallback select;
     void *user_data;
@@ -93,5 +98,23 @@ bool tape_input_level(TapePlayer *player, uint64_t tick_count);
 bool tape_has_tape(const TapePlayer *player);
 TapeAutoloadTarget tape_autoload_target(const TapePlayer *player);
 bool tape_try_fast_load(TapePlayer *player, void *machine);
+/* Copies the 10-character name from the first standard header block. */
+bool tape_first_header_name(const TapePlayer *player, char *name, size_t name_size);
+
+/* Writes a standard two-block TAP image (header + data) from in-memory bytes.
+   header_param1 and header_param2 are the format-specific words stored after
+   the data length (autostart/variable offset for programs, address/32768 for
+   CODE blocks). */
+bool tape_write_tap(
+    const char *path,
+    TapeSaveKind kind,
+    const char *name,
+    uint16_t header_param1,
+    uint16_t length,
+    uint16_t header_param2,
+    const uint8_t *data,
+    char *error_buffer,
+    size_t error_buffer_size
+);
 
 #endif
