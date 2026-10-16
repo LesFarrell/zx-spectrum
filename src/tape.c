@@ -27,7 +27,7 @@ enum {
     TAPE_TZX_LOOP_DEPTH = 16,
     TAPE_TZX_MAX_BLOCK_EXECUTIONS = 1000000,
     TAPE_TZX_MAX_GENERALIZED_SYMBOLS = 4000000,
-    TAPE_MAX_FILE_SIZE = 128 * 1024 * 1024,
+    TAPE_COMPLEX_FILE_MAX_SIZE = 128 * 1024 * 1024,
     TAPE_PILOT_PULSE_TICKS = 2168,
     TAPE_SYNC1_PULSE_TICKS = 667,
     TAPE_SYNC2_PULSE_TICKS = 735,
@@ -461,7 +461,7 @@ static bool tape_reserve_segments(TapePlayer *player, size_t additional_count) {
         return false;
     }
     required = player->segment_count + additional_count;
-    if (required > TAPE_MAX_SEGMENTS) {
+    if (required > SIZE_MAX / sizeof(*segments)) {
         return false;
     }
     if (required <= player->segment_capacity) {
@@ -470,7 +470,7 @@ static bool tape_reserve_segments(TapePlayer *player, size_t additional_count) {
 
     new_capacity = (player->segment_capacity > 0) ? player->segment_capacity : 1024;
     while (new_capacity < required) {
-        if (new_capacity > (SIZE_MAX / 2)) {
+        if (new_capacity > (SIZE_MAX / sizeof(*segments)) / 2) {
             new_capacity = required;
             break;
         }
@@ -827,7 +827,9 @@ static bool tape_parse_tap(
 
     builder.player = player;
     builder.current_level = false;
-    builder.work_remaining = tape_decode_work_budget(size);
+    /* TAP is a linear format, so its decode cost is bounded by the file
+       itself and does not need the execution limits used for TZX/PZX. */
+    builder.work_remaining = SIZE_MAX;
 
     while (offset < size) {
         uint16_t block_length;
@@ -1840,6 +1842,8 @@ bool tape_load_file_with_options(
     FILE *file;
     uint8_t *data = NULL;
     int64_t file_size;
+    const char *extension;
+    bool is_tap;
     bool ok;
 
     if (player == NULL || path == NULL) {
@@ -1863,7 +1867,14 @@ bool tape_load_file_with_options(
         tape_set_error(error_buffer, error_buffer_size, "Tape file is empty", path);
         return false;
     }
-    if ((uint64_t)file_size > TAPE_MAX_FILE_SIZE) {
+    extension = strrchr(path, '.');
+    is_tap = extension != NULL && _stricmp(extension, ".tap") == 0;
+    if ((uint64_t)file_size > SIZE_MAX) {
+        fclose(file);
+        tape_set_error(error_buffer, error_buffer_size, "Tape file is too large to load", path);
+        return false;
+    }
+    if (!is_tap && (uint64_t)file_size > TAPE_COMPLEX_FILE_MAX_SIZE) {
         fclose(file);
         tape_set_error(
             error_buffer,
