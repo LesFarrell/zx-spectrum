@@ -582,6 +582,7 @@ static bool app_apply_loaded_tape(
     HWND hwnd,
     AppState *app,
     TapePlayer *loaded_tape,
+    const char *media_name,
     bool assume_128k,
     char *error_buffer,
     size_t error_buffer_size);
@@ -2864,6 +2865,17 @@ static int app_choose_zip_entry(
     return command == 0 ? -1 : (int)command - 1;
 }
 
+static bool app_tape_assume_128k(
+    const AppState *app,
+    const char *extension,
+    bool requested_128k)
+{
+    if (extension != NULL && _stricmp(extension, ".tap") == 0) {
+        return app->spec.model != SPECTRUM_MODEL_48K;
+    }
+    return requested_128k;
+}
+
 static bool app_load_zip_file(
     HWND hwnd,
     AppState *app,
@@ -2990,7 +3002,7 @@ static bool app_load_zip_file(
             data_size,
             entry_name,
             path,
-            assume_128k,
+            app_tape_assume_128k(app, extension, assume_128k),
             error_buffer,
             error_buffer_size);
         if (loaded) {
@@ -3090,7 +3102,7 @@ static bool app_load_media_path(
             hwnd,
             app,
             path,
-            assume_128k,
+            app_tape_assume_128k(app, extension, assume_128k),
             error_buffer,
             error_buffer_size);
     }
@@ -3159,17 +3171,24 @@ static bool app_apply_loaded_tape(
     HWND hwnd,
     AppState *app,
     TapePlayer *loaded_tape,
+    const char *media_name,
     bool assume_128k,
     char *error_buffer,
     size_t error_buffer_size
 ) {
     const TapeAutoloadTarget autoload_target = tape_autoload_target(loaded_tape);
+    const char *extension = media_name != NULL ? strrchr(media_name, '.') : NULL;
+    const bool is_tap = extension != NULL && _stricmp(extension, ".tap") == 0;
     SpectrumModel autoload_model = assume_128k
         ? SPECTRUM_MODEL_128K
         : app->spec.model;
 
     if (app->tape_autoload_enabled) {
-        if (!assume_128k) {
+        if (is_tap) {
+            autoload_model = assume_128k
+                ? SPECTRUM_MODEL_128K
+                : SPECTRUM_MODEL_48K;
+        } else if (!assume_128k) {
             if (autoload_target == TAPE_AUTOLOAD_TARGET_128_MENU) {
                 autoload_model = app->spec.model == SPECTRUM_MODEL_48K
                     ? SPECTRUM_MODEL_128K
@@ -3710,17 +3729,17 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
             if (app != NULL && path_ready) {
                 const char *extension = strrchr(path, '.');
                 const bool wants_128k = extension != NULL &&
-                    (_stricmp(extension, ".tap") == 0 ||
-                     _stricmp(extension, ".tzx") == 0 ||
+                    (_stricmp(extension, ".tzx") == 0 ||
                      _stricmp(extension, ".pzx") == 0 ||
                      _stricmp(extension, ".z80") == 0 ||
                      _stricmp(extension, ".sna") == 0 ||
                      _stricmp(extension, ".szx") == 0);
                 bool can_load = true;
                 if (wants_128k) {
-                    /* Treat drag-and-drop tape/snapshot media as targeting a
-                       128K Spectrum unless the media loader subsequently
-                       requires a specific model. */
+                    /* Treat drag-and-drop TZX/PZX and snapshot media as
+                       targeting a 128K Spectrum unless the media loader
+                       subsequently requires a specific model. TAP follows
+                       the currently selected 48K/128K policy instead. */
                     app_switch_model(hwnd, app, SPECTRUM_MODEL_128K);
                     can_load = app->spec.model == SPECTRUM_MODEL_128K;
                 }
@@ -4008,6 +4027,7 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                                    hwnd,
                                    app,
                                    &job->tape,
+                                   job->path,
                                    job->assume_128k,
                                    job->error,
                                    sizeof(job->error))) {
@@ -4674,22 +4694,26 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
     return DefWindowProcA(hwnd, msg, wparam, lparam);
 }
 
-/* Parses an optional model flag plus explicit ROM path arguments, returning
-   false only when too many positional ROM paths are provided. */
+/* Parses an optional model flag, explicit ROM paths, and one startup media
+   path supplied by Explorer file associations. */
 static bool app_parse_args(
     int argc,
     char **argv,
     SpectrumModel *model,
     bool *model_explicit,
     const char **rom_a,
-    const char **rom_b
+    const char **rom_b,
+    const char **media_path
 ) {
     *model = SPECTRUM_MODEL_48K;
     *model_explicit = false;
     *rom_a = NULL;
     *rom_b = NULL;
+    *media_path = NULL;
 
     for (int i = 1; i < argc; ++i) {
+        const char *extension;
+
         if (strcmp(argv[i], "--128") == 0) {
             *model = SPECTRUM_MODEL_128K;
             *model_explicit = true;
@@ -4715,6 +4739,15 @@ static bool app_parse_args(
             *model_explicit = true;
             continue;
         }
+        extension = strrchr(argv[i], '.');
+        if (app_is_supported_media_name(argv[i]) ||
+            (extension != NULL && _stricmp(extension, ".zip") == 0)) {
+            if (*media_path != NULL) {
+                return false;
+            }
+            *media_path = argv[i];
+            continue;
+        }
         if (*rom_a == NULL) {
             *rom_a = argv[i];
         } else if (*rom_b == NULL) {
@@ -4737,6 +4770,7 @@ static void app_print_usage(void) {
     fprintf(stderr, "  zx-spectrum.exe --plus2 <plus2-combined-32k.rom>\n");
     fprintf(stderr, "  zx-spectrum.exe --plus2a <plus2a-combined-64k.rom>\n");
     fprintf(stderr, "  zx-spectrum.exe --plus3 <plus3-combined-64k.rom>\n");
+    fprintf(stderr, "  zx-spectrum.exe <media-file>\n");
     fprintf(stderr, "  zx-spectrum.exe\n");
     fprintf(stderr, "\nAutodetects ROM images in the roms folder.\n");
 }
@@ -5544,7 +5578,8 @@ static bool app_resolve_roms(
     char **argv,
     bool has_saved_model,
     SpectrumModel saved_model,
-    RomSelection *selection
+    RomSelection *selection,
+    const char **media_path
 ) {
     SpectrumModel model;
     bool model_explicit;
@@ -5553,7 +5588,14 @@ static bool app_resolve_roms(
     RomSet *target_set;
     char rom_path[MAX_PATH];
 
-    if (!app_parse_args(argc, argv, &model, &model_explicit, &rom_a, &rom_b)) {
+    if (!app_parse_args(
+            argc,
+            argv,
+            &model,
+            &model_explicit,
+            &rom_a,
+            &rom_b,
+            media_path)) {
         return false;
     }
     if (!model_explicit && rom_a == NULL && has_saved_model) {
@@ -5642,6 +5684,7 @@ static void app_show_error(const char *message) {
    drives the emulator in a simple 50 Hz event-and-render loop. */
 int main(int argc, char **argv) {
     RomSelection selection;
+    const char *startup_media_path = NULL;
     SpectrumModel saved_model = SPECTRUM_MODEL_48K;
     bool saved_tape_autoload = true;
     bool saved_fast_tape_loading = true;
@@ -5687,7 +5730,13 @@ int main(int argc, char **argv) {
         app_load_saved_toggle("covox", &saved_covox_enabled);
     has_saved_multiface_enabled =
         app_load_saved_toggle("multiface", &saved_multiface_enabled);
-    if (!app_resolve_roms(argc, argv, has_saved_model, saved_model, &selection)) {
+    if (!app_resolve_roms(
+            argc,
+            argv,
+            has_saved_model,
+            saved_model,
+            &selection,
+            &startup_media_path)) {
         app_print_usage();
         app_show_error("No compatible ROM found. Place a supported 48K, 128K, +2, +2A, or +3 ROM in the roms folder.");
         return 1;
@@ -5845,6 +5894,17 @@ int main(int argc, char **argv) {
     );
     app.running = true;
     app_debug_machine_changed(&app);
+
+    if (startup_media_path != NULL &&
+        !app_load_media_path(
+            hwnd,
+            &app,
+            startup_media_path,
+            app.spec.model != SPECTRUM_MODEL_48K,
+            error_buffer,
+            sizeof(error_buffer))) {
+        app_show_error(error_buffer);
+    }
 
     /* The shell keeps the Working in Background cursor active until a GUI
        process makes its first GetMessage call. The emulator normally uses
