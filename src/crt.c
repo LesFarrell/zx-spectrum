@@ -8,15 +8,18 @@ static uint8_t app_crt_dim(uint8_t channel) {
     return (uint8_t)(((unsigned)channel * 7u) / 8u);
 }
 
-static void app_crt_apply_effects(AppState *app) {
+/* Applies the enabled CRT filters to the live framebuffer and returns the
+   buffer that should be blitted. The copy/dimming work is skipped entirely
+   when scanlines are disabled, so the live framebuffer is returned directly. */
+static const uint32_t *app_crt_apply_effects(AppState *app) {
     const size_t count = (size_t)ZX_SCREEN_WIDTH * (size_t)ZX_SCREEN_HEIGHT;
-    if (app == NULL || app->crt_framebuffer == NULL) {
-        return;
+    if (app == NULL) {
+        return NULL;
+    }
+    if (app->crt_framebuffer == NULL || !app->crt_scanlines) {
+        return app->spec.framebuffer;
     }
     memcpy(app->crt_framebuffer, app->spec.framebuffer, count * sizeof(uint32_t));
-    if (!app->crt_scanlines) {
-        return;
-    }
     for (int y = 0; y < ZX_SCREEN_HEIGHT; ++y) {
         for (int x = 0; x < ZX_SCREEN_WIDTH; ++x) {
             const size_t index = (size_t)y * (size_t)ZX_SCREEN_WIDTH + (size_t)x;
@@ -32,4 +35,5 @@ static void app_crt_apply_effects(AppState *app) {
             app->crt_framebuffer[index] = app_crt_pack(color, r, g, b);
         }
     }
+    return app->crt_framebuffer;
 }

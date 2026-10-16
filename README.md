@@ -73,10 +73,13 @@ Small ZX Spectrum emulator in C for Windows. It uses the Win32 API for display, 
 .\src\build.bat
 ```
 
+The build writes the self-contained output to `.\bin`: `zx-spectrum.exe`,
+`Scintilla.dll`, and a copy of the ROMs in `.\bin\roms`.
+
 ## Run
 
 With no arguments, the emulator looks for `plus3.rom`, `plus2a.rom`,
-`plus2.rom`, `128.rom`, and `48.rom` in `.\src\roms`. It enables Interface 1 on
+`plus2.rom`, `128.rom`, and `48.rom` in `.\bin\roms`. It enables Interface 1 on
 48K/128K/+2 machines when `Interface1-v2.rom` is present there. When dedicated +2
 or +2A ROMs are absent, the 128K or +3 ROM set is used as a compatible
 fallback. It restores the last selected model when its ROM is available.
@@ -87,43 +90,43 @@ must be exactly 8 KB; enable it from the Machine menu before pressing its NMI
 button.
 
 ```powershell
-.\src\zx-spectrum.exe
+.\bin\zx-spectrum.exe
 ```
 
 48K:
 
 ```powershell
-.\src\zx-spectrum.exe --48 path\to\48k.rom
+.\bin\zx-spectrum.exe --48 path\to\48k.rom
 ```
 
 128K with two 16 KB ROMs:
 
 ```powershell
-.\src\zx-spectrum.exe --128 path\to\128-0.rom path\to\128-1.rom
+.\bin\zx-spectrum.exe --128 path\to\128-0.rom path\to\128-1.rom
 ```
 
 128K with one combined 32 KB ROM:
 
 ```powershell
-.\src\zx-spectrum.exe --128 path\to\128k-combined.rom
+.\bin\zx-spectrum.exe --128 path\to\128k-combined.rom
 ```
 
 Spectrum +2 with one combined 32 KB ROM:
 
 ```powershell
-.\src\zx-spectrum.exe --plus2 path\to\plus2.rom
+.\bin\zx-spectrum.exe --plus2 path\to\plus2.rom
 ```
 
 Spectrum +2A with one combined 64 KB ROM:
 
 ```powershell
-.\src\zx-spectrum.exe --plus2a path\to\plus2a.rom
+.\bin\zx-spectrum.exe --plus2a path\to\plus2a.rom
 ```
 
 Spectrum +3 with one combined 64 KB ROM:
 
 ```powershell
-.\src\zx-spectrum.exe --plus3 path\to\plus3.rom
+.\bin\zx-spectrum.exe --plus3 path\to\plus3.rom
 ```
 
 ## Keyboard

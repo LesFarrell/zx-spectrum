@@ -1,4 +1,6 @@
+#if defined(_WIN32)
 #include <windows.h>
+#endif
 
 #include "tape.h"
 
@@ -15,6 +17,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#if !defined(MAX_PATH)
+#define MAX_PATH 1024
+#endif
 
 enum {
     TAPE_TZX_HEADER_SIZE = 10,
@@ -109,6 +115,16 @@ bool tape_first_header_name(const TapePlayer *player, char *name, size_t name_si
     return false;
 }
 
+/* Removes the temporary file used while writing a tape image, so the caller
+   does not depend on a platform-specific deletion routine. */
+static void tape_remove_file(const char *path) {
+#if defined(_WIN32)
+    DeleteFileA(path);
+#else
+    remove(path);
+#endif
+}
+
 bool tape_write_tap(
     const char *path,
     TapeSaveKind kind,
@@ -120,13 +136,9 @@ bool tape_write_tap(
     char *error_buffer,
     size_t error_buffer_size)
 {
-    static const size_t TAPE_HEADER_BLOCK_LENGTH = 19;
+    enum { TAPE_HEADER_BLOCK_LENGTH = 19 };
     FILE *file;
-    char directory[MAX_PATH];
     char temporary_path[MAX_PATH];
-    const char *last_forward_slash;
-    const char *last_backslash;
-    const char *last_separator;
     uint8_t header[TAPE_HEADER_BLOCK_LENGTH];
     uint8_t block_length[2];
     uint8_t checksum;
@@ -142,28 +154,40 @@ bool tape_write_tap(
         return false;
     }
 
-    last_forward_slash = strrchr(path, '/');
-    last_backslash = strrchr(path, '\\');
-    last_separator = last_forward_slash;
-    if (last_separator == NULL ||
-        (last_backslash != NULL && last_backslash > last_separator)) {
-        last_separator = last_backslash;
-    }
-    if (last_separator == NULL) {
-        snprintf(directory, sizeof(directory), ".");
-    } else {
-        const size_t directory_length = (size_t)(last_separator - path) + 1u;
-        if (directory_length >= sizeof(directory)) {
-            snprintf(error_buffer, error_buffer_size, "The tape file path is too long.");
+#if defined(_WIN32)
+    {
+        char directory[MAX_PATH];
+        const char *last_forward_slash = strrchr(path, '/');
+        const char *last_backslash = strrchr(path, '\\');
+        const char *last_separator = last_forward_slash;
+
+        if (last_separator == NULL ||
+            (last_backslash != NULL && last_backslash > last_separator)) {
+            last_separator = last_backslash;
+        }
+        if (last_separator == NULL) {
+            snprintf(directory, sizeof(directory), ".");
+        } else {
+            const size_t directory_length = (size_t)(last_separator - path) + 1u;
+            if (directory_length >= sizeof(directory)) {
+                snprintf(error_buffer, error_buffer_size, "The tape file path is too long.");
+                return false;
+            }
+            memcpy(directory, path, directory_length);
+            directory[directory_length] = '\0';
+        }
+        if (GetTempFileNameA(directory, "zxt", 0, temporary_path) == 0) {
+            snprintf(error_buffer, error_buffer_size, "Could not create a temporary tape file.");
             return false;
         }
-        memcpy(directory, path, directory_length);
-        directory[directory_length] = '\0';
     }
-    if (GetTempFileNameA(directory, "zxt", 0, temporary_path) == 0) {
-        snprintf(error_buffer, error_buffer_size, "Could not create a temporary tape file.");
+#else
+    if (snprintf(temporary_path, sizeof(temporary_path), "%s.tmp", path) >=
+        (int)sizeof(temporary_path)) {
+        snprintf(error_buffer, error_buffer_size, "The tape file path is too long.");
         return false;
     }
+#endif
 
     header[0] = 0x00;
     header[1] = (kind == TAPE_SAVE_PROG) ? 0x00u : 0x03u;
@@ -189,7 +213,7 @@ bool tape_write_tap(
 
     file = fopen(temporary_path, "wb");
     if (file == NULL) {
-        DeleteFileA(temporary_path);
+        tape_remove_file(temporary_path);
         snprintf(error_buffer, error_buffer_size, "Could not open the tape file for writing.");
         return false;
     }
@@ -221,18 +245,28 @@ bool tape_write_tap(
         ok = false;
     }
     if (!ok) {
-        DeleteFileA(temporary_path);
+        tape_remove_file(temporary_path);
         snprintf(error_buffer, error_buffer_size, "Could not save the complete tape file.");
         return false;
     }
+#if defined(_WIN32)
     if (!MoveFileExA(
             temporary_path,
             path,
             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        DeleteFileA(temporary_path);
+        tape_remove_file(temporary_path);
         snprintf(error_buffer, error_buffer_size, "Could not replace the destination tape file.");
         return false;
     }
+#else
+    /* rename() cannot be relied on to overwrite, so drop the target first. */
+    remove(path);
+    if (rename(temporary_path, path) != 0) {
+        tape_remove_file(temporary_path);
+        snprintf(error_buffer, error_buffer_size, "Could not replace the destination tape file.");
+        return false;
+    }
+#endif
     return true;
 }
 

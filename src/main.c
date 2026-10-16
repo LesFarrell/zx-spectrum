@@ -931,7 +931,7 @@ static HMENU app_create_menu(void) {
     AppendMenuA(machine_menu, MF_POPUP, (UINT_PTR)speed_menu, "&Speed (F6 cycles)");
     AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_REWIND, "&Rewind 5 Seconds\tCtrl+Backspace");
     AppendMenuA(machine_menu, MF_SEPARATOR, 0, NULL);
-AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_MULTIFACE, "Enable &Multiface");
+    AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_MULTIFACE, "Enable &Multiface");
     AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_MULTIFACE_NMI, "Multiface &NMI\tAlt+F5");
     AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_RESTART_GAME, "Restart &Game\tF9");
     AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_REPLAY, "&Replay 4 Seconds\tF8");
@@ -956,7 +956,7 @@ AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_MULTIFACE, "Enable &Multif
     AppendMenuA(sound_menu, MF_STRING, APP_MENU_SOUND_FULLER_AY, "Fuller &AY (48K)");
     AppendMenuA(sound_menu, MF_STRING, APP_MENU_SOUND_SPECDRUM, "&SpecDrum DAC");
     AppendMenuA(sound_menu, MF_STRING, APP_MENU_SOUND_COVOX, "&Covox DAC");
-AppendMenuA(tools_menu, MF_STRING, APP_MENU_TOOLS_ASSEMBLER, "&Assembler...\tCtrl+Shift+A");
+    AppendMenuA(tools_menu, MF_STRING, APP_MENU_TOOLS_ASSEMBLER, "&Assembler...\tCtrl+Shift+A");
     AppendMenuA(tools_menu, MF_STRING, APP_MENU_TOOLS_DEBUGGER, "&Debugger...\tCtrl+Shift+D");
     AppendMenuA(tools_menu, MF_STRING, APP_MENU_TOOLS_POKE, "&Poke...\tCtrl+Shift+P");
     AppendMenuA(menu_bar, MF_POPUP, (UINT_PTR)file_menu, "&File");
@@ -4010,7 +4010,7 @@ case VK_F11:
                                    job->assume_128k,
                                    job->error,
                                    sizeof(job->error))) {
-app_show_error(job->error);
+                        app_show_error(job->error);
                     } else {
                         app_add_recent_media(app, job->source_path);
                         app_rewind_clear(app);
@@ -4033,7 +4033,7 @@ app_show_error(job->error);
                     if (!job->ok) {
                         app_show_error(job->error);
                     } else if (!app_apply_loaded_snapshot(hwnd, app, job, job->error, sizeof(job->error))) {
-app_show_error(job->error);
+                        app_show_error(job->error);
                     } else {
                         app_add_recent_media(app, job->source_path);
                         app_rewind_clear(app);
@@ -4575,11 +4575,8 @@ case APP_MENU_VIEW_INTEGER_SCALING:
                 if (buffered) {
                     draw_dc = app->video_backbuffer.dc;
                 }
-PatBlt(draw_dc, 0, 0, target_width, target_height, BLACKNESS);
-                app_crt_apply_effects(app);
-                const uint32_t *render_pixels = app->crt_framebuffer != NULL
-                    ? app->crt_framebuffer
-                    : app->spec.framebuffer;
+                PatBlt(draw_dc, 0, 0, target_width, target_height, BLACKNESS);
+                const uint32_t *render_pixels = app_crt_apply_effects(app);
                 if (app->integer_scaling) {
                     int scale_x = target_width / ZX_SCREEN_WIDTH;
                     int scale_y = target_height / ZX_SCREEN_HEIGHT;
@@ -4732,7 +4729,7 @@ static bool app_parse_args(
 /* Prints the supported command line forms and the default ROM autodetection
    behavior used when the emulator is started without arguments. */
 static void app_print_usage(void) {
-fprintf(stderr, "Usage:\n");
+    fprintf(stderr, "Usage:\n");
     fprintf(stderr, "  zx-spectrum.exe --48  <48k.rom>\n");
     fprintf(stderr, "  zx-spectrum.exe --128 <128k-0.rom> <128k-1.rom>\n");
     fprintf(stderr, "  zx-spectrum.exe --128 <128k-combined-32k.rom>\n");
@@ -5713,7 +5710,7 @@ int main(int argc, char **argv) {
     app.multiface_enabled = has_saved_multiface_enabled
         ? saved_multiface_enabled : false;
     app.mouse_x = 128;
-app.mouse_y = 96;
+    app.mouse_y = 96;
     app.integer_scaling = true;
     app.crt_scanlines = false;
     app_load_saved_toggle("crt_scanlines", &app.crt_scanlines);
@@ -5825,7 +5822,7 @@ app.mouse_y = 96;
     app_update_title(hwnd, &app.spec);
     app_update_model_menu(hwnd, app.spec.model);
     app_update_microdrive_menu(hwnd, &app);
-app_update_sound_menu(hwnd, &app);
+    app_update_sound_menu(hwnd, &app);
     app_update_disk_menu(hwnd, app.disk.inserted, !app.disk.source_read_only);
     app_update_runtime_menu(hwnd, &app);
     app_update_input_menu(hwnd, &app);
@@ -5888,7 +5885,7 @@ if (app.debug.poke_hwnd != NULL &&
         app_tick_emulator(&app);
         /* Yield to Windows between timing slices, but wake immediately when
            input or window work arrives instead of polling at full speed. */
-MsgWaitForMultipleObjectsEx(0, NULL, 2, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        MsgWaitForMultipleObjectsEx(0, NULL, 2, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
     }
 
     /* A tape/snapshot worker may have posted a completion message without the
@@ -5905,7 +5902,7 @@ MsgWaitForMultipleObjectsEx(0, NULL, 2, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
         app.main_menu = NULL;
     }
 
-app_controller_shutdown(&app);
+    app_controller_shutdown(&app);
     app_audio_shutdown(&app);
     tape_discard(&app.tape);
     dsk_discard(&app.disk);
