@@ -54,6 +54,7 @@ enum {
     APP_RECENT_MEDIA_COUNT = 8,
     APP_REWIND_SLOT_COUNT = 30,
     APP_REWIND_CAPTURE_FRAMES = 50,
+    APP_MEDIA_FILE_MAX_SIZE = 128 * 1024 * 1024,
     APP_MENU_FILE_OPEN_SNAPSHOT = 1001,
     APP_MENU_FILE_RESET = 1002,
     APP_MENU_FILE_EXIT = 1003,
@@ -62,7 +63,7 @@ enum {
     APP_MENU_FILE_AUTOLOAD_TAPES = 1006,
     APP_MENU_FILE_SAVE_SCREEN = 1007,
     APP_MENU_FILE_FAST_TAPE_LOADING = 1008,
-APP_MENU_FILE_SAVE_SNAPSHOT = 1009,
+    APP_MENU_FILE_SAVE_SNAPSHOT = 1009,
     APP_MENU_FILE_SAVE_PROGRAM_TAPE = 1012,
     APP_MENU_FILE_SAVE_RAM_TAPE = 1013,
     APP_MENU_DISK_EJECT = 1010,
@@ -71,7 +72,7 @@ APP_MENU_FILE_SAVE_SNAPSHOT = 1009,
     APP_MENU_SOUND_FULLER_AY = 1102,
     APP_MENU_SOUND_SPECDRUM = 1103,
     APP_MENU_SOUND_COVOX = 1104,
-APP_MENU_TOOLS_ASSEMBLER = 1301,
+    APP_MENU_TOOLS_ASSEMBLER = 1301,
     APP_MENU_TOOLS_DEBUGGER = 1302,
     APP_MENU_TOOLS_POKE = 1303,
     APP_MENU_MACHINE_48K = 1201,
@@ -85,7 +86,7 @@ APP_MENU_TOOLS_ASSEMBLER = 1301,
     APP_MENU_MACHINE_SPEED_2X = 1213,
     APP_MENU_MACHINE_SPEED_4X = 1214,
     APP_MENU_MACHINE_SPEED_8X = 1215,
-APP_MENU_MACHINE_MULTIFACE = 1216,
+    APP_MENU_MACHINE_MULTIFACE = 1216,
     APP_MENU_MACHINE_MULTIFACE_NMI = 1217,
     APP_MENU_MACHINE_RESTART_GAME = 1218,
     APP_MENU_MACHINE_REPLAY = 1219,
@@ -145,7 +146,7 @@ APP_MENU_MACHINE_MULTIFACE = 1216,
     APP_CTRL_POKE_VALUES = 2111,
     APP_CTRL_POKE_APPLY = 2112,
     APP_CTRL_POKE_STATUS = 2113,
-APP_CTRL_POKE_ADDRESS_LABEL = 2114,
+    APP_CTRL_POKE_ADDRESS_LABEL = 2114,
     APP_CTRL_POKE_VALUES_LABEL = 2115,
     APP_MENU_ASM_FILE_NEW = 2200,
     APP_MENU_ASM_FILE_LOAD = 2201,
@@ -172,7 +173,7 @@ APP_CTRL_POKE_ADDRESS_LABEL = 2114,
     APP_TIMER_ASM_FILE_WATCH = 3002,
     APP_DIALOG_DEBUGGER = 4001,
     APP_DIALOG_ASSEMBLER = 4002,
-APP_DIALOG_POKE = 4003,
+    APP_DIALOG_POKE = 4003,
     APP_MSG_TAPE_LOAD_COMPLETE = WM_APP + 1,
     APP_MSG_SNAPSHOT_LOAD_COMPLETE = WM_APP + 2,
     APP_MSG_TZX_SELECT_REQUEST = WM_APP + 3
@@ -465,7 +466,7 @@ struct AppState {
     uint8_t mouse_buttons;
     POINT mouse_last_position;
     bool mouse_tracking;
-unsigned speed_multiplier;
+    unsigned speed_multiplier;
     bool fullscreen;
     bool integer_scaling;
     bool crt_scanlines;
@@ -1130,7 +1131,7 @@ static void app_update_runtime_menu(HWND hwnd, const AppState *app) {
         menu,
         APP_MENU_VIEW_FULLSCREEN,
         MF_BYCOMMAND | (app->fullscreen ? MF_CHECKED : MF_UNCHECKED));
-CheckMenuItem(
+    CheckMenuItem(
         menu,
         APP_MENU_VIEW_INTEGER_SCALING,
         MF_BYCOMMAND | (app->integer_scaling ? MF_CHECKED : MF_UNCHECKED));
@@ -3168,7 +3169,7 @@ static bool app_apply_loaded_tape(
         : app->spec.model;
 
     if (app->tape_autoload_enabled) {
-if (!assume_128k) {
+        if (!assume_128k) {
             if (autoload_target == TAPE_AUTOLOAD_TARGET_128_MENU) {
                 autoload_model = app->spec.model == SPECTRUM_MODEL_48K
                     ? SPECTRUM_MODEL_128K
@@ -3197,7 +3198,7 @@ if (!assume_128k) {
     tape_init(loaded_tape);
     app_stop_tape(app);
 
-if (app->tape_autoload_enabled) {
+    if (app->tape_autoload_enabled) {
         app_tape_begin_autoload(app);
     } else {
         app_sync_tape_stop_mode(app);
@@ -3288,7 +3289,7 @@ static void app_run_autotype(AppState *app) {
         spectrum_key_up(&app->spec, app->auto_type.active_key_code);
         app->auto_type.active_key_code = 0;
         app->auto_type.cooldown_frames = APP_AUTOTYPE_COOLDOWN_FRAMES;
-if (app->auto_type.position >= app->auto_type.length) {
+        if (app->auto_type.position >= app->auto_type.length) {
             app->auto_type.length = 0;
             app->auto_type.position = 0;
             if (app->tape_autoplay_pending) {
@@ -3364,7 +3365,7 @@ static bool app_update_tape_loader_activity(AppState *app) {
     }
     app->tape_input_reads_this_frame = 0;
 
-if (app->tape_loader_idle_frames >= APP_TAPE_LOADER_IDLE_FRAMES) {
+    if (app->tape_loader_idle_frames >= APP_TAPE_LOADER_IDLE_FRAMES) {
         app_stop_tape(app);
         return true;
     }
@@ -3904,7 +3905,7 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                                 SendMessageA(hwnd, WM_COMMAND, speed_command, 0);
                             }
                             return 0;
-case VK_F11:
+                        case VK_F11:
                             SendMessageA(hwnd, WM_COMMAND, APP_MENU_VIEW_FULLSCREEN, 0);
                             return 0;
                         case VK_F8:
@@ -4141,7 +4142,7 @@ case VK_F11:
                             OFN_PATHMUSTEXIST |
                             OFN_NOCHANGEDIR;
                         ofn.lpstrDefExt = "scr";
-if (GetSaveFileNameA(&ofn) &&
+                        if (GetSaveFileNameA(&ofn) &&
                             !spectrum_save_screen_scr_file(
                                 &app->spec,
                                 path,
@@ -4304,7 +4305,7 @@ if (GetSaveFileNameA(&ofn) &&
                         app_save_speed_multiplier(app->speed_multiplier);
                         app_update_runtime_menu(hwnd, app);
                         return 0;
-case APP_MENU_MACHINE_REWIND:
+                    case APP_MENU_MACHINE_REWIND:
                         if (!app_rewind_seconds(app, 5)) {
                             MessageBeep(MB_ICONINFORMATION);
                         }
@@ -4339,7 +4340,7 @@ case APP_MENU_MACHINE_REWIND:
                     case APP_MENU_VIEW_FULLSCREEN:
                         app_set_fullscreen(hwnd, app, !app->fullscreen);
                         return 0;
-case APP_MENU_VIEW_INTEGER_SCALING:
+                    case APP_MENU_VIEW_INTEGER_SCALING:
                         app->integer_scaling = !app->integer_scaling;
                         app_update_runtime_menu(hwnd, app);
                         InvalidateRect(hwnd, NULL, FALSE);
@@ -4602,7 +4603,7 @@ case APP_MENU_VIEW_INTEGER_SCALING:
                     target_height,
                     0,
                     0,
-ZX_SCREEN_WIDTH,
+                    ZX_SCREEN_WIDTH,
                     ZX_SCREEN_HEIGHT,
                     render_pixels,
                     &app->bitmap_info,
@@ -5505,6 +5506,16 @@ static bool app_read_file_all(
         snprintf(error_buffer, error_buffer_size, "%s file is empty: %s", kind, path);
         return false;
     }
+    if ((uint64_t)file_size > APP_MEDIA_FILE_MAX_SIZE) {
+        fclose(file);
+        snprintf(
+            error_buffer,
+            error_buffer_size,
+            "%s file exceeds the 128 MB safety limit: %s",
+            kind,
+            path);
+        return false;
+    }
     rewind(file);
 
     data = (uint8_t *)malloc((size_t)file_size);
@@ -5871,7 +5882,7 @@ int main(int argc, char **argv) {
                 IsDialogMessageA(app.debug.debugger_panel, &msg)) {
                 continue;
             }
-if (app.debug.poke_hwnd != NULL &&
+            if (app.debug.poke_hwnd != NULL &&
                 app.debug.poke_panel != NULL &&
                 (msg.hwnd == app.debug.poke_panel || IsChild(app.debug.poke_panel, msg.hwnd)) &&
                 msg.message == WM_KEYDOWN &&

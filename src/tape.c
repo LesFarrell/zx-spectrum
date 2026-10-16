@@ -27,6 +27,7 @@ enum {
     TAPE_TZX_LOOP_DEPTH = 16,
     TAPE_TZX_MAX_BLOCK_EXECUTIONS = 1000000,
     TAPE_TZX_MAX_GENERALIZED_SYMBOLS = 4000000,
+    TAPE_MAX_FILE_SIZE = 128 * 1024 * 1024,
     TAPE_PILOT_PULSE_TICKS = 2168,
     TAPE_SYNC1_PULSE_TICKS = 667,
     TAPE_SYNC2_PULSE_TICKS = 735,
@@ -1828,22 +1829,6 @@ void tape_discard(TapePlayer *player) {
     tape_init(player);
 }
 
-bool tape_load_file(
-    TapePlayer *player,
-    const char *path,
-    uint32_t tick_hz,
-    char *error_buffer,
-    size_t error_buffer_size
-) {
-    return tape_load_file_with_options(
-        player,
-        path,
-        tick_hz,
-        error_buffer,
-        error_buffer_size,
-        NULL);
-}
-
 bool tape_load_file_with_options(
     TapePlayer *player,
     const char *path,
@@ -1876,6 +1861,15 @@ bool tape_load_file_with_options(
     if (file_size <= 0) {
         fclose(file);
         tape_set_error(error_buffer, error_buffer_size, "Tape file is empty", path);
+        return false;
+    }
+    if ((uint64_t)file_size > TAPE_MAX_FILE_SIZE) {
+        fclose(file);
+        tape_set_error(
+            error_buffer,
+            error_buffer_size,
+            "Tape file exceeds the 128 MB safety limit",
+            path);
         return false;
     }
     rewind(file);

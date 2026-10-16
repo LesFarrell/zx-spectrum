@@ -11,7 +11,8 @@ enum {
     ZIP_EOCD_SEARCH_SIZE = 65535 + ZIP_EOCD_MIN_SIZE,
     ZIP_CENTRAL_HEADER_SIZE = 46,
     ZIP_LOCAL_HEADER_SIZE = 30,
-    ZIP_MAX_ENTRIES = 16384
+    ZIP_MAX_ENTRIES = 16384,
+    ZIP_MAX_ARCHIVE_SIZE = 128 * 1024 * 1024
 };
 
 static uint16_t zip_u16(const uint8_t *data) {
@@ -76,9 +77,10 @@ static bool zip_read_file(
         snprintf(error_buffer, error_buffer_size, "The ZIP archive is empty or truncated: %s", path);
         return false;
     }
-    if ((uint64_t)file_size > SIZE_MAX) {
+    if ((uint64_t)file_size > SIZE_MAX ||
+        (uint64_t)file_size > ZIP_MAX_ARCHIVE_SIZE) {
         fclose(file);
-        snprintf(error_buffer, error_buffer_size, "The ZIP archive is too large to open.");
+        snprintf(error_buffer, error_buffer_size, "The ZIP archive exceeds the 128 MB safety limit.");
         return false;
     }
     rewind(file);

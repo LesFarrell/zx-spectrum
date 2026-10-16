@@ -52,6 +52,12 @@ static bool microdrive_read_file(
         snprintf(error_buffer, error_buffer_size, "Could not determine Microdrive cartridge size: %s", path);
         return false;
     }
+    if (file_size < (int64_t)(MICRODRIVE_MIN_SECTORS * MICRODRIVE_SECTOR_SIZE) ||
+        file_size > (int64_t)(MICRODRIVE_MAX_SECTORS * MICRODRIVE_SECTOR_SIZE + 1)) {
+        fclose(file);
+        snprintf(error_buffer, error_buffer_size, "Invalid MDR image size: %s", path);
+        return false;
+    }
     rewind(file);
 
     data = (uint8_t *)malloc((size_t)file_size);
@@ -312,18 +318,6 @@ int microdrive_first_empty(const MicrodriveBank *bank) {
         }
     }
     return -1;
-}
-
-bool microdrive_any_dirty(const MicrodriveBank *bank) {
-    if (bank == NULL) {
-        return false;
-    }
-    for (uint8_t drive = 0; drive < MICRODRIVE_COUNT; ++drive) {
-        if (bank->drives[drive].inserted && bank->drives[drive].dirty) {
-            return true;
-        }
-    }
-    return false;
 }
 
 bool microdrive_ready(void *user_data, uint8_t drive) {

@@ -66,7 +66,6 @@ bool microdrive_save(
 
 void microdrive_eject(MicrodriveBank *bank, uint8_t drive);
 int microdrive_first_empty(const MicrodriveBank *bank);
-bool microdrive_any_dirty(const MicrodriveBank *bank);
 
 bool microdrive_ready(void *user_data, uint8_t drive);
 bool microdrive_write_protected(void *user_data, uint8_t drive);

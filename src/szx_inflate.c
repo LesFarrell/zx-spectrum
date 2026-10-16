@@ -275,7 +275,6 @@ static bool szx_expand_codes(
         {
             unsigned length_index;
             unsigned length;
-            int distance_symbol;
             unsigned distance;
             if (symbol > 285) return false;
             length_index = (unsigned)symbol - 257;
@@ -284,13 +283,10 @@ static bool szx_expand_codes(
             {
                 return false;
             }
-            else
-            {
-                distance_symbol = szx_decode_symbol(reader, distance_table);
-                if (reader->failed || distance_symbol < 0 || distance_symbol > 29) return false;
-                distance = distance_base[distance_symbol] +
-                    szx_read_bits(reader, distance_extra[distance_symbol]);
-            }
+            const int distance_symbol = szx_decode_symbol(reader, distance_table);
+            if (reader->failed || distance_symbol < 0 || distance_symbol > 29) return false;
+            distance = distance_base[distance_symbol] +
+                szx_read_bits(reader, distance_extra[distance_symbol]);
             if (reader->failed || distance > *destination_position ||
                 length > destination_size - *destination_position)
             {

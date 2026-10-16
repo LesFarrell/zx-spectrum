@@ -65,13 +65,6 @@ typedef struct TapePlayer {
 
 void tape_init(TapePlayer *player);
 void tape_discard(TapePlayer *player);
-bool tape_load_file(
-    TapePlayer *player,
-    const char *path,
-    uint32_t tick_hz,
-    char *error_buffer,
-    size_t error_buffer_size
-);
 bool tape_load_file_with_options(
     TapePlayer *player,
     const char *path,
