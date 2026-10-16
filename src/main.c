@@ -2027,7 +2027,7 @@ static bool app_tape_input_callback(void *user_data, uint64_t tick_count) {
     return tape_input_level(&app->tape, tick_count);
 }
 
-/* Fast-traps the standard ROM tape loader when a TAP/TZX block can be
+/* Fast-traps the standard ROM tape loader when a TAP/TZX/PZX block can be
    injected directly instead of being edge-timed through the EAR bit. */
 static bool app_tape_fast_load_trap(void *user_data, void *machine) {
     AppState *app = (AppState *)user_data;
@@ -2131,7 +2131,7 @@ static void app_drain_load_completions(AppState *app) {
 }
 
 /* Runs tape file I/O and decode work away from the window thread so opening
-   larger TAP/TZX files does not stall input or trigger the busy cursor. */
+   larger TAP/TZX/PZX files does not stall input or trigger the busy cursor. */
 static DWORD WINAPI app_tape_load_worker(void *param) {
     AppTapeLoadJob *job = (AppTapeLoadJob *)param;
     TapeLoadOptions options = {app_tzx_select_callback, job->hwnd};
@@ -3113,7 +3113,7 @@ static bool app_load_media_path(
     return false;
 }
 
-/* Inserts an already decoded TAP/TZX image, then either auto-starts a standard
+/* Inserts an already decoded TAP/TZX/PZX image, then either auto-starts a standard
    ROM load or leaves the tape inserted for manual control depending on user
    preference. This runs on the main thread after background file decode ends. */
 static void app_tape_begin_autoload(AppState *app) {
@@ -3598,7 +3598,7 @@ static void app_set_modal_loop_timer(AppState *app, HWND hwnd, bool enabled) {
 }
 
 /* Prompts for a .tap destination and writes either the current BASIC program
-   or a CODE block of the visible 48K memory range. */
+   or a CODE block of the visible 48 KB RAM range at 0x4000-0xFFFF. */
 static void app_save_to_tap(HWND hwnd, AppState *app, bool program) {
     OPENFILENAMEA ofn;
     char path[MAX_PATH];
@@ -4673,8 +4673,8 @@ ZX_SCREEN_WIDTH,
     return DefWindowProcA(hwnd, msg, wparam, lparam);
 }
 
-/* Parses optional `--48` or `--128` flags plus explicit ROM path arguments,
-   returning false only when too many positional ROM paths are provided. */
+/* Parses an optional model flag plus explicit ROM path arguments, returning
+   false only when too many positional ROM paths are provided. */
 static bool app_parse_args(
     int argc,
     char **argv,
@@ -5003,7 +5003,7 @@ static bool app_load_saved_speed_multiplier(unsigned *multiplier) {
 }
 
 /* Persists the user's menu-selected machine preference so future launches
-   start in the same 48K or 128K mode when possible. */
+   start with the same Spectrum model when its ROM is available. */
 static void app_save_model(SpectrumModel model) {
     char path[MAX_PATH];
     if (!app_settings_path(path, sizeof(path))) {

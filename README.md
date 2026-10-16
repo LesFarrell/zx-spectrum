@@ -155,8 +155,8 @@ Spectrum +3 with one combined 64 KB ROM:
   48K/128K/+2 machines as `.sna` when that extension is selected
 - `File -> Save Screen...` writes the visible Spectrum screen as a 6912-byte `.scr`
 - `File -> Recent Media` remembers the eight most recently opened media files
-- Drag one supported ZIP, tape, disk, or snapshot file onto the emulator window to
-  load it through the same media handling
+- Drag one supported media, screen, archive, or snapshot file onto the emulator
+  window to load it through the same media handling
 - ZIP archives support stored and deflated entries. Disk and Microdrive images
   opened from an archive are mounted read-only so the archive cannot be
   overwritten accidentally. Multi-disk, encrypted, ZIP64-sized, and
@@ -172,24 +172,33 @@ Spectrum +3 with one combined 64 KB ROM:
   changed cartridges can be saved explicitly or on eject/exit
 - Opening or dropping an `.mdr` inserts it into the first free Microdrive. If
   +2A or +3 is active, the emulator switches to an Interface 1-compatible model.
-- `File -> Auto-load Tapes On Open` toggles whether opening a tape starts loading automatically
+- `Tape -> Auto-load Tapes On Open` toggles whether opening a tape starts loading automatically
 - With auto-load on, opening a tape inspects the tape and chooses `48 BASIC` or the `128K` tape loader automatically
 - With auto-load off, opening a tape just inserts and rewinds it for manual loading
-- Tape and snapshot file reading now run in the background so opening larger `.tap`, `.tzx`, `.pzx`, `.z80`, `.sna`, or `.szx` files does not stall the main window
+- Tape and snapshot files are read in the background so opening larger `.tap`,
+  `.tzx`, `.pzx`, `.z80`, `.sna`, or `.szx` files does not stall the main window
 - Standard ROM `LOAD ""` operations fast-load automatically for `.tap`,
   standard-block `.tzx`, and standard-data `.pzx` files
 - `Tape -> Use Fast Tape Loading` runs custom and turbo tape loaders as quickly as the host CPU allows, without generating intermediate audio or frames; it is enabled by default
-- Use `F3` or `File -> Play Tape` only for custom loaders or real-time tape playback
-- Press `F4` or use `File -> Stop Tape` to stop real-time playback
+- Use `F3` or `Tape -> Play Tape` only for custom loaders or real-time tape playback
+- Press `F4` or use `Tape -> Stop Tape` to stop real-time playback
 - `File -> Reset` resets the active machine
+- `File -> Save Program To Tape...` writes the current BASIC program as a
+  standard two-block `.tap` image
+- `File -> Save RAM To Tape...` writes the visible `0x4000`-`0xFFFF` RAM range
+  as a CODE block in a `.tap` image
 - `File -> Exit` closes the emulator
 - `Machine` switches among 48K, 128K, +3, +2, and +2A and remembers the choice
 - `Ctrl+1` through `Ctrl+5` select 48K, 128K, +3, +2, and +2A
 - `Machine -> Speed` selects 1x, 2x, 4x, or 8x and remembers the selection
 - `F2` pauses, `F6` cycles through the speed choices, and `Ctrl+Backspace`
   rewinds up to five seconds
+- `F8` or `Machine -> Replay 4 Seconds` rewinds four seconds; `F9` or
+  `Machine -> Restart Game` resets and autoloads the inserted tape again
 - `F11` toggles fullscreen; `Escape` leaves fullscreen
 - `View -> Integer Scaling` keeps the image at a centered whole-number scale
+- `View -> Scanlines` applies a lightweight alternating-line display filter;
+  the setting is remembered between runs
 - `Sound -> Mute Sound` or `Ctrl+M` toggles all emulator audio and remembers the choice between runs
 - The Sound menu also enables Fuller AY, SpecDrum, and Covox; the Machine menu
   attaches the matching Multiface and `Alt+F5` presses its NMI button
@@ -214,7 +223,9 @@ Spectrum +3 with one combined 64 KB ROM:
 - `Ctrl+F` opens Find and `Ctrl+H` opens Find and Replace; both support match case and whole-word searches, and searches wrap around the document
 - `Ctrl+A`, `Ctrl+Z`, `Ctrl+X`, `Ctrl+C`, and `Ctrl+V` work like a normal text editor inside the assembler source box
 - Assembler writes are limited to RAM at `0x4000`-`0xFFFF`; ROM addresses are read-only in the running machine
-- Working samples are included at [hello.asm](/C:/Users/Les%20Farrell/OneDrive/Desktop/emu/src/examples/hello.asm), [include-main.asm](/C:/Users/Les%20Farrell/OneDrive/Desktop/emu/src/examples/include-main.asm), and [space-invaders.asm](/C:/Users/Les%20Farrell/OneDrive/Desktop/emu/src/examples/space-invaders.asm)
+- Working samples are included at [hello.asm](src/examples/hello.asm),
+  [include-main.asm](src/examples/include-main.asm), and
+  [space-invaders.asm](src/examples/space-invaders.asm)
 
 ### Space Invaders sample
 
@@ -229,4 +240,6 @@ The included `space-invaders.asm` is a complete 48K mini-game and a larger examp
 
 ## Notes
 
-This is a deliberately simple emulator shell built around the vendored `chips` ZX Spectrum core under the zlib/libpng license. The license text is in [third_party/chips/LICENSE.txt](</C:/Users/Les Farrell/OneDrive/Desktop/emu/third_party/chips/LICENSE.txt>).
+This is a deliberately simple emulator shell built around the vendored `chips`
+ZX Spectrum core under the zlib/libpng license. The license text is in
+[third_party/chips/LICENSE.txt](third_party/chips/LICENSE.txt).

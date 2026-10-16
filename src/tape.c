@@ -97,7 +97,7 @@ bool tape_first_header_name(const TapePlayer *player, char *name, size_t name_si
     name[0] = '\0';
     for (size_t i = 0; i < player->block_count; ++i) {
         const TapeBlock *block = &player->blocks[i];
-        if (block == NULL || block->bytes == NULL || block->length < 19 ||
+        if (block->bytes == NULL || block->length < 19 ||
             block->bytes[0] != 0x00) {
             continue;
         }
@@ -294,8 +294,8 @@ static bool tape_has_full_ram_banks(const TapePlayer *player) {
 }
 
 /* Classifies the likely ROM-side autoload path from the first indexed blocks.
-   Ambiguous tapes fall back to 48 BASIC because most TAP/TZX program images
-   use a standard 48K loader even when opened from a 128K-capable frontend. */
+   Ambiguous tapes fall back to 48 BASIC because most standard program images
+   use a 48K loader even when opened from a 128K-capable frontend. */
 static TapeAutoloadTarget tape_detect_autoload_target(const TapePlayer *player) {
     uint8_t first_type;
 

@@ -338,7 +338,7 @@ static void app_assembler_sync_error_from_status(AppState *app, const char *stat
         return;
     }
     parsed_line = strtoull(line_text, &end, 10);
-    if (parsed_line == 0 || end == line_text || end == NULL || *end != ':') {
+    if (parsed_line == 0 || end == line_text || *end != ':') {
         return;
     }
     app->debug.assembler_error_line = (size_t)parsed_line;
@@ -376,7 +376,7 @@ static void app_assembler_update_line_numbers(AppState *app) {
     );
 }
 
-/* Sizes the debugger controls to the current client area of the tool window. */
+/* Sizes the assembler controls to the current client area of the tool window. */
 
 static void app_assembler_layout_controls(AppState *app, HWND hwnd) {
     RECT rect;
@@ -1218,7 +1218,7 @@ static void app_apply_window_icons(HWND hwnd) {
     }
 }
 
-/* Creates or focuses the debugger tool window from the Tools menu. */
+/* Creates or focuses the assembler tool window from the Tools menu. */
 
 static void app_open_assembler_window(AppState *app) {
     char path[MAX_PATH];
@@ -1259,7 +1259,7 @@ static void app_open_assembler_window(AppState *app) {
     }
 }
 
-/* Summarizes the debugger controls, shortcuts, and common workflows in one
+/* Summarizes the assembler controls, shortcuts, and common workflows in one
    modal dialog so the tool can be used without reading the source. */
 
 static void app_show_assembler_help(HWND hwnd) {

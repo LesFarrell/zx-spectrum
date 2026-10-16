@@ -1247,14 +1247,13 @@ static bool _zx_plus3_fdc_load_read_sector(zx_t* sys) {
 static void _zx_plus3_fdc_complete_sector(zx_t* sys, bool writing) {
     const uint8_t drive = sys->plus3_fdc.last_drive;
     const uint8_t head_drive = (uint8_t)(drive | ((sys->plus3_fdc.transfer_h & 1) << 2));
-    bool ok = true;
 
     if (writing) {
         if (sys->disk_write_sector == 0) {
             _zx_plus3_fdc_finish_data(sys, (uint8_t)(0x40 | head_drive), 0x02, 0);
             return;
         }
-        ok = sys->disk_write_sector(
+        if (!sys->disk_write_sector(
                 sys->disk_user_data,
                 drive,
                 sys->plus3_fdc.transfer_c,
@@ -1262,8 +1261,7 @@ static void _zx_plus3_fdc_complete_sector(zx_t* sys, bool writing) {
                 sys->plus3_fdc.transfer_r,
                 sys->plus3_fdc.transfer_n,
                 sys->plus3_fdc.transfer,
-                sys->plus3_fdc.transfer_size);
-        if (!ok) {
+                sys->plus3_fdc.transfer_size)) {
             _zx_plus3_fdc_finish_data(sys, (uint8_t)(0x40 | head_drive), 0x04, 0);
             return;
         }

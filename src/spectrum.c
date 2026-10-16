@@ -107,7 +107,7 @@ static bool spectrum_load_file_exact(const char *path, uint8_t *buffer, size_t m
 }
 
 /* Extracts the target machine model from a `.z80` snapshot header so the
-   wrapper can rebuild the emulator as 48K or 128K before loading the state. */
+   wrapper can rebuild the emulator for any supported model before loading. */
 bool spectrum_detect_snapshot_model_data(
     const uint8_t *data,
     size_t size,
