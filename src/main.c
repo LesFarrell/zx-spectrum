@@ -82,13 +82,11 @@ enum {
     APP_MENU_MACHINE_PLUS2A = 1205,
     APP_MENU_MACHINE_PAUSE = 1210,
     APP_MENU_MACHINE_SPEED_1X = 1211,
-    APP_MENU_MACHINE_REWIND = 1212,
     APP_MENU_MACHINE_SPEED_2X = 1213,
     APP_MENU_MACHINE_SPEED_4X = 1214,
     APP_MENU_MACHINE_SPEED_8X = 1215,
     APP_MENU_MACHINE_MULTIFACE = 1216,
     APP_MENU_MACHINE_MULTIFACE_NMI = 1217,
-    APP_MENU_MACHINE_RESTART_GAME = 1218,
     APP_MENU_MACHINE_REPLAY = 1219,
     APP_MENU_VIEW_FULLSCREEN = 1250,
     APP_MENU_VIEW_INTEGER_SCALING = 1251,
@@ -931,12 +929,10 @@ static HMENU app_create_menu(void) {
     AppendMenuA(speed_menu, MF_STRING, APP_MENU_MACHINE_SPEED_4X, "&4x");
     AppendMenuA(speed_menu, MF_STRING, APP_MENU_MACHINE_SPEED_8X, "&8x");
     AppendMenuA(machine_menu, MF_POPUP, (UINT_PTR)speed_menu, "&Speed (F6 cycles)");
-    AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_REWIND, "&Rewind 5 Seconds\tCtrl+Backspace");
     AppendMenuA(machine_menu, MF_SEPARATOR, 0, NULL);
     AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_MULTIFACE, "Enable &Multiface");
     AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_MULTIFACE_NMI, "Multiface &NMI\tAlt+F5");
-    AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_RESTART_GAME, "Restart &Game\tF9");
-    AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_REPLAY, "&Replay 4 Seconds\tF8");
+    AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_REPLAY, "&Replay 5 Seconds\tF8");
     AppendMenuA(view_menu, MF_STRING, APP_MENU_VIEW_FULLSCREEN, "&Fullscreen\tF11");
     AppendMenuA(view_menu, MF_STRING, APP_MENU_VIEW_INTEGER_SCALING, "&Integer Scaling");
     AppendMenuA(view_menu, MF_SEPARATOR, 0, NULL);
@@ -1117,7 +1113,7 @@ static void app_update_runtime_menu(HWND hwnd, const AppState *app) {
         (app->speed_multiplier == 8 ? MF_CHECKED : MF_UNCHECKED));
     EnableMenuItem(
         menu,
-        APP_MENU_MACHINE_REWIND,
+        APP_MENU_MACHINE_REPLAY,
         MF_BYCOMMAND | (app->rewind.count > 0 ? MF_ENABLED : MF_GRAYED));
     CheckMenuItem(menu, APP_MENU_MACHINE_MULTIFACE, MF_BYCOMMAND |
         (app->multiface_enabled ? MF_CHECKED : MF_UNCHECKED));
@@ -3149,24 +3145,6 @@ static void app_tape_begin_autoload(AppState *app) {
     }
 }
 
-static void app_restart_current_tape(HWND hwnd, AppState *app) {
-    if (app == NULL || !tape_has_tape(&app->tape)) {
-        MessageBeep(MB_ICONINFORMATION);
-        return;
-    }
-
-    app_tape_begin_autoload(app);
-    app_apply_joystick_mask(app);
-    spectrum_set_mouse(
-        &app->spec,
-        app->mouse_x,
-        app->mouse_y,
-        app->mouse_buttons);
-    app_rewind_clear(app);
-    app_debug_machine_changed(app);
-    InvalidateRect(hwnd, NULL, FALSE);
-}
-
 static bool app_apply_loaded_tape(
     HWND hwnd,
     AppState *app,
@@ -3863,9 +3841,6 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                         case 'S':
                             SendMessageA(hwnd, WM_COMMAND, APP_MENU_FILE_SAVE_SNAPSHOT, 0);
                             return 0;
-                        case VK_BACK:
-                            SendMessageA(hwnd, WM_COMMAND, APP_MENU_MACHINE_REWIND, 0);
-                            return 0;
                         case '1':
                         case VK_NUMPAD1:
                             SendMessageA(hwnd, WM_COMMAND, APP_MENU_MACHINE_48K, 0);
@@ -3929,9 +3904,6 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                             return 0;
                         case VK_F8:
                             SendMessageA(hwnd, WM_COMMAND, APP_MENU_MACHINE_REPLAY, 0);
-                            return 0;
-                        case VK_F9:
-                            SendMessageA(hwnd, WM_COMMAND, APP_MENU_MACHINE_RESTART_GAME, 0);
                             return 0;
                         case VK_ESCAPE:
                             if (app->fullscreen) {
@@ -4325,18 +4297,10 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                         app_save_speed_multiplier(app->speed_multiplier);
                         app_update_runtime_menu(hwnd, app);
                         return 0;
-                    case APP_MENU_MACHINE_REWIND:
+                    case APP_MENU_MACHINE_REPLAY:
                         if (!app_rewind_seconds(app, 5)) {
                             MessageBeep(MB_ICONINFORMATION);
                         }
-                        return 0;
-                    case APP_MENU_MACHINE_REPLAY:
-                        if (!app_rewind_seconds(app, 4)) {
-                            MessageBeep(MB_ICONINFORMATION);
-                        }
-                        return 0;
-                    case APP_MENU_MACHINE_RESTART_GAME:
-                        app_restart_current_tape(hwnd, app);
                         return 0;
                     case APP_MENU_MACHINE_MULTIFACE:
                         if (app->spec.multiface_rom_loaded ||
