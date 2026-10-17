@@ -1593,7 +1593,7 @@ static bool app_assembler_write_source_to_path(
 ) {
     int source_length = app_assembler_editor_text_length(app->debug.assembler_source);
     char *source;
-    FILE *file;
+    FileWriteChunk chunk;
 
     source = (char *)malloc((size_t)source_length + 1);
     if (source == NULL) {
@@ -1602,20 +1602,12 @@ static bool app_assembler_write_source_to_path(
     }
     app_assembler_editor_get_text(app->debug.assembler_source, source, source_length + 1);
 
-    file = fopen(path, "wb");
-    if (file == NULL) {
-        free(source);
-        snprintf(status_buffer, status_buffer_size, "Could not write file: %s", path);
-        return false;
-    }
-    bool write_ok = source_length <= 0 ||
-        fwrite(source, 1, (size_t)source_length, file) == (size_t)source_length;
-    if (fclose(file) != 0) {
-        write_ok = false;
-    }
+    chunk.data = source;
+    chunk.size = source_length > 0 ? (size_t)source_length : 0;
+    const bool write_ok = file_write_atomic(
+        path, &chunk, 1, "assembler source file", status_buffer, status_buffer_size);
     free(source);
     if (!write_ok) {
-        snprintf(status_buffer, status_buffer_size, "Could not write file: %s", path);
         return false;
     }
     app->debug.assembler_dirty = false;

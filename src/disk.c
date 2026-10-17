@@ -1,4 +1,5 @@
 #include "disk.h"
+#include "file_util.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -313,8 +314,7 @@ bool dsk_save_file(
     char *error_buffer,
     size_t error_buffer_size)
 {
-    FILE *file;
-    bool ok;
+    FileWriteChunk chunk;
 
     if (image != NULL && image->source_read_only) {
         snprintf(error_buffer, error_buffer_size, "A disk loaded from a ZIP archive is read-only.");
@@ -326,17 +326,15 @@ bool dsk_save_file(
         return false;
     }
 
-    file = fopen(image->path, "wb");
-    if (file == NULL) {
-        snprintf(error_buffer, error_buffer_size, "Could not open the disk image for writing.");
-        return false;
-    }
-    ok = fwrite(image->data, 1, image->data_size, file) == image->data_size;
-    if (fclose(file) != 0) {
-        ok = false;
-    }
-    if (!ok) {
-        snprintf(error_buffer, error_buffer_size, "Could not save the complete disk image.");
+    chunk.data = image->data;
+    chunk.size = image->data_size;
+    if (!file_write_atomic(
+            image->path,
+            &chunk,
+            1,
+            "disk image",
+            error_buffer,
+            error_buffer_size)) {
         return false;
     }
     image->dirty = false;

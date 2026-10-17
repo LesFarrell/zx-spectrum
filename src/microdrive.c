@@ -1,4 +1,5 @@
 #include "microdrive.h"
+#include "file_util.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -210,7 +211,7 @@ bool microdrive_create_file(
     MicrodriveCartridge created;
     uint8_t label[10];
     uint8_t write_protect = 0;
-    FILE *file;
+    FileWriteChunk chunks[2];
 
     if (bank == NULL || drive >= MICRODRIVE_COUNT || path == NULL || path[0] == '\0') {
         snprintf(error_buffer, error_buffer_size, "Invalid Microdrive drive or path.");
@@ -235,22 +236,17 @@ bool microdrive_create_file(
         /* A zero record header and zero data/checksum mark a free sector. */
     }
 
-    file = fopen(path, "wb");
-    if (file == NULL) {
+    chunks[0] = (FileWriteChunk){created.data, created.data_size};
+    chunks[1] = (FileWriteChunk){&write_protect, 1};
+    if (!file_write_atomic(
+            path,
+            chunks,
+            2,
+            "Microdrive cartridge",
+            error_buffer,
+            error_buffer_size)) {
         free(created.data);
-        snprintf(error_buffer, error_buffer_size, "Could not create Microdrive cartridge: %s", path);
         return false;
-    }
-    {
-        const bool write_failed =
-            fwrite(created.data, 1, created.data_size, file) != created.data_size ||
-            fwrite(&write_protect, 1, 1, file) != 1;
-        const bool close_failed = fclose(file) != 0;
-        if (write_failed || close_failed) {
-            free(created.data);
-            snprintf(error_buffer, error_buffer_size, "Could not finish creating Microdrive cartridge: %s", path);
-            return false;
-        }
     }
 
     created.inserted = true;
@@ -267,7 +263,7 @@ bool microdrive_save(
     size_t error_buffer_size)
 {
     MicrodriveCartridge *cartridge;
-    FILE *file;
+    FileWriteChunk chunks[2];
     uint8_t write_protect;
 
     if (bank == NULL || drive >= MICRODRIVE_COUNT || !bank->drives[drive].inserted) {
@@ -284,25 +280,17 @@ bool microdrive_save(
         return false;
     }
 
-    file = fopen(cartridge->path, "wb");
-    if (file == NULL) {
-        snprintf(error_buffer, error_buffer_size, "Could not save Microdrive cartridge: %s", cartridge->path);
-        return false;
-    }
     write_protect = cartridge->write_protected ? 1 : 0;
-    {
-        const bool write_failed =
-            fwrite(cartridge->data, 1, cartridge->data_size, file) != cartridge->data_size ||
-            fwrite(&write_protect, 1, 1, file) != 1;
-        const bool close_failed = fclose(file) != 0;
-        if (write_failed || close_failed) {
-            snprintf(
-                error_buffer,
-                error_buffer_size,
-                "Could not finish saving Microdrive cartridge: %s",
-                cartridge->path);
-            return false;
-        }
+    chunks[0] = (FileWriteChunk){cartridge->data, cartridge->data_size};
+    chunks[1] = (FileWriteChunk){&write_protect, 1};
+    if (!file_write_atomic(
+            cartridge->path,
+            chunks,
+            2,
+            "Microdrive cartridge",
+            error_buffer,
+            error_buffer_size)) {
+        return false;
     }
     cartridge->dirty = false;
     return true;

@@ -9,6 +9,7 @@
 #include "systems/zx.h"
 
 #include "spectrum.h"
+#include "file_util.h"
 #include "szx_inflate.h"
 #include "tape.h"
 
@@ -762,31 +763,17 @@ bool spectrum_save_screen_scr_file(
     char *error_buffer,
     size_t error_buffer_size)
 {
-    FILE *file;
+    FileWriteChunk chunk;
     if (spec == NULL || !spec->machine_ready || path == NULL || path[0] == '\0' ||
         spec->machine.display_ram_bank >= 8)
     {
         snprintf(error_buffer, error_buffer_size, "No visible Spectrum screen is available to save.");
         return false;
     }
-    file = fopen(path, "wb");
-    if (file == NULL)
-    {
-        snprintf(error_buffer, error_buffer_size, "Could not create SCR file: %s", path);
-        return false;
-    }
-    const bool wrote_all = fwrite(
-        spec->machine.ram[spec->machine.display_ram_bank],
-        1,
-        SCR_SCREEN_SIZE,
-        file) == SCR_SCREEN_SIZE;
-    const int close_result = fclose(file);
-    if (!wrote_all || close_result != 0)
-    {
-        snprintf(error_buffer, error_buffer_size, "Could not save the complete SCR file: %s", path);
-        return false;
-    }
-    return true;
+    chunk.data = spec->machine.ram[spec->machine.display_ram_bank];
+    chunk.size = SCR_SCREEN_SIZE;
+    return file_write_atomic(
+        path, &chunk, 1, "SCR file", error_buffer, error_buffer_size);
 }
 
 static void spectrum_store_sna_registers(
@@ -879,7 +866,7 @@ bool spectrum_save_snapshot_z80_file(
         ((size_t)page_count * (Z80_PAGE_HEADER_SIZE + SNA_RAM_BANK_SIZE));
     uint8_t *data;
     size_t offset = Z80_V3_HEADER_SIZE;
-    FILE *file;
+    FileWriteChunk chunk;
     bool ok;
 
     if (spec == NULL || !spec->machine_ready || path == NULL || path[0] == '\0')
@@ -949,22 +936,12 @@ bool spectrum_save_snapshot_z80_file(
     (void)zx_load_snapshot(&spec->machine, restore_version, restore_state);
     _aligned_free(restore_state);
 
-    file = fopen(path, "wb");
-    if (file == NULL)
-    {
-        free(data);
-        snprintf(error_buffer, error_buffer_size, "Could not open the Z80 snapshot for writing.");
-        return false;
-    }
-    ok = fwrite(data, 1, data_size, file) == data_size;
-    if (fclose(file) != 0) ok = false;
+    chunk.data = data;
+    chunk.size = data_size;
+    ok = file_write_atomic(
+        path, &chunk, 1, "Z80 snapshot", error_buffer, error_buffer_size);
     free(data);
-    if (!ok)
-    {
-        snprintf(error_buffer, error_buffer_size, "Could not save the complete Z80 snapshot.");
-        return false;
-    }
-    return true;
+    return ok;
 }
 
 /* Saves the live BASIC program area (PROG..E_LINE, with the variables offset
@@ -1086,7 +1063,7 @@ bool spectrum_save_snapshot_sna_file(
     size_t data_size;
     size_t offset;
     uint8_t paged_bank;
-    FILE *file;
+    FileWriteChunk chunk;
     bool ok;
 
     if (spec == NULL || !spec->machine_ready || path == NULL || path[0] == '\0') {
@@ -1171,22 +1148,12 @@ bool spectrum_save_snapshot_sna_file(
     (void)zx_load_snapshot(&spec->machine, restore_version, restore_state);
     _aligned_free(restore_state);
 
-    file = fopen(path, "wb");
-    if (file == NULL) {
-        free(data);
-        snprintf(error_buffer, error_buffer_size, "Could not open the snapshot file for writing.");
-        return false;
-    }
-    ok = fwrite(data, 1, data_size, file) == data_size;
-    if (fclose(file) != 0) {
-        ok = false;
-    }
+    chunk.data = data;
+    chunk.size = data_size;
+    ok = file_write_atomic(
+        path, &chunk, 1, "SNA snapshot", error_buffer, error_buffer_size);
     free(data);
-    if (!ok) {
-        snprintf(error_buffer, error_buffer_size, "Could not save the complete snapshot file.");
-        return false;
-    }
-    return true;
+    return ok;
 }
 
 bool spectrum_save_runtime_state(

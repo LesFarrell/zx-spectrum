@@ -16,6 +16,7 @@
 #include <malloc.h>
 
 #include "spectrum.h"
+#include "file_util.h"
 #include "tape.h"
 #include "disk.h"
 #include "microdrive.h"
@@ -390,6 +391,7 @@ typedef struct AssemblerContext {
     AppState *app;
     uint16_t start_address;
     uint16_t address;
+    bool address_exhausted;
     size_t total_written;
     int pass;
     bool write_to_machine;
@@ -1095,9 +1097,33 @@ static const char *app_tape_autoload_settings_value(bool enabled) {
 }
 
 static void app_update_runtime_menu(HWND hwnd, const AppState *app) {
+    static const UINT speed_commands[] = {
+        APP_MENU_MACHINE_SPEED_1X,
+        APP_MENU_MACHINE_SPEED_2X,
+        APP_MENU_MACHINE_SPEED_4X,
+        APP_MENU_MACHINE_SPEED_8X
+    };
+    static const unsigned speed_multipliers[] = {1, 2, 4, 8};
     HMENU menu = GetMenu(hwnd);
     if (menu == NULL || app == NULL) {
         return;
+    }
+    for (size_t i = 0; i < sizeof(speed_commands) / sizeof(speed_commands[0]); ++i) {
+        char label[64];
+        const unsigned multiplier = speed_multipliers[i];
+        const double mhz =
+            ((double)app->spec.machine.freq_hz * (double)multiplier) / 1000000.0;
+        if (multiplier == 1) {
+            snprintf(label, sizeof(label), "&1x (Normal, %.2f MHz)", mhz);
+        } else {
+            snprintf(label, sizeof(label), "&%ux (%.2f MHz)", multiplier, mhz);
+        }
+        ModifyMenuA(
+            menu,
+            speed_commands[i],
+            MF_BYCOMMAND | MF_STRING,
+            speed_commands[i],
+            label);
     }
     CheckMenuItem(
         menu,

@@ -1148,6 +1148,8 @@ static bool app_assemble_write_bytes(
     char *error_buffer,
     size_t error_buffer_size)
 {
+    size_t next_address;
+
     if (length == 0)
     {
         return true;
@@ -1157,7 +1159,7 @@ static bool app_assemble_write_bytes(
         snprintf(error_buffer, error_buffer_size, "Assembler writes are limited to RAM at 4000h-FFFFh.");
         return false;
     }
-    if ((size_t)ctx->address + length > 0x10000u)
+    if (ctx->address_exhausted || (size_t)ctx->address + length > 0x10000u)
     {
         snprintf(error_buffer, error_buffer_size, "Assembled bytes run past FFFFh.");
         return false;
@@ -1210,7 +1212,15 @@ static bool app_assemble_write_bytes(
     {
         mem_write_range(&ctx->app->spec.machine.mem, ctx->address, bytes, (uint32_t)length);
     }
-    ctx->address = (uint16_t)(ctx->address + (uint16_t)length);
+    next_address = (size_t)ctx->address + length;
+    if (next_address == 0x10000u)
+    {
+        ctx->address_exhausted = true;
+    }
+    else
+    {
+        ctx->address = (uint16_t)next_address;
+    }
     return true;
 }
 
@@ -1394,6 +1404,7 @@ static bool app_assemble_line(
             return false;
         }
         ctx->address = (uint16_t)value.value;
+        ctx->address_exhausted = false;
         return true;
     }
 
@@ -2606,6 +2617,7 @@ static bool app_assemble_source(
     }
 
     ctx.address = start_address;
+    ctx.address_exhausted = false;
     ctx.total_written = 0;
     ctx.pass = 2;
     ctx.write_to_machine = write_to_machine;
@@ -2726,47 +2738,25 @@ static void app_assembler_build_tap_name(const char *path, char out_name[11])
     }
 }
 
-/* Appends one Spectrum TAP block to an output file, including its length
-   prefix and XOR checksum byte. */
-static bool app_assembler_write_tap_block(
-    FILE *file,
+/* Encodes one Spectrum TAP block, including its length prefix and XOR
+   checksum byte. The caller provides payload_length + 3 bytes. */
+static size_t app_assembler_encode_tap_block(
+    uint8_t *destination,
     const uint8_t *payload,
-    size_t payload_length,
-    char *error_buffer,
-    size_t error_buffer_size,
-    const char *path)
+    size_t payload_length)
 {
     uint8_t checksum = 0;
-    uint16_t block_length;
+    const uint16_t block_length = (uint16_t)(payload_length + 1u);
 
-    /* The TAP length covers the flag/data payload and its trailing checksum. */
-    if (payload_length > 0xFFFEu)
-    {
-        snprintf(error_buffer, error_buffer_size, "TAP block is too large: %s", path);
-        return false;
-    }
-    block_length = (uint16_t)(payload_length + 1u);
-    if (fputc(block_length & 0xFF, file) == EOF ||
-        fputc((block_length >> 8) & 0xFF, file) == EOF)
-    {
-        snprintf(error_buffer, error_buffer_size, "Could not write TAP file: %s", path);
-        return false;
-    }
+    destination[0] = (uint8_t)(block_length & 0xFFu);
+    destination[1] = (uint8_t)(block_length >> 8);
     for (size_t i = 0; i < payload_length; ++i)
     {
         checksum ^= payload[i];
-        if (fputc(payload[i], file) == EOF)
-        {
-            snprintf(error_buffer, error_buffer_size, "Could not write TAP file: %s", path);
-            return false;
-        }
+        destination[i + 2u] = payload[i];
     }
-    if (fputc(checksum, file) == EOF)
-    {
-        snprintf(error_buffer, error_buffer_size, "Could not write TAP file: %s", path);
-        return false;
-    }
-    return true;
+    destination[payload_length + 2u] = checksum;
+    return payload_length + 3u;
 }
 
 /* Writes one standard Spectrum CODE file as a two-block TAP image. */
@@ -2778,11 +2768,14 @@ static bool app_assembler_write_tap_file(
     char *error_buffer,
     size_t error_buffer_size)
 {
-    FILE *file;
     uint8_t header[18];
     uint8_t *block_data;
+    uint8_t *tap_data;
+    size_t tap_size;
+    size_t offset;
+    FileWriteChunk chunk;
     char tape_name[11];
-    bool ok = false;
+    bool ok;
 
     if (length == 0 || length > 0xFFFDu)
     {
@@ -2811,33 +2804,25 @@ static bool app_assembler_write_tap_file(
     block_data[0] = 0xFF;
     memcpy(block_data + 1, data, length);
 
-    file = fopen(path, "wb");
-    if (file == NULL)
+    tap_size = length + 25u;
+    tap_data = (uint8_t *)malloc(tap_size);
+    if (tap_data == NULL)
     {
         free(block_data);
-        snprintf(error_buffer, error_buffer_size, "Could not write TAP file: %s", path);
+        snprintf(error_buffer, error_buffer_size, "Out of memory.");
         return false;
     }
-
-    if (app_assembler_write_tap_block(file, header, sizeof(header), error_buffer, error_buffer_size, path) &&
-        app_assembler_write_tap_block(file, block_data, length + 1, error_buffer, error_buffer_size, path))
-    {
-        ok = true;
-    }
-
-    if (fclose(file) != 0)
-    {
-        ok = false;
-        snprintf(error_buffer, error_buffer_size, "Could not finish writing TAP file: %s", path);
-    }
+    offset = app_assembler_encode_tap_block(tap_data, header, sizeof(header));
+    offset += app_assembler_encode_tap_block(
+        tap_data + offset, block_data, length + 1u);
     free(block_data);
 
-    if (!ok)
-    {
-        remove(path);
-        return false;
-    }
-    return true;
+    chunk.data = tap_data;
+    chunk.size = offset;
+    ok = file_write_atomic(
+        path, &chunk, 1, "TAP file", error_buffer, error_buffer_size);
+    free(tap_data);
+    return ok;
 }
 
 /* Seeds the assembler with the current PC and a brief syntax reminder. */
@@ -2931,12 +2916,15 @@ static bool app_assembler_format_source_text(const char *source, char **formatte
                 size_t line_length = (size_t)(trimmed_end - trimmed_start);
                 if (used + line_length + 7 >= capacity)
                 {
+                    char *resized;
                     capacity = capacity + line_length + 256;
-                    formatted = (char *)realloc(formatted, capacity);
-                    if (formatted == NULL)
+                    resized = (char *)realloc(formatted, capacity);
+                    if (resized == NULL)
                     {
+                        free(formatted);
                         return false;
                     }
+                    formatted = resized;
                 }
                 memcpy(formatted + used, trimmed_start, (size_t)(label_end - trimmed_start));
                 used += (size_t)(label_end - trimmed_start);
@@ -2986,12 +2974,15 @@ static bool app_assembler_format_source_text(const char *source, char **formatte
                 }
                 if (used + line_length + 5 >= capacity)
                 {
+                    char *resized;
                     capacity = capacity + line_length + 256;
-                    formatted = (char *)realloc(formatted, capacity);
-                    if (formatted == NULL)
+                    resized = (char *)realloc(formatted, capacity);
+                    if (resized == NULL)
                     {
+                        free(formatted);
                         return false;
                     }
+                    formatted = resized;
                 }
                 if (comment_start == NULL || comment_start > trimmed_start)
                 {
@@ -3021,12 +3012,15 @@ static bool app_assembler_format_source_text(const char *source, char **formatte
         {
             if (used + 2 >= capacity)
             {
+                char *resized;
                 capacity += 256;
-                formatted = (char *)realloc(formatted, capacity);
-                if (formatted == NULL)
+                resized = (char *)realloc(formatted, capacity);
+                if (resized == NULL)
                 {
+                    free(formatted);
                     return false;
                 }
+                formatted = resized;
             }
             formatted[used++] = '\r';
             formatted[used++] = '\n';
@@ -3037,12 +3031,15 @@ static bool app_assembler_format_source_text(const char *source, char **formatte
 
     if (used + 1 >= capacity)
     {
+        char *resized;
         capacity += 1;
-        formatted = (char *)realloc(formatted, capacity);
-        if (formatted == NULL)
+        resized = (char *)realloc(formatted, capacity);
+        if (resized == NULL)
         {
+            free(formatted);
             return false;
         }
+        formatted = resized;
     }
     formatted[used] = '\0';
     *formatted_output = formatted;

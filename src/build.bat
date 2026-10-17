@@ -25,6 +25,7 @@ zig cc ^
     -I..\third_party\chips ^
     -I..\third_party\scintilla\include ^
     main.c ^
+    file_util.c ^
     spectrum.c ^
     szx_inflate.c ^
     zip.c ^

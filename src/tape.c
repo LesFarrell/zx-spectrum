@@ -27,7 +27,7 @@ enum {
     TAPE_TZX_LOOP_DEPTH = 16,
     TAPE_TZX_MAX_BLOCK_EXECUTIONS = 1000000,
     TAPE_TZX_MAX_GENERALIZED_SYMBOLS = 4000000,
-    TAPE_COMPLEX_FILE_MAX_SIZE = 128 * 1024 * 1024,
+    TAPE_FILE_MAX_SIZE = 128 * 1024 * 1024,
     TAPE_PILOT_PULSE_TICKS = 2168,
     TAPE_SYNC1_PULSE_TICKS = 667,
     TAPE_SYNC2_PULSE_TICKS = 735,
@@ -1842,8 +1842,6 @@ bool tape_load_file_with_options(
     FILE *file;
     uint8_t *data = NULL;
     int64_t file_size;
-    const char *extension;
-    bool is_tap;
     bool ok;
 
     if (player == NULL || path == NULL) {
@@ -1867,14 +1865,12 @@ bool tape_load_file_with_options(
         tape_set_error(error_buffer, error_buffer_size, "Tape file is empty", path);
         return false;
     }
-    extension = strrchr(path, '.');
-    is_tap = extension != NULL && _stricmp(extension, ".tap") == 0;
     if ((uint64_t)file_size > SIZE_MAX) {
         fclose(file);
         tape_set_error(error_buffer, error_buffer_size, "Tape file is too large to load", path);
         return false;
     }
-    if (!is_tap && (uint64_t)file_size > TAPE_COMPLEX_FILE_MAX_SIZE) {
+    if ((uint64_t)file_size > TAPE_FILE_MAX_SIZE) {
         fclose(file);
         tape_set_error(
             error_buffer,
@@ -1927,6 +1923,14 @@ bool tape_load_data_with_options(
 
     if (player == NULL || data == NULL || data_size == 0 || name == NULL) {
         tape_set_error(error_buffer, error_buffer_size, "Invalid tape data", name);
+        return false;
+    }
+    if (data_size > TAPE_FILE_MAX_SIZE) {
+        tape_set_error(
+            error_buffer,
+            error_buffer_size,
+            "Tape file exceeds the 128 MB safety limit",
+            name);
         return false;
     }
     tape_discard(player);
