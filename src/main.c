@@ -53,8 +53,9 @@ enum {
     APP_TAPE_LOADER_ACTIVE_READS = 32,
     APP_TAPE_LOADER_IDLE_FRAMES = 250,
     APP_RECENT_MEDIA_COUNT = 8,
-    APP_REWIND_SLOT_COUNT = 30,
-    APP_REWIND_CAPTURE_FRAMES = 50,
+    APP_REWIND_CAPTURE_FRAMES = 25,
+    APP_REWIND_MAX_FRAMES = 250,
+    APP_REWIND_SLOT_COUNT = APP_REWIND_MAX_FRAMES / APP_REWIND_CAPTURE_FRAMES + 1,
     APP_MEDIA_FILE_MAX_SIZE = 128 * 1024 * 1024,
     APP_MENU_FILE_OPEN_SNAPSHOT = 1001,
     APP_MENU_FILE_RESET = 1002,
@@ -88,7 +89,7 @@ enum {
     APP_MENU_MACHINE_SPEED_8X = 1215,
     APP_MENU_MACHINE_MULTIFACE = 1216,
     APP_MENU_MACHINE_MULTIFACE_NMI = 1217,
-    APP_MENU_MACHINE_REPLAY = 1219,
+    APP_MENU_MACHINE_REWIND = 1219,
     APP_MENU_VIEW_FULLSCREEN = 1250,
     APP_MENU_VIEW_INTEGER_SCALING = 1251,
     APP_MENU_VIEW_SCANLINES = 1252,
@@ -267,7 +268,7 @@ typedef enum KeyboardJoystickPreset {
 } KeyboardJoystickPreset;
 
 typedef struct RewindState {
-    zx_t *slots;
+    zx_t *snapshots;
     uint32_t versions[APP_REWIND_SLOT_COUNT];
     SpectrumModel models[APP_REWIND_SLOT_COUNT];
     size_t next;
@@ -662,7 +663,7 @@ static void app_rewind_clear(AppState *app);
 static bool app_rewind_init(AppState *app);
 static void app_rewind_discard(AppState *app);
 static void app_rewind_capture(AppState *app);
-static bool app_rewind_seconds(AppState *app, unsigned seconds);
+static bool app_rewind_restore_oldest(AppState *app);
 static void app_set_fullscreen(HWND hwnd, AppState *app, bool enabled);
 static void app_apply_joystick_mask(AppState *app);
 static bool app_video_backbuffer_ensure(
@@ -934,7 +935,7 @@ static HMENU app_create_menu(void) {
     AppendMenuA(machine_menu, MF_SEPARATOR, 0, NULL);
     AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_MULTIFACE, "Enable &Multiface");
     AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_MULTIFACE_NMI, "Multiface &NMI\tAlt+F5");
-    AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_REPLAY, "&Replay 5 Seconds\tF8");
+    AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_REWIND, "&Rewind 5 Seconds\tF8");
     AppendMenuA(view_menu, MF_STRING, APP_MENU_VIEW_FULLSCREEN, "&Fullscreen\tF11");
     AppendMenuA(view_menu, MF_STRING, APP_MENU_VIEW_INTEGER_SCALING, "&Integer Scaling");
     AppendMenuA(view_menu, MF_SEPARATOR, 0, NULL);
@@ -1139,7 +1140,7 @@ static void app_update_runtime_menu(HWND hwnd, const AppState *app) {
         (app->speed_multiplier == 8 ? MF_CHECKED : MF_UNCHECKED));
     EnableMenuItem(
         menu,
-        APP_MENU_MACHINE_REPLAY,
+        APP_MENU_MACHINE_REWIND,
         MF_BYCOMMAND | (app->rewind.count > 0 ? MF_ENABLED : MF_GRAYED));
     CheckMenuItem(menu, APP_MENU_MACHINE_MULTIFACE, MF_BYCOMMAND |
         (app->multiface_enabled ? MF_CHECKED : MF_UNCHECKED));
@@ -1279,12 +1280,12 @@ static void app_add_recent_media(AppState *app, const char *path) {
 
 static bool app_rewind_init(AppState *app) {
     const size_t allocation_size = APP_REWIND_SLOT_COUNT * sizeof(zx_t);
-    app->rewind.slots = (zx_t *)_aligned_malloc(allocation_size, _Alignof(zx_t));
-    if (app->rewind.slots != NULL) {
-        memset(app->rewind.slots, 0, allocation_size);
+    app->rewind.snapshots = (zx_t *)_aligned_malloc(allocation_size, _Alignof(zx_t));
+    if (app->rewind.snapshots != NULL) {
+        memset(app->rewind.snapshots, 0, allocation_size);
     }
     app_rewind_clear(app);
-    return app->rewind.slots != NULL;
+    return app->rewind.snapshots != NULL;
 }
 
 static void app_rewind_clear(AppState *app) {
@@ -1303,29 +1304,36 @@ static void app_rewind_discard(AppState *app) {
     if (app == NULL) {
         return;
     }
-    _aligned_free(app->rewind.slots);
-    app->rewind.slots = NULL;
+    _aligned_free(app->rewind.snapshots);
+    app->rewind.snapshots = NULL;
     app_rewind_clear(app);
 }
 
+/* Records one checkpoint every 25 emulated frames (about 500 ms). The slot
+   count includes both endpoints of the 250-frame (about five-second) window. */
 static void app_rewind_capture(AppState *app) {
     size_t slot;
-    if (app == NULL || app->rewind.slots == NULL || app->debug.paused) {
+    if (app == NULL || app->rewind.snapshots == NULL || app->debug.paused) {
         return;
     }
     if (app->rewind.frames_until_capture > 1) {
         app->rewind.frames_until_capture--;
+        /* Once emulation advances beyond the full window, exclude the oldest
+           endpoint until the next capture overwrites it. */
+        if (app->rewind.count == APP_REWIND_SLOT_COUNT) {
+            app->rewind.count--;
+        }
         return;
     }
     slot = app->rewind.next;
     if (!spectrum_save_runtime_state(
             &app->spec,
-            &app->rewind.slots[slot],
+            &app->rewind.snapshots[slot],
             &app->rewind.versions[slot])) {
         return;
     }
     app->rewind.models[slot] = app->spec.model;
-    app->rewind.next = (slot + 1) % APP_REWIND_SLOT_COUNT;
+    app->rewind.next = (slot + 1u) % APP_REWIND_SLOT_COUNT;
     if (app->rewind.count < APP_REWIND_SLOT_COUNT) {
         app->rewind.count++;
     }
@@ -1335,24 +1343,26 @@ static void app_rewind_capture(AppState *app) {
     }
 }
 
-static bool app_rewind_seconds(AppState *app, unsigned seconds) {
-    size_t steps;
+/* Restores the oldest retained snapshot, which is at most 250 emulated frames
+   (about five seconds) old, then discards the abandoned timeline. */
+static bool app_rewind_restore_oldest(AppState *app) {
     size_t slot;
-    if (app == NULL || app->rewind.slots == NULL || app->rewind.count == 0) {
+    if (app == NULL || app->rewind.snapshots == NULL ||
+        app->rewind.count == 0) {
         return false;
     }
-    steps = seconds < app->rewind.count ? seconds : app->rewind.count;
-    slot = (app->rewind.next + APP_REWIND_SLOT_COUNT - steps) % APP_REWIND_SLOT_COUNT;
+    slot = (app->rewind.next + APP_REWIND_SLOT_COUNT - app->rewind.count) %
+        APP_REWIND_SLOT_COUNT;
     if (!spectrum_load_runtime_state(
             &app->spec,
             app->rewind.models[slot],
-            &app->rewind.slots[slot],
+            &app->rewind.snapshots[slot],
             app->rewind.versions[slot])) {
         app_rewind_clear(app);
         return false;
     }
-    app->rewind.next = (slot + 1) % APP_REWIND_SLOT_COUNT;
-    app->rewind.count = app->rewind.count - steps + 1;
+    app->rewind.next = (slot + 1u) % APP_REWIND_SLOT_COUNT;
+    app->rewind.count = 1;
     app->rewind.frames_until_capture = APP_REWIND_CAPTURE_FRAMES;
     app_audio_flush(app);
     app_release_all_keys(app);
@@ -3504,7 +3514,8 @@ static double app_model_frame_duration_ms(SpectrumModel model) {
 }
 
 /* Runs one timing slice of the emulator and audio service. This is shared by
-   the normal idle loop and the timer path used during modal move/size loops. */
+   the normal idle loop and the timer path used during modal menu, move, and
+   size loops. */
 static void app_tick_emulator(AppState *app) {
     LARGE_INTEGER now;
     LARGE_INTEGER warp_started;
@@ -3537,6 +3548,7 @@ static void app_tick_emulator(AppState *app) {
         while (frames_run < APP_TAPE_WARP_MAX_FRAMES && !app->debug.paused) {
             app_run_autotype(app);
             app_debug_run_frame(app, false);
+            app_rewind_capture(app);
             frames_run++;
             (void)app_update_tape_loader_activity(app);
 
@@ -3604,8 +3616,8 @@ static void app_tick_emulator(AppState *app) {
     app_audio_service(app);
 }
 
-/* Keeps the emulator ticking while Windows is inside a modal move/size loop
-   for any of the app's top-level windows. */
+/* Keeps the emulator ticking while Windows is inside a modal menu or
+   move/size loop for any of the app's top-level windows. */
 static void app_set_modal_loop_timer(AppState *app, HWND hwnd, bool enabled) {
     if (app == NULL) {
         return;
@@ -3929,7 +3941,9 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                             SendMessageA(hwnd, WM_COMMAND, APP_MENU_VIEW_FULLSCREEN, 0);
                             return 0;
                         case VK_F8:
-                            SendMessageA(hwnd, WM_COMMAND, APP_MENU_MACHINE_REPLAY, 0);
+                            if ((lparam & (1u << 30)) == 0) {
+                                SendMessageA(hwnd, WM_COMMAND, APP_MENU_MACHINE_REWIND, 0);
+                            }
                             return 0;
                         case VK_ESCAPE:
                             if (app->fullscreen) {
@@ -3963,6 +3977,12 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
             app_set_modal_loop_timer(app, hwnd, true);
             return 0;
         case WM_EXITSIZEMOVE:
+            app_set_modal_loop_timer(app, hwnd, false);
+            return 0;
+        case WM_ENTERMENULOOP:
+            app_set_modal_loop_timer(app, hwnd, true);
+            return 0;
+        case WM_EXITMENULOOP:
             app_set_modal_loop_timer(app, hwnd, false);
             return 0;
         case WM_TIMER:
@@ -4323,8 +4343,8 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                         app_save_speed_multiplier(app->speed_multiplier);
                         app_update_runtime_menu(hwnd, app);
                         return 0;
-                    case APP_MENU_MACHINE_REPLAY:
-                        if (!app_rewind_seconds(app, 5)) {
+                    case APP_MENU_MACHINE_REWIND:
+                        if (!app_rewind_restore_oldest(app)) {
                             MessageBeep(MB_ICONINFORMATION);
                         }
                         return 0;

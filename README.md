@@ -50,7 +50,8 @@ Small ZX Spectrum emulator in C for Windows. It uses the Win32 API for display, 
   supported files
 - Pause, selectable 1x/2x/4x/8x speed, borderless fullscreen, and centered
   integer display scaling
-- A 30-second in-memory rewind history sampled once per second
+- A five-second in-memory rewind history sampled every 25 emulated frames
+  (approximately 500 ms)
 - Eight remembered recent-media paths
 
 ## Not implemented
@@ -191,10 +192,9 @@ Spectrum +3 with one combined 64 KB ROM:
 - `Machine` switches among 48K, 128K, +3, +2, and +2A and remembers the choice
 - `Ctrl+1` through `Ctrl+5` select 48K, 128K, +3, +2, and +2A
 - `Machine -> Speed` selects 1x, 2x, 4x, or 8x and remembers the selection
-- `F2` pauses, `F6` cycles through the speed choices, and `Ctrl+Backspace`
-  rewinds up to five seconds
-- `F8` or `Machine -> Replay 4 Seconds` rewinds four seconds; `F9` or
-  `Machine -> Restart Game` resets and autoloads the inserted tape again
+- `F2` pauses and `F6` cycles through the speed choices
+- `F8` or `Machine -> Rewind 5 Seconds` rewinds five emulated seconds, or to
+  the oldest available half-second checkpoint when less history exists
 - `F11` toggles fullscreen; `Escape` leaves fullscreen
 - `View -> Integer Scaling` keeps the image at a centered whole-number scale
 - `View -> Scanlines` applies a lightweight alternating-line display filter;
