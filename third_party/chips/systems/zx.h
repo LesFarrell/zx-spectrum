@@ -68,14 +68,15 @@ extern "C" {
 #endif
 
 // bump this whenever the zx_t struct layout changes
-#define ZX_SNAPSHOT_VERSION (0x000A)
+#define ZX_SNAPSHOT_VERSION (0x000B)
 
 #define ZX_MAX_AUDIO_SAMPLES (1024)      // max number of audio samples in internal sample buffer
 #define ZX_DEFAULT_AUDIO_SAMPLES (128)   // default number of samples in internal sample buffer
-#define ZX_FRAMEBUFFER_WIDTH (512)
+#define ZX_FRAMEBUFFER_WIDTH (640)
 #define ZX_FRAMEBUFFER_HEIGHT (256)
 #define ZX_FRAMEBUFFER_SIZE_BYTES (ZX_FRAMEBUFFER_WIDTH * ZX_FRAMEBUFFER_HEIGHT)
 #define ZX_DISPLAY_WIDTH (320)
+#define ZX_HIRES_DISPLAY_WIDTH (640)
 #define ZX_DISPLAY_HEIGHT (256)
 #define ZX_PLUS3_MAX_SECTOR_SIZE (8192)
 #define ZX_ULAPLUS_PALETTE_SIZE (64)
@@ -244,6 +245,7 @@ typedef struct {
     uint8_t border_color;
     uint8_t ulaplus_register;
     uint8_t ulaplus_mode;
+    uint8_t timex_video_mode;
     uint8_t ulaplus_palette[ZX_ULAPLUS_PALETTE_SIZE];
     uint32_t ulaplus_colors[256];
     bool ulaplus_enabled;
@@ -359,6 +361,8 @@ void zx_reset(zx_t* sys);
 chips_display_info_t zx_display_info(zx_t* sys);
 // resolve one indexed framebuffer pixel to the colour active on its scanline
 uint32_t zx_display_color(const zx_t* sys, int y, uint8_t color_index);
+// query the active source width (standard/hi-colour or Timex hi-resolution)
+int zx_display_width(const zx_t* sys);
 // run ZX Spectrum instance for a given number of microseconds, return number of ticks
 uint32_t zx_exec(zx_t* sys, uint32_t micro_seconds);
 // run ZX Spectrum instance for an exact number of CPU T-states
@@ -471,10 +475,10 @@ static uint32_t _zx_ulaplus_decode_color(uint8_t color) {
     const uint8_t green3 = color >> 5;
     const uint8_t red3 = (color >> 2) & 7;
     const uint8_t blue2 = color & 3;
-    const uint8_t blue3 = (uint8_t)((blue2 << 1) | (blue2 & 1));
-    const uint8_t red8 = (uint8_t)((red3 << 5) | (red3 << 2) | (red3 & 3));
-    const uint8_t green8 = (uint8_t)((green3 << 5) | (green3 << 2) | (green3 & 3));
-    const uint8_t blue8 = (uint8_t)((blue3 << 5) | (blue3 << 2) | (blue3 & 3));
+    const uint8_t blue3 = (uint8_t)((blue2 << 1) | ((blue2 >> 1) | (blue2 & 1)));
+    const uint8_t red8 = (uint8_t)((red3 << 5) | (red3 << 2) | (red3 >> 1));
+    const uint8_t green8 = (uint8_t)((green3 << 5) | (green3 << 2) | (green3 >> 1));
+    const uint8_t blue8 = (uint8_t)((blue3 << 5) | (blue3 << 2) | (blue3 >> 1));
     return 0xFF000000u |
         ((uint32_t)blue8 << 16) |
         ((uint32_t)green8 << 8) |
@@ -494,6 +498,7 @@ static void _zx_ulaplus_reset(zx_t* sys) {
     sys->ulaplus_register = 0;
     sys->ulaplus_mode = 0;
     sys->ulaplus_enabled = false;
+    sys->timex_video_mode = 0;
     memcpy(
         sys->ulaplus_palette,
         _zx_ulaplus_default_palette,
@@ -503,6 +508,34 @@ static void _zx_ulaplus_reset(zx_t* sys) {
         0,
         sizeof(sys->ulaplus_scanline_enabled));
     _zx_ulaplus_begin_scanline(sys);
+}
+
+/* ULAplus mode-group register selection mirrors the Timex port FF display
+   controls. Values 3/7 select the bank-7 hi-colour/hi-resolution variants;
+   port FF itself continues to select the video mode without changing banks. */
+static void _zx_ulaplus_select_register(zx_t* sys, uint8_t data) {
+    sys->ulaplus_register = data;
+    if ((data >> 6) == 1) {
+        const uint8_t control = data & 0x3F;
+        const uint8_t encoded_mode = control & 7;
+        uint8_t timex_mode;
+        bool bank7;
+        switch (encoded_mode) {
+            case 0: timex_mode = 0; bank7 = false; break;
+            case 1: timex_mode = 1; bank7 = false; break;
+            case 2: timex_mode = 2; bank7 = false; break;
+            case 3: timex_mode = 2; bank7 = true; break;
+            case 4: timex_mode = 0; bank7 = true; break;
+            case 5: timex_mode = 1; bank7 = true; break;
+            case 6: timex_mode = 6; bank7 = false; break;
+            default: timex_mode = 6; bank7 = true; break;
+        }
+        sys->timex_video_mode = (uint8_t)(
+            (sys->timex_video_mode & 0xC0) | (control & 0x38) | timex_mode);
+        if (sys->type != ZX_TYPE_48K) {
+            sys->display_ram_bank = bank7 ? 7 : 5;
+        }
+    }
 }
 
 static void _zx_ulaplus_record_event(
@@ -740,13 +773,36 @@ static bool _zx_decode_scanline(zx_t* sys) {
     const int btm_decode_line = sys->top_border_scanlines + 192 + 32;
     if ((sys->scanline_y >= top_decode_line) && (sys->scanline_y < btm_decode_line)) {
         const uint16_t y = sys->scanline_y - top_decode_line;
-        uint8_t* dst = &sys->fb[y * ZX_FRAMEBUFFER_WIDTH];
+        uint8_t video_mode = sys->timex_video_mode & 7;
         const uint8_t* vidmem_bank = sys->ram[sys->display_ram_bank];
         const bool blink = 0 != (sys->blink_counter & 0x10);
         uint8_t line_palette[ZX_ULAPLUS_PALETTE_SIZE];
         uint8_t event_index = 0;
         bool palette_enabled = sys->ulaplus_line_enabled;
         bool resolved_color_line = palette_enabled;
+        bool hires;
+        int display_width;
+        int border_width;
+        uint8_t border_standard;
+        uint8_t border_ulaplus;
+        uint8_t* dst = &sys->fb[y * ZX_FRAMEBUFFER_WIDTH];
+
+        if (video_mode != 1 && video_mode != 2 && video_mode != 6) {
+            video_mode = 0;
+        }
+        hires = video_mode == 6;
+        display_width = hires ? ZX_HIRES_DISPLAY_WIDTH : ZX_DISPLAY_WIDTH;
+        border_width = hires ? 64 : 32;
+        if (hires) {
+            const uint8_t ink = (sys->timex_video_mode >> 3) & 7;
+            border_standard = (uint8_t)(8 | (7 - ink));
+            border_ulaplus = (uint8_t)(24 + (7 - ink));
+        }
+        else {
+            border_standard = sys->border_color;
+            border_ulaplus = (uint8_t)(8 + (sys->border_color & 7));
+        }
+
         memcpy(line_palette, sys->ulaplus_line_palette, sizeof(line_palette));
         for (uint8_t event = 0; event < sys->ulaplus_line_event_count; event++) {
             if (sys->ulaplus_line_events[event].register_index == ZX_ULAPLUS_PALETTE_SIZE) {
@@ -782,76 +838,90 @@ static bool _zx_decode_scanline(zx_t* sys) {
 
         if ((y < 32) || (y >= 224)) {
             // upper/lower border
-            for (int x = 0; x < ZX_DISPLAY_WIDTH; x++) {
+            for (int x = 0; x < display_width; x++) {
                 /* The cropped display begins eight t-states into the
-                   hardware line; the full left border is 24 t-states. */
-                const uint16_t tstate = (uint16_t)(8 + (x >> 1));
+                   hardware line; hi-res pixels are half as wide. */
+                const uint16_t tstate = (uint16_t)(8 + (hires ? (x >> 2) : (x >> 1)));
                 _ZX_APPLY_ULAPLUS_EVENTS(tstate);
-                *dst++ = _ZX_RESOLVE_PIXEL(
-                    sys->border_color,
-                    (uint8_t)(8 + (sys->border_color & 7)));
+                *dst++ = _ZX_RESOLVE_PIXEL(border_standard, border_ulaplus);
             }
         }
         else {
-            /* compute video memory Y offset (inside 256x192 area)
-                this is how the 16-bit video memory address is computed
-                from X and Y coordinates:
-                | 0| 1| 0|Y7|Y6|Y2|Y1|Y0|Y5|Y4|Y3|X4|X3|X2|X1|X0|
-            */
-            const uint16_t yy = y-32;
-            const uint16_t y_offset = ((yy & 0xC0)<<5) | ((yy & 0x07)<<8) | ((yy & 0x38)<<2);
+            /* The two Timex display files occupy the first and second 8 KB
+               halves of the selected 16 KB Spectrum display bank. */
+            const uint16_t yy = y - 32;
+            const uint16_t y_offset = (uint16_t)(
+                ((yy & 0xC0) << 5) | ((yy & 0x07) << 8) | ((yy & 0x38) << 2));
 
             // left border
-            for (int x = 0; x < (4*8); x++) {
-                _ZX_APPLY_ULAPLUS_EVENTS((uint16_t)(8 + (x >> 1)));
-                *dst++ = _ZX_RESOLVE_PIXEL(
-                    sys->border_color,
-                    (uint8_t)(8 + (sys->border_color & 7)));
+            for (int x = 0; x < border_width; x++) {
+                _ZX_APPLY_ULAPLUS_EVENTS(
+                    (uint16_t)(8 + (hires ? (x >> 2) : (x >> 1))));
+                *dst++ = _ZX_RESOLVE_PIXEL(border_standard, border_ulaplus);
             }
 
-            // valid 256x192 vidmem area
-            for (uint16_t x = 0; x < 32; x++) {
-                const uint16_t pix_offset = y_offset | x;
-                const uint16_t clr_offset = 0x1800 + (((yy & ~0x7)<<2) | x);
-
-                // pixel mask and color attribute bytes
-                const uint8_t pix = vidmem_bank[pix_offset];
-                const uint8_t clr = vidmem_bank[clr_offset];
-
-                // foreground and background color
-                uint8_t std_fg, std_bg;
-                uint8_t ulaplus_fg, ulaplus_bg;
-                const uint8_t clut = (clr >> 6) * 16;
-                ulaplus_fg = clut | (clr & 7);
-                ulaplus_bg = clut | 8 | ((clr >> 3) & 7);
-                if ((clr & (1<<7)) && blink) {
-                    std_fg = (clr>>3) & 7;
-                    std_bg = clr & 7;
+            if (hires) {
+                const uint8_t ink = (sys->timex_video_mode >> 3) & 7;
+                const uint8_t paper = (uint8_t)(7 - ink);
+                const uint8_t std_fg = (uint8_t)(8 | ink);
+                const uint8_t std_bg = (uint8_t)(8 | paper);
+                const uint8_t ulaplus_fg = (uint8_t)(24 + ink);
+                const uint8_t ulaplus_bg = (uint8_t)(24 + paper);
+                for (uint16_t x = 0; x < 32; x++) {
+                    const uint8_t even_pixels = vidmem_bank[y_offset | x];
+                    const uint8_t odd_pixels = vidmem_bank[0x2000 | y_offset | x];
+                    for (int px = 7; px >= 0; px--) {
+                        const uint16_t screen_x = (uint16_t)((x * 16) + ((7 - px) * 2));
+                        _ZX_APPLY_ULAPLUS_EVENTS((uint16_t)(24 + (screen_x >> 2)));
+                        *dst++ = even_pixels & (1 << px)
+                            ? _ZX_RESOLVE_PIXEL(std_fg, ulaplus_fg)
+                            : _ZX_RESOLVE_PIXEL(std_bg, ulaplus_bg);
+                        *dst++ = odd_pixels & (1 << px)
+                            ? _ZX_RESOLVE_PIXEL(std_fg, ulaplus_fg)
+                            : _ZX_RESOLVE_PIXEL(std_bg, ulaplus_bg);
+                    }
                 }
-                else {
-                    std_fg = clr & 7;
-                    std_bg = (clr>>3) & 7;
-                }
-                // color bit 6: standard vs bright
-                std_fg |= (clr & (1<<6)) >> 3;
-                std_bg |= (clr & (1<<6)) >> 3;
+            }
+            else {
+                const uint16_t screen_base = video_mode == 1 ? 0x2000 : 0;
+                for (uint16_t x = 0; x < 32; x++) {
+                    const uint16_t pix_offset = screen_base + y_offset + x;
+                    const uint16_t clr_offset = video_mode == 2
+                        ? (uint16_t)(0x2000 + y_offset + x)
+                        : (uint16_t)(screen_base + 0x1800 + (((yy & ~0x7) << 2) | x));
+                    const uint8_t pix = vidmem_bank[pix_offset];
+                    const uint8_t clr = vidmem_bank[clr_offset];
+                    uint8_t std_fg;
+                    uint8_t std_bg;
+                    const uint8_t clut = (uint8_t)((clr >> 6) * 16);
+                    const uint8_t ulaplus_fg = (uint8_t)(clut | (clr & 7));
+                    const uint8_t ulaplus_bg = (uint8_t)(clut | 8 | ((clr >> 3) & 7));
+                    if ((clr & (1 << 7)) && blink) {
+                        std_fg = (clr >> 3) & 7;
+                        std_bg = clr & 7;
+                    }
+                    else {
+                        std_fg = clr & 7;
+                        std_bg = (clr >> 3) & 7;
+                    }
+                    std_fg |= (clr & (1 << 6)) >> 3;
+                    std_bg |= (clr & (1 << 6)) >> 3;
 
-                for (int px = 7; px >=0; px--) {
-                    const uint16_t screen_x = (uint16_t)((x * 8) + (7 - px));
-                    _ZX_APPLY_ULAPLUS_EVENTS(
-                        (uint16_t)(24 + (screen_x >> 1)));
-                    *dst++ = pix & (1<<px)
-                        ? _ZX_RESOLVE_PIXEL(std_fg, ulaplus_fg)
-                        : _ZX_RESOLVE_PIXEL(std_bg, ulaplus_bg);
+                    for (int px = 7; px >= 0; px--) {
+                        const uint16_t screen_x = (uint16_t)((x * 8) + (7 - px));
+                        _ZX_APPLY_ULAPLUS_EVENTS((uint16_t)(24 + (screen_x >> 1)));
+                        *dst++ = pix & (1 << px)
+                            ? _ZX_RESOLVE_PIXEL(std_fg, ulaplus_fg)
+                            : _ZX_RESOLVE_PIXEL(std_bg, ulaplus_bg);
+                    }
                 }
             }
 
             // right border
-            for (int x = 0; x < (4*8); x++) {
-                _ZX_APPLY_ULAPLUS_EVENTS((uint16_t)(152 + (x >> 1)));
-                *dst++ = _ZX_RESOLVE_PIXEL(
-                    sys->border_color,
-                    (uint8_t)(8 + (sys->border_color & 7)));
+            for (int x = 0; x < border_width; x++) {
+                _ZX_APPLY_ULAPLUS_EVENTS(
+                    (uint16_t)(152 + (hires ? (x >> 2) : (x >> 1))));
+                *dst++ = _ZX_RESOLVE_PIXEL(border_standard, border_ulaplus);
             }
         }
 
@@ -2099,7 +2169,7 @@ static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
             }
         }
         else if ((io_addr == 0xBF3B) && (pins & Z80_WR)) {
-            sys->ulaplus_register = Z80_GET_DATA(pins);
+            _zx_ulaplus_select_register(sys, Z80_GET_DATA(pins));
         }
         else if (io_addr == 0xFF3B) {
             if (pins & Z80_RD) {
@@ -2107,6 +2177,14 @@ static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
             }
             else if (pins & Z80_WR) {
                 _zx_ulaplus_write_data(sys, Z80_GET_DATA(pins));
+            }
+        }
+        else if ((uint8_t)io_addr == 0xFF) {
+            if (pins & Z80_RD) {
+                Z80_SET_DATA(pins, sys->timex_video_mode);
+            }
+            else if (pins & Z80_WR) {
+                sys->timex_video_mode = Z80_GET_DATA(pins);
             }
         }
         else if (sys->multiface_enabled && (pins & Z80_RD) &&
@@ -2808,6 +2886,13 @@ uint32_t zx_display_color(const zx_t* sys, int y, uint8_t color_index) {
     return _zx_standard_palette[color_index & 0x0F];
 }
 
+int zx_display_width(const zx_t* sys) {
+    CHIPS_ASSERT(sys && sys->valid);
+    return (sys->timex_video_mode & 7) == 6
+        ? ZX_HIRES_DISPLAY_WIDTH
+        : ZX_DISPLAY_WIDTH;
+}
+
 chips_display_info_t zx_display_info(zx_t* sys) {
     const chips_display_info_t res = {
         .frame = {
@@ -2824,7 +2909,7 @@ chips_display_info_t zx_display_info(zx_t* sys) {
         .screen = {
             .x = 0,
             .y = 0,
-            .width = ZX_DISPLAY_WIDTH,
+            .width = sys ? zx_display_width(sys) : ZX_DISPLAY_WIDTH,
             .height = ZX_DISPLAY_HEIGHT,
         },
         .palette = {

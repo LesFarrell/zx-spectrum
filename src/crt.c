@@ -12,17 +12,20 @@ static uint8_t app_crt_dim(uint8_t channel) {
    buffer that should be blitted. The copy/dimming work is skipped entirely
    when scanlines are disabled, so the live framebuffer is returned directly. */
 static const uint32_t *app_crt_apply_effects(AppState *app) {
-    const size_t count = (size_t)ZX_SCREEN_WIDTH * (size_t)ZX_SCREEN_HEIGHT;
+    int width;
+    size_t count;
     if (app == NULL) {
         return NULL;
     }
+    width = spectrum_framebuffer_width(&app->spec);
+    count = (size_t)width * (size_t)ZX_SCREEN_HEIGHT;
     if (app->crt_framebuffer == NULL || !app->crt_scanlines) {
         return app->spec.framebuffer;
     }
     memcpy(app->crt_framebuffer, app->spec.framebuffer, count * sizeof(uint32_t));
     for (int y = 0; y < ZX_SCREEN_HEIGHT; ++y) {
-        for (int x = 0; x < ZX_SCREEN_WIDTH; ++x) {
-            const size_t index = (size_t)y * (size_t)ZX_SCREEN_WIDTH + (size_t)x;
+        for (int x = 0; x < width; ++x) {
+            const size_t index = (size_t)y * (size_t)width + (size_t)x;
             const uint32_t color = app->crt_framebuffer[index];
             uint8_t r = (uint8_t)((color >> 16) & 0xFFu);
             uint8_t g = (uint8_t)((color >> 8) & 0xFFu);

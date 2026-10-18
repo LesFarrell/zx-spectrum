@@ -14,8 +14,9 @@ Small ZX Spectrum emulator in C for Windows. It uses the Win32 API for display, 
 - Spectrum +3 model with four ROM banks, `0x7FFD`/`0x1FFD` paging,
   all-RAM modes, AY audio, and uPD765 floppy-controller emulation
 - ULA screen rendering with border and flash attributes
-- Standard ULAplus 64-colour palette mode on ports `0xBF3B`/`0xFF3B`,
-  including scanline palette changes and colour-register readback
+- ULAplus 64-colour palette mode on ports `0xBF3B`/`0xFF3B`, including
+  scanline palette changes, colour-register readback, and the optional Timex
+  screen 1, hi-colour, and hi-resolution video modes through port `0xFF`
 - Native CPU and frame timing: 3.5 MHz with 69,888 T-states per 48K frame,
   and 3.546894 MHz with 70,908 T-states per 128K-family frame
 - Memory-side ULA contention timing for 48K and 128K RAM accesses
@@ -46,7 +47,8 @@ Small ZX Spectrum emulator in C for Windows. It uses the Win32 API for display, 
 - `.szx` ZX-State snapshot loading for 48K, 128K, +2, +2A, and +3 machines,
   including zlib-compressed RAM pages, paging, AY, ULAplus `PLTT`, Fuller AY,
   SpecDrum, Covox, and Multiface state
-- `.scr` screen loading and saving for the currently displayed RAM bank
+- Standard, ULAplus, Timex hi-colour, and Timex hi-resolution `.scr` screen
+  loading and saving for the currently displayed RAM bank
 - `.zip` archive loading for every supported tape, disk, Microdrive, screen,
   and snapshot format, with an entry picker when an archive contains several
   supported files
@@ -62,7 +64,6 @@ Small ZX Spectrum emulator in C for Windows. It uses the Win32 API for display, 
 - Floating-bus reads and selectable early/late ULA timing variants
 - Pixel-accurate mid-scanline border and screen changes (the current renderer
   is scanline-granular)
-- Optional ULAplus Timex hi-colour and hi-resolution video modes
 - SZX machine variants outside the five currently emulated Sinclair models;
   unrelated peripheral blocks are skipped while core state is restored
 - Creating or formatting DSK tracks

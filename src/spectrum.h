@@ -16,6 +16,7 @@
 
 enum {
     ZX_SCREEN_WIDTH = ZX_DISPLAY_WIDTH,
+    ZX_SCREEN_MAX_WIDTH = ZX_HIRES_DISPLAY_WIDTH,
     ZX_SCREEN_HEIGHT = ZX_DISPLAY_HEIGHT
 };
 
@@ -71,7 +72,7 @@ typedef struct Spectrum {
     uint8_t multiface_rom[ZX_MULTIFACE_ROM_SIZE];
     bool multiface_rom_loaded;
 
-    uint32_t framebuffer[ZX_SCREEN_WIDTH * ZX_SCREEN_HEIGHT];
+    uint32_t framebuffer[ZX_SCREEN_MAX_WIDTH * ZX_SCREEN_HEIGHT];
 } Spectrum;
 
 /* Clears the wrapper state and records which machine model should be created
@@ -160,6 +161,7 @@ void spectrum_reset(Spectrum *spec);
 /* Copies the emulator's indexed framebuffer into the wrapper's 32-bit RGBA
    framebuffer using the palette provided by the chips display descriptor. */
 void spectrum_render_frame(Spectrum *spec);
+int spectrum_framebuffer_width(const Spectrum *spec);
 
 /* Sends a host key press into the embedded emulator using the chips keyboard
    mapping configured during machine initialization. */
@@ -186,7 +188,7 @@ void spectrum_set_expansion_audio(
 void spectrum_set_multiface_enabled(Spectrum *spec, bool enabled);
 void spectrum_multiface_nmi(Spectrum *spec);
 
-/* Loads or saves the 6912-byte bitmap/attribute image of the visible screen. */
+/* Loads or saves standard, ULAplus, Timex hi-colour, and Timex hi-res screens. */
 bool spectrum_load_screen_scr_data(
     Spectrum *spec,
     const uint8_t *data,

@@ -54,7 +54,7 @@ enum {
     APP_TAPE_LOADER_IDLE_FRAMES = 250,
     APP_RECENT_MEDIA_COUNT = 8,
     APP_REWIND_CAPTURE_FRAMES = 25,
-    APP_REWIND_MAX_FRAMES = 250,
+    APP_REWIND_MAX_FRAMES = 100,
     APP_REWIND_SLOT_COUNT = APP_REWIND_MAX_FRAMES / APP_REWIND_CAPTURE_FRAMES + 1,
     APP_MEDIA_FILE_MAX_SIZE = 128 * 1024 * 1024,
     APP_MENU_FILE_OPEN_SNAPSHOT = 1001,
@@ -936,7 +936,7 @@ static HMENU app_create_menu(void) {
     AppendMenuA(machine_menu, MF_SEPARATOR, 0, NULL);
     AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_MULTIFACE, "Enable &Multiface");
     AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_MULTIFACE_NMI, "Multiface &NMI\tAlt+F5");
-    AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_REWIND, "&Rewind 5 Seconds\tF8");
+    AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_REWIND, "&Rewind 2 Seconds\tF8");
     AppendMenuA(view_menu, MF_STRING, APP_MENU_VIEW_FULLSCREEN, "&Fullscreen\tF11");
     AppendMenuA(view_menu, MF_STRING, APP_MENU_VIEW_INTEGER_SCALING, "&Integer Scaling");
     AppendMenuA(view_menu, MF_SEPARATOR, 0, NULL);
@@ -1311,7 +1311,7 @@ static void app_rewind_discard(AppState *app) {
 }
 
 /* Records one checkpoint every 25 emulated frames (about 500 ms). The slot
-   count includes both endpoints of the 250-frame (about five-second) window. */
+   count includes both endpoints of the 100-frame (about two-second) window. */
 static void app_rewind_capture(AppState *app) {
     size_t slot;
     if (app == NULL || app->rewind.snapshots == NULL || app->debug.paused) {
@@ -1344,8 +1344,8 @@ static void app_rewind_capture(AppState *app) {
     }
 }
 
-/* Restores the oldest retained snapshot, which is at most 250 emulated frames
-   (about five seconds) old, then discards the abandoned timeline. */
+/* Restores the oldest retained snapshot, which is at most 100 emulated frames
+   (about two seconds) old, then discards the abandoned timeline. */
 static bool app_rewind_restore_oldest(AppState *app) {
     size_t slot;
     if (app == NULL || app->rewind.snapshots == NULL ||
@@ -4612,6 +4612,7 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                 }
                 PatBlt(draw_dc, 0, 0, target_width, target_height, BLACKNESS);
                 const uint32_t *render_pixels = app_crt_apply_effects(app);
+                const int source_width = spectrum_framebuffer_width(&app->spec);
                 if (app->integer_scaling) {
                     int scale_x = target_width / ZX_SCREEN_WIDTH;
                     int scale_y = target_height / ZX_SCREEN_HEIGHT;
@@ -4629,6 +4630,7 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                     target_x = (rect.right - target_width) / 2;
                     target_y = (rect.bottom - target_height) / 2;
                 }
+                app->bitmap_info.bmiHeader.biWidth = source_width;
                 StretchDIBits(
                     draw_dc,
                     target_x,
@@ -4637,7 +4639,7 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                     target_height,
                     0,
                     0,
-                    ZX_SCREEN_WIDTH,
+                    source_width,
                     ZX_SCREEN_HEIGHT,
                     render_pixels,
                     &app->bitmap_info,
@@ -5756,7 +5758,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    AppState app;
+    static AppState app;
     ZeroMemory(&app, sizeof(app));
     app.roms = selection;
     app.tape_autoload_enabled = has_saved_tape_autoload ? saved_tape_autoload : true;
@@ -5789,7 +5791,7 @@ int main(int argc, char **argv) {
     app.crt_scanlines = false;
     app_load_saved_toggle("crt_scanlines", &app.crt_scanlines);
     app.crt_framebuffer = (uint32_t *)malloc(
-        (size_t)ZX_SCREEN_WIDTH * (size_t)ZX_SCREEN_HEIGHT * sizeof(uint32_t));
+        (size_t)ZX_SCREEN_MAX_WIDTH * (size_t)ZX_SCREEN_HEIGHT * sizeof(uint32_t));
     app_load_recent_media(&app);
     tape_init(&app.tape);
     dsk_init(&app.disk);

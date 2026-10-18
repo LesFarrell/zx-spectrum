@@ -30,7 +30,13 @@ enum
     SNA_128K_DUPLICATE_BANK_SIZE = SNA_128K_BASE_SIZE + (6 * SNA_RAM_BANK_SIZE),
     Z80_V3_HEADER_SIZE = 87,
     Z80_PAGE_HEADER_SIZE = 3,
-    SCR_SCREEN_SIZE = 6912
+    SCR_BITMAP_SIZE = 6144,
+    SCR_SCREEN_SIZE = 6912,
+    SCR_ULAPLUS_SIZE = SCR_SCREEN_SIZE + ZX_ULAPLUS_PALETTE_SIZE,
+    SCR_TIMEX_SIZE = SCR_BITMAP_SIZE * 2,
+    SCR_TIMEX_ULAPLUS_SIZE = SCR_TIMEX_SIZE + ZX_ULAPLUS_PALETTE_SIZE,
+    SCR_HIRES_SIZE = SCR_TIMEX_SIZE + 1,
+    SCR_HIRES_ULAPLUS_SIZE = SCR_HIRES_SIZE + ZX_ULAPLUS_PALETTE_SIZE
 };
 
 static uint16_t spectrum_read_u16(const uint8_t *data)
@@ -623,12 +629,13 @@ void spectrum_render_frame(Spectrum *spec)
 
     const uint8_t *src = (const uint8_t *)spec->display.frame.buffer.ptr;
     const int pitch = spec->display.frame.dim.width;
+    const int width = spectrum_framebuffer_width(spec);
 
     for (int y = 0; y < ZX_SCREEN_HEIGHT; ++y)
     {
         const uint8_t *src_row = src + y * pitch;
-        uint32_t *dst_row = &spec->framebuffer[y * ZX_SCREEN_WIDTH];
-        for (int x = 0; x < ZX_SCREEN_WIDTH; ++x)
+        uint32_t *dst_row = &spec->framebuffer[y * width];
+        for (int x = 0; x < width; ++x)
         {
             uint32_t color = zx_display_color(&spec->machine, y, src_row[x]);
             dst_row[x] =
@@ -637,6 +644,15 @@ void spectrum_render_frame(Spectrum *spec)
                 ((color & 0x00FF0000u) >> 16);
         }
     }
+}
+
+int spectrum_framebuffer_width(const Spectrum *spec)
+{
+    if (spec == NULL || !spec->machine_ready)
+    {
+        return ZX_SCREEN_WIDTH;
+    }
+    return zx_display_width(&spec->machine);
 }
 
 /* Delivers a host key press to the embedded chips keyboard handler when the
@@ -739,20 +755,64 @@ bool spectrum_load_screen_scr_data(
     char *error_buffer,
     size_t error_buffer_size)
 {
+    uint8_t *display_bank;
+    const uint8_t *palette = NULL;
+    uint8_t video_mode = 0;
     if (spec == NULL || !spec->machine_ready || data == NULL)
     {
         snprintf(error_buffer, error_buffer_size, "No running machine or SCR data is available.");
         return false;
     }
-    if (data_size != SCR_SCREEN_SIZE || spec->machine.display_ram_bank >= 8)
+    if (spec->machine.display_ram_bank >= 8)
     {
-        snprintf(error_buffer, error_buffer_size, "SCR images must be exactly 6912 bytes.");
+        snprintf(error_buffer, error_buffer_size, "The current display RAM bank is invalid.");
         return false;
     }
-    memcpy(
-        spec->machine.ram[spec->machine.display_ram_bank],
-        data,
-        SCR_SCREEN_SIZE);
+    display_bank = spec->machine.ram[spec->machine.display_ram_bank];
+    switch (data_size)
+    {
+        case SCR_SCREEN_SIZE:
+            memcpy(display_bank, data, SCR_SCREEN_SIZE);
+            break;
+        case SCR_ULAPLUS_SIZE:
+            memcpy(display_bank, data, SCR_SCREEN_SIZE);
+            palette = data + SCR_SCREEN_SIZE;
+            break;
+        case SCR_TIMEX_SIZE:
+            memcpy(display_bank, data, SCR_BITMAP_SIZE);
+            memcpy(display_bank + 0x2000, data + SCR_BITMAP_SIZE, SCR_BITMAP_SIZE);
+            video_mode = 2;
+            break;
+        case SCR_TIMEX_ULAPLUS_SIZE:
+            memcpy(display_bank, data, SCR_BITMAP_SIZE);
+            memcpy(display_bank + 0x2000, data + SCR_BITMAP_SIZE, SCR_BITMAP_SIZE);
+            palette = data + SCR_TIMEX_SIZE;
+            video_mode = 2;
+            break;
+        case SCR_HIRES_SIZE:
+            memcpy(display_bank, data, SCR_BITMAP_SIZE);
+            memcpy(display_bank + 0x2000, data + SCR_BITMAP_SIZE, SCR_BITMAP_SIZE);
+            video_mode = (uint8_t)((data[SCR_TIMEX_SIZE] & 0xF8u) | 6u);
+            break;
+        case SCR_HIRES_ULAPLUS_SIZE:
+            memcpy(display_bank, data, SCR_BITMAP_SIZE);
+            memcpy(display_bank + 0x2000, data + SCR_BITMAP_SIZE, SCR_BITMAP_SIZE);
+            video_mode = (uint8_t)((data[SCR_TIMEX_SIZE] & 0xF8u) | 6u);
+            palette = data + SCR_HIRES_SIZE;
+            break;
+        default:
+            snprintf(error_buffer, error_buffer_size,
+                "SCR images must be 6912, 6976, 12288, 12289, 12352, or 12353 bytes.");
+            return false;
+    }
+    spec->machine.timex_video_mode = video_mode;
+    spec->machine.ulaplus_enabled = palette != NULL;
+    spec->machine.ulaplus_mode = palette != NULL ? 1 : 0;
+    if (palette != NULL)
+    {
+        memcpy(spec->machine.ulaplus_palette, palette, ZX_ULAPLUS_PALETTE_SIZE);
+    }
+    _zx_ulaplus_begin_scanline(&spec->machine);
     spectrum_render_frame(spec);
     return true;
 }
@@ -763,17 +823,42 @@ bool spectrum_save_screen_scr_file(
     char *error_buffer,
     size_t error_buffer_size)
 {
-    FileWriteChunk chunk;
+    FileWriteChunk chunks[4];
+    size_t chunk_count = 0;
+    uint8_t video_mode;
+    uint8_t timex_ff;
+    const uint8_t *display_bank;
     if (spec == NULL || !spec->machine_ready || path == NULL || path[0] == '\0' ||
         spec->machine.display_ram_bank >= 8)
     {
         snprintf(error_buffer, error_buffer_size, "No visible Spectrum screen is available to save.");
         return false;
     }
-    chunk.data = spec->machine.ram[spec->machine.display_ram_bank];
-    chunk.size = SCR_SCREEN_SIZE;
+    display_bank = spec->machine.ram[spec->machine.display_ram_bank];
+    video_mode = spec->machine.timex_video_mode & 7u;
+    if (video_mode == 2 || video_mode == 6)
+    {
+        chunks[chunk_count++] = (FileWriteChunk){display_bank, SCR_BITMAP_SIZE};
+        chunks[chunk_count++] = (FileWriteChunk){display_bank + 0x2000, SCR_BITMAP_SIZE};
+        if (video_mode == 6)
+        {
+            timex_ff = spec->machine.timex_video_mode;
+            chunks[chunk_count++] = (FileWriteChunk){&timex_ff, 1};
+        }
+    }
+    else
+    {
+        const size_t screen_base = video_mode == 1 ? 0x2000u : 0u;
+        chunks[chunk_count++] = (FileWriteChunk){display_bank + screen_base, SCR_SCREEN_SIZE};
+    }
+    if (spec->machine.ulaplus_enabled)
+    {
+        chunks[chunk_count++] = (FileWriteChunk){
+            spec->machine.ulaplus_palette,
+            ZX_ULAPLUS_PALETTE_SIZE};
+    }
     return file_write_atomic(
-        path, &chunk, 1, "SCR file", error_buffer, error_buffer_size);
+        path, chunks, chunk_count, "SCR file", error_buffer, error_buffer_size);
 }
 
 static void spectrum_store_sna_registers(
@@ -1341,6 +1426,7 @@ typedef struct SpectrumSzxState {
     uint8_t ay[SZX_AY_SIZE];
     uint8_t ulaplus_palette[ZX_ULAPLUS_PALETTE_SIZE];
     uint8_t ulaplus_register;
+    uint8_t timex_video_mode;
     uint8_t specdrum_value;
     uint8_t covox_value;
     uint8_t multiface_flags;
@@ -1473,6 +1559,7 @@ static bool spectrum_parse_szx(
                 state->ulaplus_palette,
                 payload + 2,
                 sizeof(state->ulaplus_palette));
+            state->timex_video_mode = payload[66];
             state->has_ulaplus = true;
         }
         else if (memcmp(header, "DRUM", 4) == 0)
@@ -1739,6 +1826,7 @@ bool spectrum_load_snapshot_szx_data(
         spec->machine.ulaplus_register = state.ulaplus_register;
         spec->machine.ulaplus_enabled = state.ulaplus_enabled;
         spec->machine.ulaplus_mode = state.ulaplus_enabled ? 1 : 0;
+        spec->machine.timex_video_mode = state.timex_video_mode;
         memcpy(
             spec->machine.ulaplus_palette,
             state.ulaplus_palette,
