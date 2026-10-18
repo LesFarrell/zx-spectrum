@@ -1438,7 +1438,7 @@ static void app_debug_resume(AppState *app) {
 /* Executes exactly one instruction from the current paused machine state and
    then refreshes both the display and debugger snapshot text. */
 static void app_debug_step_instruction(AppState *app) {
-    uint32_t step_us;
+    uint32_t frame_tstates;
 
     if (!app->spec.machine_ready) {
         return;
@@ -1456,8 +1456,8 @@ static void app_debug_step_instruction(AppState *app) {
     app->spec.machine.debug.callback.func = app_debug_callback;
     app->spec.machine.debug.callback.user_data = app;
     app->spec.machine.debug.stopped = &app->debug.stop_requested;
-    step_us = (uint32_t)(app_model_frame_duration_ms(app->spec.model) * 1000.0 + 0.5);
-    zx_exec(&app->spec.machine, step_us);
+    frame_tstates = app_machine_frame_tstates(&app->spec);
+    zx_exec_ticks(&app->spec.machine, frame_tstates);
     app->spec.machine.debug.callback.func = NULL;
     app->spec.machine.debug.callback.user_data = NULL;
     app->spec.machine.debug.stopped = NULL;
@@ -1598,9 +1598,7 @@ static void app_debug_run_frame(AppState *app, bool render_frame) {
         app->spec.machine.debug.callback.user_data = app;
         app->spec.machine.debug.stopped = &app->debug.stop_requested;
     }
-    frame_tstates = app->spec.model == SPECTRUM_MODEL_48K
-        ? 312u * 224u
-        : 311u * 228u;
+    frame_tstates = app_machine_frame_tstates(&app->spec);
     zx_exec_ticks(&app->spec.machine, frame_tstates);
     if (debugger_active &&
         (app->debug.breakpoint_count > 0 ||
@@ -1703,9 +1701,7 @@ static void app_debug_pause(AppState *app) {
     app->spec.machine.debug.callback.func = app_debug_callback;
     app->spec.machine.debug.callback.user_data = app;
     app->spec.machine.debug.stopped = &app->debug.stop_requested;
-    frame_tstates = app->spec.model == SPECTRUM_MODEL_48K
-        ? 312u * 224u
-        : 311u * 228u;
+    frame_tstates = app_machine_frame_tstates(&app->spec);
     zx_exec_ticks(&app->spec.machine, frame_tstates);
     app->spec.machine.debug.callback.func = NULL;
     app->spec.machine.debug.callback.user_data = NULL;

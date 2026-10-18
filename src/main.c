@@ -542,7 +542,8 @@ static bool app_load_model_roms(
     size_t error_buffer_size
 );
 static bool app_parse_number(const char *text, int *value);
-static double app_model_frame_duration_ms(SpectrumModel model);
+static uint32_t app_machine_frame_tstates(const Spectrum *spec);
+static double app_machine_frame_duration_ms(const Spectrum *spec);
 static void app_tick_emulator(AppState *app);
 static bool app_load_tape_file(
     HWND hwnd,
@@ -3504,13 +3505,16 @@ static void app_handle_key_up(AppState *app, WPARAM wparam) {
     app->active_key_codes[vk] = 0;
 }
 
-/* Returns the real PAL frame duration for the selected Spectrum model so the
-   frontend can step 48K and 128K machines at their native rates. */
-static double app_model_frame_duration_ms(SpectrumModel model) {
-    if (model != SPECTRUM_MODEL_48K) {
-        return (311.0 * 228.0 * 1000.0) / 3546894.0;
-    }
-    return (312.0 * 224.0 * 1000.0) / 3500000.0;
+/* Derives frame timing from the active core configuration so CPU execution
+   and host pacing cannot disagree about a model's clock or video geometry. */
+static uint32_t app_machine_frame_tstates(const Spectrum *spec) {
+    return (uint32_t)spec->machine.frame_scan_lines *
+        (uint32_t)spec->machine.scanline_period;
+}
+
+static double app_machine_frame_duration_ms(const Spectrum *spec) {
+    return ((double)app_machine_frame_tstates(spec) * 1000.0) /
+        (double)spec->machine.freq_hz;
 }
 
 /* Runs one timing slice of the emulator and audio service. This is shared by
@@ -3533,7 +3537,7 @@ static void app_tick_emulator(AppState *app) {
     QueryPerformanceCounter(&now);
     elapsed_ms = (double)(now.QuadPart - app->last_tick.QuadPart) * 1000.0 / (double)app->perf_freq.QuadPart;
     app->last_tick = now;
-    frame_ms = app_model_frame_duration_ms(app->spec.model);
+    frame_ms = app_machine_frame_duration_ms(&app->spec);
 
     warp_requested = app->fast_tape_loading_enabled && !app->debug.paused &&
         (app->tape_autoplay_pending || app->tape.playing);
@@ -5691,7 +5695,7 @@ static void app_show_error(const char *message) {
 }
 
 /* Initializes the frontend, resolves ROM files, creates the window, and then
-   drives the emulator in a simple 50 Hz event-and-render loop. */
+   drives the emulator at the active model's native PAL frame rate. */
 int main(int argc, char **argv) {
     RomSelection selection;
     const char *startup_media_path = NULL;

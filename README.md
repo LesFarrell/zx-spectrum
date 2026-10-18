@@ -16,6 +16,8 @@ Small ZX Spectrum emulator in C for Windows. It uses the Win32 API for display, 
 - ULA screen rendering with border and flash attributes
 - Standard ULAplus 64-colour palette mode on ports `0xBF3B`/`0xFF3B`,
   including scanline palette changes and colour-register readback
+- Native CPU and frame timing: 3.5 MHz with 69,888 T-states per 48K frame,
+  and 3.546894 MHz with 70,908 T-states per 128K-family frame
 - Memory-side ULA contention timing for 48K and 128K RAM accesses
 - Keyboard matrix input
 - Selectable Kempston, Sinclair 1, Sinclair 2, and Cursor/Protek/AGF joystick
