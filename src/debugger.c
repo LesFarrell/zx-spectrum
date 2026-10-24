@@ -1114,6 +1114,11 @@ static bool app_debug_is_step_over_candidate(const Spectrum *spec, uint16_t addr
         case 0xF4:
         case 0xFC:
             return true;
+        case 0xCF:
+        case 0xEF:
+            /* RST 08h (error) and RST 28h (calculator) consume inline bytes
+               and never return to pc+1, so single-step them instead. */
+            return false;
         default:
             return (op & 0xC7u) == 0xC7u;
     }
@@ -1942,6 +1947,13 @@ static LRESULT CALLBACK app_debugger_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
                 return 0;
             }
             break;
+        case WM_COMMAND:
+            if (app != NULL &&
+                app->debug.debugger_panel != NULL &&
+                SendMessageA(app->debug.debugger_panel, WM_COMMAND, wparam, lparam)) {
+                return 0;
+            }
+            break;
         case WM_CLOSE:
             DestroyWindow(hwnd);
             return 0;
@@ -2302,6 +2314,15 @@ static INT_PTR CALLBACK app_debugger_dlgproc(HWND hwnd, UINT msg, WPARAM wparam,
             return TRUE;
         case WM_DESTROY:
             if (app != NULL) {
+                /* Children are destroyed after this; give them back their own procs first. */
+                if (app->debug.debugger_address_edit != NULL && app->debug.debugger_address_edit_wndproc != NULL) {
+                    SetWindowLongPtrA(app->debug.debugger_address_edit, GWLP_WNDPROC,
+                        (LONG_PTR)app->debug.debugger_address_edit_wndproc);
+                }
+                if (app->debug.debugger_points_list != NULL && app->debug.debugger_points_list_wndproc != NULL) {
+                    SetWindowLongPtrA(app->debug.debugger_points_list, GWLP_WNDPROC,
+                        (LONG_PTR)app->debug.debugger_points_list_wndproc);
+                }
                 if (app->debug.debugger_background_brush != NULL) {
                     DeleteObject(app->debug.debugger_background_brush);
                     app->debug.debugger_background_brush = NULL;

@@ -56,6 +56,12 @@ static DskTrack *dsk_find_track(DskImage *image, uint8_t c, uint8_t h) {
     return NULL;
 }
 
+/*
+    c and h select the physical track under the head.  The controller has
+    already matched the command's full C/H/R/N against the ID fields on that
+    track, so only R and N are needed to pick the sector here; the ID C/H of
+    protected sectors may legitimately differ from the physical position.
+*/
 static DskSector *dsk_find_sector(
     DskImage *image,
     uint8_t c,
@@ -69,8 +75,7 @@ static DskSector *dsk_find_sector(
     }
     for (uint8_t index = 0; index < track->sector_count; ++index) {
         DskSector *sector = &track->sectors[index];
-        if (sector->c == c && sector->h == h && sector->r == r &&
-            (sector->n == n || n == 0xFF)) {
+        if (sector->r == r && (sector->n == n || n == 0xFF)) {
             return sector;
         }
     }
@@ -174,9 +179,10 @@ static bool dsk_parse_owned_data(
                 image->data + file_offset + 0x18 + ((size_t)sector_index * 8u);
             DskSector *sector = &track->sectors[sector_index];
             const uint32_t nominal_size = dsk_size_from_code(descriptor[3]);
+            /* Standard DSK stores every sector at the Track-Info size. */
             uint32_t stored_size = image->extended
                 ? dsk_read_u16(descriptor + 6)
-                : nominal_size;
+                : dsk_size_from_code(image->data[file_offset + 0x14]);
 
             if (!image->extended && stored_size == 0) {
                 stored_size = nominal_size;
@@ -198,6 +204,7 @@ static bool dsk_parse_owned_data(
             sector->n = descriptor[3];
             sector->st1 = descriptor[4];
             sector->st2 = descriptor[5];
+            sector->descriptor = image->data + file_offset + 0x18 + ((size_t)sector_index * 8u);
             sector->stored_size = stored_size;
             sector->size =
                 stored_size != 0 && nominal_size != 0 && stored_size > nominal_size &&
@@ -392,6 +399,13 @@ bool dsk_write_sector(
 {
     DskImage *image = (DskImage *)user_data;
     DskSector *sector;
+    const bool deleted = (drive & DSK_WRITE_DELETED) != 0;
+
+    drive &= (uint8_t)~DSK_WRITE_DELETED;
+    if (buffer == NULL && data_size == 0) {
+        /* Write-protect query used by the controller. */
+        return dsk_drive_ready(image, drive) && !image->source_read_only;
+    }
     if (!dsk_drive_ready(image, drive) || buffer == NULL || image->source_read_only) {
         return false;
     }
@@ -403,8 +417,11 @@ bool dsk_write_sector(
     for (uint32_t offset = 0; offset + data_size <= sector->stored_size; offset += data_size) {
         memcpy(sector->data + offset, buffer, data_size);
     }
+    /* Persist the fresh status so a saved image does not keep old marks. */
     sector->st1 = 0;
-    sector->st2 = 0;
+    sector->st2 = deleted ? 0x40 : 0;
+    sector->descriptor[4] = sector->st1;
+    sector->descriptor[5] = sector->st2;
     image->dirty = true;
     return true;
 }

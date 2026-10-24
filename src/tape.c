@@ -280,9 +280,9 @@ static bool tape_has_full_ram_banks(const TapePlayer *player) {
     for (size_t i = 0; i < player->block_count; ++i) {
         const TapeBlock *block = &player->blocks[i];
         const TapeBlock *previous = i > 0 ? &player->blocks[i - 1] : NULL;
-        if (block->bytes != NULL &&
+        if (block->length == 16386u &&
+            block->bytes != NULL &&
             block->bytes[0] == 0xFF &&
-            block->length == 16386u &&
             (previous == NULL ||
              previous->length == 0 ||
              previous->bytes[0] != 0x00)) {
@@ -367,12 +367,17 @@ static bool tape_append_fast_block(
         return false;
     }
     block = &player->blocks[player->block_count++];
-    block->bytes = (uint8_t *)malloc(length);
-    if (block->bytes == NULL) {
-        player->block_count--;
-        return false;
+    /* Zero-length blocks keep a NULL buffer; malloc(0) may legitimately
+       return NULL and must not be mistaken for running out of memory. */
+    block->bytes = NULL;
+    if (length > 0) {
+        block->bytes = (uint8_t *)malloc(length);
+        if (block->bytes == NULL) {
+            player->block_count--;
+            return false;
+        }
+        memcpy(block->bytes, data, length);
     }
-    memcpy(block->bytes, data, length);
     block->length = length;
     block->resume_segment_index = resume_segment_index;
     return true;
@@ -510,7 +515,9 @@ static bool tape_append_level(TapePlayer *player, uint32_t duration_ticks, bool 
     if (duration_ticks == 0) {
         return true;
     }
-    if (player->segment_count > 0) {
+    /* Never extend a segment that precedes a recorded fast-load resume point,
+       or resuming there would skip the merged waveform. */
+    if (player->segment_count > player->merge_floor) {
         segment = &player->segments[player->segment_count - 1];
         if (segment->level_high == level_high && segment->stop_after == TAPE_STOP_NONE) {
             if (segment->duration_ticks > UINT32_MAX - duration_ticks) {
@@ -554,11 +561,17 @@ static bool tape_mark_stop(TapePlayer *player, TapeStopMode stop_mode) {
 
 static bool tape_append_pulse(TapeBuilder *builder, uint32_t duration_ticks) {
     uint32_t machine_ticks;
-    if (!tape_consume_work(builder, 1) ||
-        !tape_tstates_to_ticks(builder->player->tick_hz, duration_ticks, &machine_ticks)) {
+    if (!tape_consume_work(builder, 1)) {
         return false;
     }
     builder->current_level = !builder->current_level;
+    /* A zero-length TZX pulse only flips the signal polarity. */
+    if (duration_ticks == 0) {
+        return true;
+    }
+    if (!tape_tstates_to_ticks(builder->player->tick_hz, duration_ticks, &machine_ticks)) {
+        return false;
+    }
     return tape_append_level(builder->player, machine_ticks, builder->current_level);
 }
 
@@ -776,6 +789,7 @@ static bool tape_append_standard_block(
     }
     if (resume_segment_index_out != NULL) {
         *resume_segment_index_out = builder->player->segment_count;
+        builder->player->merge_floor = builder->player->segment_count;
     }
     if (pause_ms > 0) {
         return tape_append_pause(builder, pause_ms);
@@ -1050,6 +1064,7 @@ static bool tape_parse_pzx(
             }
             if (!tape_append_pzx_pulse(&builder, tail)) goto decode_limit;
             resume_segment_index = player->segment_count;
+            player->merge_floor = resume_segment_index;
             /* ROM fast loading is safe only for the canonical Spectrum pulse
                pairs. Non-standard DATA blocks still play through the waveform. */
             if ((bit_count & 7u) == 0 && byte_count > 0 &&
@@ -1210,11 +1225,22 @@ static bool tape_tzx_next_block_offset(
             if (!tape_has_bytes(offset, 20, size)) return false;
             body_length = 20u + tape_read_u32(&data[offset + 16u]);
             break;
+        case 0x34:
+            body_length = 8;
+            break;
+        case 0x40:
+            if (!tape_has_bytes(offset, 4, size)) return false;
+            body_length = 4u + tape_read_u24(&data[offset + 1u]);
+            break;
         case 0x5A:
             body_length = 9;
             break;
         default:
-            return false;
+            /* TZX 1.10+ gives deprecated (0x16, 0x17) and unknown blocks a
+               leading DWORD length so readers can skip them. */
+            if (!tape_has_bytes(offset, 4, size)) return false;
+            body_length = 4u + (size_t)tape_read_u32(&data[offset]);
+            break;
     }
 
     if (!tape_has_bytes(offset, body_length, size)) {
@@ -1777,18 +1803,10 @@ static bool tape_parse_tzx(
                 break;
             }
 
-            case 0x30:
-            case 0x31:
-            case 0x32:
-            case 0x33:
-            case 0x35:
-            case 0x5A:
+            /* Informational, deprecated, and unknown blocks carry no waveform;
+               the directory pass has already validated their extents. */
+            default:
                 break;
-
-            default: {
-                failure_message = "Unsupported TZX block";
-                goto finished;
-            }
         }
         block_index = next_block_index;
     }
@@ -1965,13 +1983,19 @@ bool tape_load_data_with_options(
         return false;
     }
 
+    if (player->segment_count == 0) {
+        tape_set_error(error_buffer, error_buffer_size, "Tape contains no playable data", name);
+        tape_discard(player);
+        return false;
+    }
+
     player->autoload_target = tape_detect_autoload_target(player);
-    player->inserted = player->segment_count > 0;
+    player->inserted = true;
     player->playing = false;
     player->next_block_index = 0;
     player->play_index = 0;
     player->segment_end_tick = 0;
-    return player->inserted;
+    return true;
 }
 
 void tape_rewind(TapePlayer *player, uint32_t tick_hz) {
@@ -2019,6 +2043,7 @@ void tape_start(TapePlayer *player, uint64_t tick_count) {
     }
     if (player->play_index >= player->segment_count) {
         player->play_index = 0;
+        player->next_block_index = 0;
     }
     player->playing = true;
     player->segment_end_tick = tick_count + player->segments[player->play_index].duration_ticks;
@@ -2077,7 +2102,17 @@ bool tape_try_fast_load(TapePlayer *player, void *machine_ptr) {
     uint16_t bytes_processed = 0;
     zx_t *machine = (zx_t *)machine_ptr;
 
-    if (player == NULL || machine == NULL || player->next_block_index >= player->block_count) {
+    if (player == NULL || machine == NULL) {
+        return false;
+    }
+    /* Blocks whose waveform has already played in real time (for example a
+       headerless block the trap declined) must not be injected again or
+       rewind playback; resume at the first block still ahead of the tape. */
+    while (player->next_block_index < player->block_count &&
+           player->blocks[player->next_block_index].resume_segment_index <= player->play_index) {
+        player->next_block_index++;
+    }
+    if (player->next_block_index >= player->block_count) {
         return false;
     }
 

@@ -15,6 +15,7 @@ typedef struct DskSector {
     uint32_t size;
     uint32_t stored_size;
     uint8_t *data;
+    uint8_t *descriptor;
 } DskSector;
 
 typedef struct DskTrack {
@@ -77,6 +78,14 @@ bool dsk_read_sector(
     uint8_t *st1,
     uint8_t *st2
 );
+
+/*
+    c and h select the physical track; r and n select the sector on it.
+    OR DSK_WRITE_DELETED into drive to write a deleted data address mark.
+    A NULL buffer with data_size 0 only reports whether the drive is
+    writable (false when write-protected or not ready).
+*/
+enum { DSK_WRITE_DELETED = 0x80 };
 
 bool dsk_write_sector(
     void *user_data,

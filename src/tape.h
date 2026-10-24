@@ -53,6 +53,8 @@ typedef struct TapePlayer {
     TapeBlock *blocks;
     size_t block_count;
     size_t block_capacity;
+    /* Decode-time only: segments below this index are never merged into. */
+    size_t merge_floor;
     size_t next_block_index;
     size_t play_index;
     uint64_t segment_end_tick;

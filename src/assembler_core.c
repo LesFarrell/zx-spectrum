@@ -22,6 +22,19 @@ static char *app_trim_inplace(char *text)
     return start;
 }
 
+/* Returns true when the apostrophe at cursor belongs to the AF' register name
+   rather than opening a quoted literal. */
+static bool app_is_af_shadow_apostrophe(const char *text, const char *cursor)
+{
+    if (cursor - text < 2 ||
+        toupper((unsigned char)cursor[-2]) != 'A' ||
+        toupper((unsigned char)cursor[-1]) != 'F')
+    {
+        return false;
+    }
+    return cursor - text == 2 || !(isalnum((unsigned char)cursor[-3]) || cursor[-3] == '_');
+}
+
 /* Removes assembler comments introduced by ';' from a source line unless the
    marker appears inside a single- or double-quoted string literal. */
 static void app_strip_comment(char *text)
@@ -33,6 +46,10 @@ static void app_strip_comment(char *text)
     {
         if (*cursor == '\'' && !in_double)
         {
+            if (!in_single && app_is_af_shadow_apostrophe(text, cursor))
+            {
+                continue;
+            }
             in_single = !in_single;
         }
         else if (*cursor == '"' && !in_single)
@@ -794,6 +811,16 @@ static bool app_parse_value(
         }
         while (*cursor != '\0' && *cursor != '+' && *cursor != '-' && *cursor != '*' && *cursor != '&')
         {
+            /* Operator characters inside quoted literals such as '-' are data. */
+            if (*cursor == '\'' || *cursor == '"')
+            {
+                const char *close = strchr(cursor + 1, *cursor);
+                if (close != NULL)
+                {
+                    cursor = close + 1;
+                    continue;
+                }
+            }
             cursor++;
         }
         atom_length = (size_t)(cursor - start);
@@ -1210,7 +1237,18 @@ static bool app_assemble_write_bytes(
     }
     if (ctx->pass == 2 && ctx->write_to_machine)
     {
-        mem_write_range(&ctx->app->spec.machine.mem, ctx->address, bytes, (uint32_t)length);
+        if (ctx->app->machine_kind == APP_MACHINE_NEXT)
+        {
+            /* Write through the Next's current MMU mapping, as the CPU would. */
+            for (size_t i = 0; i < length; ++i)
+            {
+                next_machine_write_memory(&ctx->app->next, (uint16_t)(ctx->address + i), bytes[i]);
+            }
+        }
+        else
+        {
+            mem_write_range(&ctx->app->spec.machine.mem, ctx->address, bytes, (uint32_t)length);
+        }
     }
     next_address = (size_t)ctx->address + length;
     if (next_address == 0x10000u)
@@ -1297,6 +1335,249 @@ static bool app_assemble_db_item(
 }
 
 /* Encodes one assembler line from the mini-assembler supported by the UI. */
+/* True when an operand names a Z80 register, so Z80N forms that take an
+   immediate (ADD rr,nn and PUSH nn) never swallow a register by mistake. */
+static bool app_is_register_name(const char *text)
+{
+    static const char *names[] = {
+        "A", "B", "C", "D", "E", "H", "L", "I", "R", "F",
+        "AF", "AF'", "BC", "DE", "HL", "SP", "IX", "IY",
+        "IXH", "IXL", "IYH", "IYL", "HX", "LX", "HY", "LY",
+        "XH", "XL", "YH", "YL"};
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i)
+    {
+        if (app_equals_ignore_case(text, names[i]))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Parses an 8-bit operand for a Z80N instruction. */
+static bool app_parse_z80n_byte(
+    AssemblerContext *ctx,
+    const char *mnemonic,
+    const char *text,
+    uint8_t *out,
+    char *error_buffer,
+    size_t error_buffer_size)
+{
+    AssemblerValue value;
+    if (app_is_register_name(text) || !app_parse_value(ctx, text, &value))
+    {
+        snprintf(error_buffer, error_buffer_size, "Invalid %s operand: %s", mnemonic, text);
+        return false;
+    }
+    if (ctx->pass == 2 && (value.value < -128 || value.value > 255))
+    {
+        snprintf(error_buffer, error_buffer_size, "%s operand is out of range: %s", mnemonic, text);
+        return false;
+    }
+    *out = (uint8_t)value.value;
+    return true;
+}
+
+/* Assembles the ZX Spectrum Next (Z80N) extended instructions. These are
+   all ED-prefixed opcodes that do nothing useful on other Spectrum models.
+   Forms shared with standard mnemonics (ADD, PUSH, JP) are only claimed when
+   their operands match a Z80N encoding; everything else is left to the
+   standard Z80 assembler and *handled stays false. */
+static bool app_assemble_z80n(
+    AssemblerContext *ctx,
+    const char *mnemonic,
+    const char *lhs,
+    const char *rhs,
+    int operand_count,
+    uint8_t *bytes,
+    size_t *length,
+    bool *handled,
+    char *error_buffer,
+    size_t error_buffer_size)
+{
+    /* Mnemonic, ED opcode, and the operand spellings it accepts. Implied
+       operands may also be omitted, as most Next assemblers allow. */
+    static const struct
+    {
+        const char *mnemonic;
+        uint8_t opcode;
+        const char *lhs;
+        const char *rhs;
+    } implied[] = {
+        {"SWAPNIB", 0x23, "A", NULL},
+        {"MIRROR", 0x24, "A", NULL},
+        {"BSLA", 0x28, "DE", "B"},
+        {"BSRA", 0x29, "DE", "B"},
+        {"BSRL", 0x2A, "DE", "B"},
+        {"BSRF", 0x2B, "DE", "B"},
+        {"BRLC", 0x2C, "DE", "B"},
+        {"MUL", 0x30, "D", "E"},
+        {"OUTINB", 0x90, NULL, NULL},
+        {"PIXELDN", 0x93, NULL, NULL},
+        {"PIXELAD", 0x94, NULL, NULL},
+        {"SETAE", 0x95, NULL, NULL},
+        {"LDIX", 0xA4, NULL, NULL},
+        {"LDWS", 0xA5, NULL, NULL},
+        {"LDDX", 0xAC, NULL, NULL},
+        {"LDIRX", 0xB4, NULL, NULL},
+        {"LDPIRX", 0xB7, NULL, NULL},
+        {"LDDRX", 0xBC, NULL, NULL}};
+    AssemblerValue value;
+
+    *handled = false;
+    for (size_t i = 0; i < sizeof(implied) / sizeof(implied[0]); ++i)
+    {
+        if (!app_equals_ignore_case(mnemonic, implied[i].mnemonic))
+        {
+            continue;
+        }
+        *handled = true;
+        if (operand_count != 0 &&
+            !(implied[i].lhs != NULL && app_equals_ignore_case(lhs, implied[i].lhs) &&
+              ((implied[i].rhs == NULL && operand_count == 1) ||
+               (implied[i].rhs != NULL && operand_count == 2 &&
+                app_equals_ignore_case(rhs, implied[i].rhs)))))
+        {
+            if (implied[i].lhs == NULL)
+            {
+                snprintf(error_buffer, error_buffer_size, "%s takes no operands.", implied[i].mnemonic);
+            }
+            else if (implied[i].rhs == NULL)
+            {
+                snprintf(error_buffer, error_buffer_size, "Unsupported %s form; use %s %s.",
+                         implied[i].mnemonic, implied[i].mnemonic, implied[i].lhs);
+            }
+            else
+            {
+                snprintf(error_buffer, error_buffer_size, "Unsupported %s form; use %s %s,%s.",
+                         implied[i].mnemonic, implied[i].mnemonic, implied[i].lhs, implied[i].rhs);
+            }
+            return false;
+        }
+        bytes[(*length)++] = 0xED;
+        bytes[(*length)++] = implied[i].opcode;
+        return true;
+    }
+
+    if (app_equals_ignore_case(mnemonic, "TEST"))
+    {
+        uint8_t operand;
+        *handled = true;
+        if (!app_require_operand_count("TEST", operand_count, 1, 1, error_buffer, error_buffer_size) ||
+            !app_parse_z80n_byte(ctx, "TEST", lhs, &operand, error_buffer, error_buffer_size))
+        {
+            return false;
+        }
+        bytes[(*length)++] = 0xED;
+        bytes[(*length)++] = 0x27;
+        bytes[(*length)++] = operand;
+        return true;
+    }
+
+    if (app_equals_ignore_case(mnemonic, "NEXTREG"))
+    {
+        uint8_t reg;
+        *handled = true;
+        if (!app_require_operand_count("NEXTREG", operand_count, 2, 2, error_buffer, error_buffer_size) ||
+            !app_parse_z80n_byte(ctx, "NEXTREG", lhs, &reg, error_buffer, error_buffer_size))
+        {
+            return false;
+        }
+        bytes[(*length)++] = 0xED;
+        if (app_equals_ignore_case(rhs, "A"))
+        {
+            bytes[(*length)++] = 0x92;
+            bytes[(*length)++] = reg;
+        }
+        else
+        {
+            uint8_t data;
+            if (!app_parse_z80n_byte(ctx, "NEXTREG", rhs, &data, error_buffer, error_buffer_size))
+            {
+                return false;
+            }
+            bytes[(*length)++] = 0x91;
+            bytes[(*length)++] = reg;
+            bytes[(*length)++] = data;
+        }
+        return true;
+    }
+
+    if (app_equals_ignore_case(mnemonic, "JP") && operand_count == 1 &&
+        app_equals_ignore_case(lhs, "(C)"))
+    {
+        *handled = true;
+        bytes[(*length)++] = 0xED;
+        bytes[(*length)++] = 0x98;
+        return true;
+    }
+
+    if (app_equals_ignore_case(mnemonic, "ADD") && operand_count == 2)
+    {
+        static const char *pairs[] = {"HL", "DE", "BC"};
+        for (unsigned pair = 0; pair < 3; ++pair)
+        {
+            if (!app_equals_ignore_case(lhs, pairs[pair]))
+            {
+                continue;
+            }
+            if (app_equals_ignore_case(rhs, "A"))
+            {
+                /* ADD HL,A / ADD DE,A / ADD BC,A */
+                *handled = true;
+                bytes[(*length)++] = 0xED;
+                bytes[(*length)++] = (uint8_t)(0x31 + pair);
+                return true;
+            }
+            if (!app_is_register_name(rhs) && rhs[0] != '(')
+            {
+                /* ADD HL,nn / ADD DE,nn / ADD BC,nn (little-endian) */
+                *handled = true;
+                if (!app_parse_value(ctx, rhs, &value))
+                {
+                    snprintf(error_buffer, error_buffer_size, "Invalid ADD operand: %s", rhs);
+                    return false;
+                }
+                if (ctx->pass == 2 && (value.value < -32768 || value.value > 0xFFFF))
+                {
+                    snprintf(error_buffer, error_buffer_size, "ADD operand is out of range: %s", rhs);
+                    return false;
+                }
+                bytes[(*length)++] = 0xED;
+                bytes[(*length)++] = (uint8_t)(0x34 + pair);
+                bytes[(*length)++] = (uint8_t)value.value;
+                bytes[(*length)++] = (uint8_t)(value.value >> 8);
+                return true;
+            }
+        }
+        return true;
+    }
+
+    if (app_equals_ignore_case(mnemonic, "PUSH") && operand_count == 1 &&
+        !app_is_register_name(lhs))
+    {
+        /* PUSH nn stores its operand big-endian, unlike every other Z80
+           immediate word. */
+        *handled = true;
+        if (!app_parse_value(ctx, lhs, &value))
+        {
+            snprintf(error_buffer, error_buffer_size, "Invalid PUSH operand: %s", lhs);
+            return false;
+        }
+        if (ctx->pass == 2 && (value.value < -32768 || value.value > 0xFFFF))
+        {
+            snprintf(error_buffer, error_buffer_size, "PUSH operand is out of range: %s", lhs);
+            return false;
+        }
+        bytes[(*length)++] = 0xED;
+        bytes[(*length)++] = 0x8A;
+        bytes[(*length)++] = (uint8_t)(value.value >> 8);
+        bytes[(*length)++] = (uint8_t)value.value;
+        return true;
+    }
+    return true;
+}
+
 static bool app_assemble_line(
     AssemblerContext *ctx,
     char *line,
@@ -1551,6 +1832,25 @@ static bool app_assemble_line(
         return true;
     }
 
+    {
+        bool handled_z80n = false;
+
+        if (!app_assemble_z80n(ctx, mnemonic, lhs, rhs, operand_count, bytes, &length,
+                               &handled_z80n, error_buffer, error_buffer_size))
+        {
+            return false;
+        }
+        if (handled_z80n)
+        {
+            if (!app_assemble_write_bytes(ctx, bytes, length, error_buffer, error_buffer_size))
+            {
+                return false;
+            }
+            ctx->total_written += length;
+            return true;
+        }
+    }
+
     if (app_equals_ignore_case(mnemonic, "NOP"))
     {
         if (!app_require_operand_count("NOP", operand_count, 0, 0, error_buffer, error_buffer_size))
@@ -1769,9 +2069,7 @@ static bool app_assemble_line(
             snprintf(error_buffer, error_buffer_size, "Invalid DJNZ target: %s", lhs);
             return false;
         }
-        disp = (value.numeric_literal && value.value >= -128 && value.value <= 127)
-                   ? value.value
-                   : (value.value - ((int)ctx->address + 2));
+        disp = value.value - ((int)ctx->address + 2);
         if (ctx->pass == 2 && (disp < -128 || disp > 127))
         {
             snprintf(error_buffer, error_buffer_size, "DJNZ target is out of range.");
@@ -1810,9 +2108,7 @@ static bool app_assemble_line(
                 return false;
             }
         }
-        disp = (value.numeric_literal && value.value >= -128 && value.value <= 127)
-                   ? value.value
-                   : (value.value - ((int)ctx->address + 2));
+        disp = value.value - ((int)ctx->address + 2);
         if (ctx->pass == 2 && (disp < -128 || disp > 127))
         {
             snprintf(error_buffer, error_buffer_size, "JR target is out of range.");
@@ -2293,7 +2589,23 @@ static bool app_assemble_line(
             return false;
         }
 
-        if (rr >= 0 && app_parse_value(ctx, rhs, &value))
+        /* Register sources must be matched before the immediate form, or a
+           register name parses as an unresolved forward reference in pass 1. */
+        if (app_equals_ignore_case(lhs, "SP") && app_equals_ignore_case(rhs, "HL"))
+        {
+            bytes[length++] = 0xF9;
+        }
+        else if (app_equals_ignore_case(lhs, "SP") && app_equals_ignore_case(rhs, "IX"))
+        {
+            bytes[length++] = 0xDD;
+            bytes[length++] = 0xF9;
+        }
+        else if (app_equals_ignore_case(lhs, "SP") && app_equals_ignore_case(rhs, "IY"))
+        {
+            bytes[length++] = 0xFD;
+            bytes[length++] = 0xF9;
+        }
+        else if (rr >= 0 && app_parse_value(ctx, rhs, &value))
         {
             if (ctx->pass == 2 && (value.value < -32768 || value.value > 0xFFFF))
             {
@@ -2327,20 +2639,6 @@ static bool app_assemble_line(
             bytes[length++] = 0x21;
             bytes[length++] = (uint8_t)value.value;
             bytes[length++] = (uint8_t)(value.value >> 8);
-        }
-        else if (app_equals_ignore_case(lhs, "SP") && app_equals_ignore_case(rhs, "HL"))
-        {
-            bytes[length++] = 0xF9;
-        }
-        else if (app_equals_ignore_case(lhs, "SP") && app_equals_ignore_case(rhs, "IX"))
-        {
-            bytes[length++] = 0xDD;
-            bytes[length++] = 0xF9;
-        }
-        else if (app_equals_ignore_case(lhs, "SP") && app_equals_ignore_case(rhs, "IY"))
-        {
-            bytes[length++] = 0xFD;
-            bytes[length++] = 0xF9;
         }
         else if (dst8 >= 0 && dst8 != 6 && source_is_indexed)
         {
@@ -2485,6 +2783,32 @@ static bool app_assemble_line(
             bytes[length++] = (uint8_t)value.value;
             bytes[length++] = (uint8_t)(value.value >> 8);
         }
+        else if (app_parse_indirect_address(ctx, lhs, &value) && app_parse_reg16(rhs) >= 0)
+        {
+            /* LD (nn),BC/DE/SP use the ED-prefixed forms; HL is handled above. */
+            if (ctx->pass == 2 && (value.value < 0 || value.value > 0xFFFF))
+            {
+                snprintf(error_buffer, error_buffer_size, "Unsupported LD form: %s,%s", lhs, rhs);
+                return false;
+            }
+            bytes[length++] = 0xED;
+            bytes[length++] = (uint8_t)(0x43 + (app_parse_reg16(rhs) << 4));
+            bytes[length++] = (uint8_t)value.value;
+            bytes[length++] = (uint8_t)(value.value >> 8);
+        }
+        else if (rr >= 0 && app_parse_indirect_address(ctx, rhs, &value))
+        {
+            /* LD BC/DE/SP,(nn) */
+            if (ctx->pass == 2 && (value.value < 0 || value.value > 0xFFFF))
+            {
+                snprintf(error_buffer, error_buffer_size, "Unsupported LD form: %s,%s", lhs, rhs);
+                return false;
+            }
+            bytes[length++] = 0xED;
+            bytes[length++] = (uint8_t)(0x4B + (rr << 4));
+            bytes[length++] = (uint8_t)value.value;
+            bytes[length++] = (uint8_t)(value.value >> 8);
+        }
         else if (app_equals_ignore_case(lhs, "(BC)") && app_equals_ignore_case(rhs, "A"))
         {
             bytes[length++] = 0x02;
@@ -2500,6 +2824,12 @@ static bool app_assemble_line(
         else if (app_equals_ignore_case(lhs, "A") && app_equals_ignore_case(rhs, "(DE)"))
         {
             bytes[length++] = 0x1A;
+        }
+        else if (dst8 == 6 && src8 == 6)
+        {
+            /* 76h is HALT, not a memory-to-memory load. */
+            snprintf(error_buffer, error_buffer_size, "Unsupported LD form: %s,%s", lhs, rhs);
+            return false;
         }
         else if (dst8 >= 0 && src8 >= 0)
         {
@@ -3076,7 +3406,10 @@ static bool app_assembler_uppercase_source_text(const char *source, char **upper
         }
         else if (ch == '\'' && !in_double)
         {
-            in_single = !in_single;
+            if (in_single || !app_is_af_shadow_apostrophe(source, source + i))
+            {
+                in_single = !in_single;
+            }
             uppercase_text[i] = ch;
         }
         else if (ch == '"' && !in_single)

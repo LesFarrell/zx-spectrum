@@ -54,8 +54,13 @@ static void szx_align_byte(SzxBitReader *reader)
 
 /* Builds the canonical code tables in the reversed-bit ordering used by
    DEFLATE. Incomplete alphabets are valid, as is an empty distance alphabet
-   for an all-literal block; oversubscribed trees are not. */
-static bool szx_build_huffman(SzxHuffman *table, const uint8_t *lengths, size_t count)
+   for an all-literal block; oversubscribed trees are not. The code-length
+   alphabet must be complete, as RFC 1951 decoders such as zlib require. */
+static bool szx_build_huffman(
+    SzxHuffman *table,
+    const uint8_t *lengths,
+    size_t count,
+    bool require_complete)
 {
     uint16_t offsets[SZX_INFLATE_MAX_BITS + 1] = {0};
     int available = 1;
@@ -80,6 +85,10 @@ static bool szx_build_huffman(SzxHuffman *table, const uint8_t *lengths, size_t 
         {
             return false;
         }
+    }
+    if (require_complete && available != 0)
+    {
+        return false;
     }
 
     offsets[1] = 0;
@@ -147,8 +156,8 @@ static bool szx_build_fixed_tables(SzxHuffman *literal_table, SzxHuffman *distan
     for (unsigned index = 256; index <= 279; ++index) literal_lengths[index] = 7;
     for (unsigned index = 280; index <= 287; ++index) literal_lengths[index] = 8;
     memset(distance_lengths, 5, sizeof(distance_lengths));
-    return szx_build_huffman(literal_table, literal_lengths, 288) &&
-        szx_build_huffman(distance_table, distance_lengths, 32);
+    return szx_build_huffman(literal_table, literal_lengths, 288, false) &&
+        szx_build_huffman(distance_table, distance_lengths, 32, false);
 }
 
 static bool szx_build_dynamic_tables(
@@ -176,7 +185,7 @@ static bool szx_build_dynamic_tables(
     {
         code_lengths[order[index]] = (uint8_t)szx_read_bits(reader, 3);
     }
-    if (reader->failed || !szx_build_huffman(&code_table, code_lengths, 19))
+    if (reader->failed || !szx_build_huffman(&code_table, code_lengths, 19, true))
     {
         return false;
     }
@@ -228,8 +237,8 @@ static bool szx_build_dynamic_tables(
     {
         return false;
     }
-    return szx_build_huffman(literal_table, lengths, literal_count) &&
-        szx_build_huffman(distance_table, lengths + literal_count, distance_count);
+    return szx_build_huffman(literal_table, lengths, literal_count, false) &&
+        szx_build_huffman(distance_table, lengths + literal_count, distance_count, false);
 }
 
 static bool szx_expand_codes(
@@ -307,6 +316,7 @@ static bool szx_expand_deflate(
     size_t source_size,
     uint8_t *destination,
     size_t destination_size,
+    bool require_exact_end,
     size_t *actual_size)
 {
     SzxBitReader reader = {source, source_size, 0, 0, 0, false};
@@ -365,7 +375,9 @@ static bool szx_expand_deflate(
             return false;
         }
     }
-    if (reader.position != reader.size)
+    /* zlib streams locate the Adler-32 trailer from the end, so the DEFLATE
+       data must fill the span exactly; ZIP entries may carry padding. */
+    if (require_exact_end && reader.position != reader.size)
     {
         return false;
     }
@@ -427,6 +439,7 @@ bool szx_inflate_raw(
         source_size,
         destination,
         destination_size,
+        false,
         &actual_size) && actual_size == destination_size;
 }
 
@@ -460,6 +473,7 @@ bool szx_inflate_zlib_bounded(
             source_size - 6,
             destination,
             destination_capacity,
+            true,
             &actual_size) ||
         szx_adler32(destination, actual_size) != expected_adler)
     {

@@ -27,6 +27,12 @@ zig cc ^
     main.c ^
     file_util.c ^
     spectrum.c ^
+    next_machine.c ^
+    next_dma.c ^
+    next_copper.c ^
+    next_sprite.c ^
+    next_sd.c ^
+    next_rtc.c ^
     szx_inflate.c ^
     zip.c ^
     disk.c ^

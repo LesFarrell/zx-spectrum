@@ -17,12 +17,20 @@ static const uint32_t *app_crt_apply_effects(AppState *app) {
     if (app == NULL) {
         return NULL;
     }
-    width = spectrum_framebuffer_width(&app->spec);
+    width = app->machine_kind == APP_MACHINE_NEXT
+        ? app->next.framebuffer_width
+        : spectrum_framebuffer_width(&app->spec);
     count = (size_t)width * (size_t)ZX_SCREEN_HEIGHT;
     if (app->crt_framebuffer == NULL || !app->crt_scanlines) {
-        return app->spec.framebuffer;
+        return app->machine_kind == APP_MACHINE_NEXT
+            ? app->next.framebuffer
+            : app->spec.framebuffer;
     }
-    memcpy(app->crt_framebuffer, app->spec.framebuffer, count * sizeof(uint32_t));
+    memcpy(app->crt_framebuffer,
+        app->machine_kind == APP_MACHINE_NEXT
+            ? app->next.framebuffer
+            : app->spec.framebuffer,
+        count * sizeof(uint32_t));
     for (int y = 0; y < ZX_SCREEN_HEIGHT; ++y) {
         for (int x = 0; x < width; ++x) {
             const size_t index = (size_t)y * (size_t)width + (size_t)x;

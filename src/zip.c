@@ -27,12 +27,22 @@ static uint32_t zip_u32(const uint8_t *data) {
 }
 
 static uint32_t zip_crc32(const uint8_t *data, size_t size) {
+    static uint32_t table[256];
+    static bool table_ready = false;
     uint32_t crc = 0xFFFFFFFFu;
-    while (size-- != 0) {
-        crc ^= *data++;
-        for (unsigned bit = 0; bit < 8; ++bit) {
-            crc = (crc >> 1) ^ (0xEDB88320u & (uint32_t)-(int32_t)(crc & 1u));
+
+    if (!table_ready) {
+        for (uint32_t index = 0; index < 256; ++index) {
+            uint32_t value = index;
+            for (unsigned bit = 0; bit < 8; ++bit) {
+                value = (value >> 1) ^ (0xEDB88320u & (uint32_t)-(int32_t)(value & 1u));
+            }
+            table[index] = value;
         }
+        table_ready = true;
+    }
+    while (size-- != 0) {
+        crc = (crc >> 8) ^ table[(crc ^ *data++) & 0xFFu];
     }
     return ~crc;
 }
@@ -292,8 +302,12 @@ bool zip_extract_entry(
             entry->name);
         return false;
     }
-    if (entry->uncompressed_size == 0 || entry->uncompressed_size > ZIP_MAX_EXTRACTED_SIZE) {
-        snprintf(error_buffer, error_buffer_size, "ZIP entry is empty or exceeds the 128 MB safety limit: %s", entry->name);
+    if (entry->uncompressed_size == 0) {
+        snprintf(error_buffer, error_buffer_size, "ZIP entry is empty: %s", entry->name);
+        return false;
+    }
+    if (entry->uncompressed_size > ZIP_MAX_EXTRACTED_SIZE) {
+        snprintf(error_buffer, error_buffer_size, "ZIP entry exceeds the 128 MB safety limit: %s", entry->name);
         return false;
     }
     offset = entry->local_header_offset;
@@ -302,7 +316,9 @@ bool zip_extract_entry(
         snprintf(error_buffer, error_buffer_size, "The ZIP local header is invalid: %s", entry->name);
         return false;
     }
-    if (zip_u16(archive->data + offset + 6) != entry->flags ||
+    /* Only encryption and method affect extraction; sizes and CRC always come
+       from the central directory, which also covers data-descriptor entries. */
+    if (((zip_u16(archive->data + offset + 6) ^ entry->flags) & 1u) != 0 ||
         zip_u16(archive->data + offset + 8) != entry->method) {
         snprintf(error_buffer, error_buffer_size, "ZIP entry headers disagree: %s", entry->name);
         return false;

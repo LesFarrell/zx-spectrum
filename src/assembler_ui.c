@@ -170,7 +170,7 @@ static void app_update_model_menu(HWND hwnd, SpectrumModel model) {
     CheckMenuRadioItem(
         menu,
         APP_MENU_MACHINE_48K,
-        APP_MENU_MACHINE_PLUS2A,
+        APP_MENU_MACHINE_NEXT,
         app_model_menu_id(model),
         MF_BYCOMMAND
     );
@@ -833,7 +833,9 @@ static LRESULT CALLBACK app_assembler_source_wndproc(HWND hwnd, UINT msg, WPARAM
     HWND parent = GetParent(hwnd);
     AppState *app = parent != NULL ? (AppState *)GetWindowLongPtrA(parent, GWLP_USERDATA) : NULL;
     HWND command_target = (app != NULL && app->debug.assembler_hwnd != NULL) ? app->debug.assembler_hwnd : parent;
-    WNDPROC old_proc = (app != NULL) ? app->debug.assembler_source_wndproc : DefWindowProcA;
+    WNDPROC old_proc = (app != NULL && app->debug.assembler_source_wndproc != NULL)
+        ? app->debug.assembler_source_wndproc
+        : DefWindowProcA;
     LRESULT result;
 
     if (app != NULL && msg == WM_CHAR && app->debug.assembler_suppress_next_char) {
@@ -1111,6 +1113,11 @@ static INT_PTR CALLBACK app_assembler_dlgproc(HWND hwnd, UINT msg, WPARAM wparam
         case WM_DESTROY:
             if (app != NULL) {
                 KillTimer(hwnd, APP_TIMER_ASM_FILE_WATCH);
+                /* The editor is destroyed after this; restore Scintilla's proc so it sees WM_NCDESTROY. */
+                if (app->debug.assembler_source != NULL && app->debug.assembler_source_wndproc != NULL) {
+                    SetWindowLongPtrA(app->debug.assembler_source, GWLP_WNDPROC,
+                        (LONG_PTR)app->debug.assembler_source_wndproc);
+                }
                 if (app->debug.assembler_source_brush != NULL) {
                     DeleteObject(app->debug.assembler_source_brush);
                     app->debug.assembler_source_brush = NULL;
@@ -1314,6 +1321,16 @@ static void app_show_assembler_help(HWND hwnd) {
         "  ADD, SUB, AND, OR, XOR, CP\r\n"
         "  PUSH, POP, IN, OUT, EX, DI, EI, RST\r\n"
         "\r\n"
+        "ZX Spectrum Next (Z80N) extensions:\r\n"
+        "  SWAPNIB, MIRROR A, TEST n, MUL D,E\r\n"
+        "  BSLA/BSRA/BSRL/BSRF/BRLC DE,B\r\n"
+        "  ADD HL/DE/BC,A   ADD HL/DE/BC,nn   PUSH nn\r\n"
+        "  NEXTREG reg,n   NEXTREG reg,A   OUTINB   JP (C)\r\n"
+        "  PIXELDN, PIXELAD, SETAE\r\n"
+        "  LDIX, LDWS, LDDX, LDIRX, LDPIRX, LDDRX\r\n"
+        "  These run only on the Next. With the Next active, Assemble\r\n"
+        "  writes into its memory and Ctrl+F5 runs from ORG there.\r\n"
+        "\r\n"
         "Notes:\r\n"
         "  - Numbers may be decimal, $hex, 0xhex, hex with H suffix, or %binary.\r\n"
         "  - Constants use NAME EQU value and can reference earlier labels or constants.\r\n"
@@ -1396,7 +1413,9 @@ static void app_assembler_set_current_path(AppState *app, const char *path) {
         return;
     }
     if (path != NULL) {
-        snprintf(app->debug.assembler_current_path, sizeof(app->debug.assembler_current_path), "%s", path);
+        if (path != app->debug.assembler_current_path) {
+            snprintf(app->debug.assembler_current_path, sizeof(app->debug.assembler_current_path), "%s", path);
+        }
         app_assembler_save_last_path(path);
         app_assembler_sync_file_tracking(app, path);
     } else {
@@ -1662,6 +1681,11 @@ static bool app_assembler_save_source_as(HWND hwnd, AppState *app, char *status_
     return app_assembler_write_source_to_path(app, path, status_buffer, status_buffer_size);
 }
 
+/* The assembler targets whichever machine is running, classic or Next. */
+static uint16_t app_assembler_current_pc(const AppState *app) {
+    return app->machine_kind == APP_MACHINE_NEXT ? app->next.cpu.pc : app->spec.machine.cpu.pc;
+}
+
 /* Assembles the current source into one contiguous CODE block and saves it as
    a standard Spectrum TAP image without altering live RAM. */
 static bool app_assembler_export_tap(HWND hwnd, AppState *app, char *status_buffer, size_t status_buffer_size) {
@@ -1700,7 +1724,7 @@ static bool app_assembler_export_tap(HWND hwnd, AppState *app, char *status_buff
     if (app_assembler_find_source_org(prepared_source.text, &org_address)) {
         effective_address = org_address;
     } else {
-        effective_address = app->spec.machine.cpu.pc;
+        effective_address = app_assembler_current_pc(app);
     }
 
     if (!app_assemble_source(
@@ -1837,13 +1861,18 @@ static void app_assembler_apply_source(HWND hwnd, AppState *app, bool run_after_
     if (app_assembler_find_source_org(prepared_source.text, &org_address)) {
         effective_address = org_address;
     } else {
-        effective_address = app->spec.machine.cpu.pc;
+        effective_address = app_assembler_current_pc(app);
     }
     if (app_assemble_source(app, effective_address, &prepared_source, true, NULL, status, sizeof(status))) {
         if (run_after_assembly) {
             size_t used = strlen(status);
-            app_debug_set_view_address(app, effective_address, true);
-            app_debug_run_from_address(app, effective_address);
+            if (app->machine_kind == APP_MACHINE_NEXT) {
+                app->next.cpu_pins = z80_prefetch(&app->next.cpu, effective_address);
+                app->debug.paused = false;
+            } else {
+                app_debug_set_view_address(app, effective_address, true);
+                app_debug_run_from_address(app, effective_address);
+            }
             snprintf(
                 status + used,
                 sizeof(status) - used,

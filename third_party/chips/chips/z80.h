@@ -333,6 +333,8 @@ extern "C" {
 #define Z80_ZF (1<<6)           // zero
 #define Z80_SF (1<<7)           // sign
 
+typedef void (*z80_nextreg_write_callback_t)(void* user_data, uint8_t reg, uint8_t value);
+
 // CPU state
 typedef struct {
     uint16_t step;      // the currently active decoder step
@@ -364,6 +366,9 @@ typedef struct {
     uint8_t im;
     bool iff1, iff2;
     bool suppress_int;  // suppress maskable interrupts until the next instruction
+    bool z80n_enabled;  // enable ZX Spectrum Next ED-prefixed extensions
+    z80_nextreg_write_callback_t z80n_nextreg_write;
+    void* z80n_user_data;
 } z80_t;
 
 // initialize a new Z80 instance and return initial pin mask
@@ -376,6 +381,11 @@ uint64_t z80_tick(z80_t* cpu, uint64_t pins);
 uint64_t z80_prefetch(z80_t* cpu, uint16_t new_pc);
 // return true when full instruction has finished
 bool z80_opdone(z80_t* cpu);
+void z80_set_z80n_enabled(z80_t* cpu, bool enabled);
+void z80_set_z80n_nextreg_callback(
+    z80_t* cpu,
+    z80_nextreg_write_callback_t callback,
+    void* user_data);
 
 #ifdef __cplusplus
 } // extern C
@@ -423,6 +433,55 @@ bool z80_opdone(z80_t* cpu);
 #define Z80_M1_T2 1706
 #define Z80_M1_T3 1707
 #define Z80_M1_T4 1708
+#define Z80N_TEST_T1 1709
+#define Z80N_TEST_T2 1710
+#define Z80N_TEST_T3 1711
+#define Z80N_ADDNN_T1 1712
+#define Z80N_ADDNN_T2 1713
+#define Z80N_ADDNN_T3 1714
+#define Z80N_ADDNN_T4 1715
+#define Z80N_ADDNN_T5 1716
+#define Z80N_ADDNN_T6 1717
+#define Z80N_ADDNN_T7 1718
+#define Z80N_ADDNN_T8 1719
+#define Z80N_NEXTREGNN_T1 1720
+#define Z80N_NEXTREGNN_T2 1721
+#define Z80N_NEXTREGNN_T3 1722
+#define Z80N_NEXTREGNN_T4 1723
+#define Z80N_NEXTREGNN_T5 1724
+#define Z80N_NEXTREGNN_T6 1725
+#define Z80N_NEXTREGA_T1 1726
+#define Z80N_NEXTREGA_T2 1727
+#define Z80N_NEXTREGA_T3 1728
+#define Z80N_PUSHNN_T1 1729
+#define Z80N_PUSHNN_T2 1730
+#define Z80N_PUSHNN_T3 1731
+#define Z80N_PUSHNN_T4 1732
+#define Z80N_PUSHNN_T5 1733
+#define Z80N_PUSHNN_T6 1734
+#define Z80N_PUSHNN_T7 1735
+#define Z80N_PUSHNN_T8 1736
+#define Z80N_PUSHNN_T9 1737
+#define Z80N_PUSHNN_T10 1738
+#define Z80N_PUSHNN_T11 1739
+#define Z80N_PUSHNN_T12 1740
+#define Z80N_PUSHNN_T13 1741
+#define Z80N_OUTINB_T1 1742
+#define Z80N_OUTINB_T2 1743
+#define Z80N_OUTINB_T3 1744
+#define Z80N_JPC_T1 1745
+#define Z80N_LDIX_T1 1746
+#define Z80N_LDIX_T2 1747
+#define Z80N_LDIX_T3 1748
+#define Z80N_LDIX_T4 1749
+#define Z80N_LDIX_T5 1750
+#define Z80N_LDWS_T1 1751
+#define Z80N_LDWS_T2 1752
+#define Z80N_LDWS_T3 1753
+#define Z80N_LDPIRX_T1 1754
+#define Z80N_LDPIRX_T2 1755
+#define Z80N_LDPIRX_T3 1756
+#define Z80N_LDPIRX_T4 1757
 #define Z80_CB_STEP 1612
 #define Z80_CBHL_STEP 1613
 #define Z80_DDFDCB_STEP 1621
@@ -443,12 +502,33 @@ uint64_t z80_init(z80_t* cpu) {
 }
 
 uint64_t z80_reset(z80_t* cpu) {
+    const bool z80n_enabled = cpu->z80n_enabled;
+    const z80_nextreg_write_callback_t z80n_nextreg_write = cpu->z80n_nextreg_write;
+    void* const z80n_user_data = cpu->z80n_user_data;
     // reset state as described in 'The Undocumented Z80 Documented'
     memset(cpu, 0, sizeof(z80_t));
+    cpu->z80n_enabled = z80n_enabled;
+    cpu->z80n_nextreg_write = z80n_nextreg_write;
+    cpu->z80n_user_data = z80n_user_data;
     cpu->af = cpu->bc = cpu->de = cpu->hl = 0xFFFF;
     cpu->wz = cpu->sp = cpu->ix = cpu->iy = 0xFFFF;
     cpu->af2 = cpu->bc2 = cpu->de2 = cpu->hl2 = 0xFFFF;
     return z80_prefetch(cpu, 0x0000);
+}
+
+void z80_set_z80n_enabled(z80_t* cpu, bool enabled) {
+    CHIPS_ASSERT(cpu);
+    cpu->z80n_enabled = enabled;
+}
+
+void z80_set_z80n_nextreg_callback(
+    z80_t* cpu,
+    z80_nextreg_write_callback_t callback,
+    void* user_data)
+{
+    CHIPS_ASSERT(cpu);
+    cpu->z80n_nextreg_write = callback;
+    cpu->z80n_user_data = user_data;
 }
 
 bool z80_opdone(z80_t* cpu) {
@@ -722,6 +802,43 @@ static inline void _z80_sbc16(z80_t* cpu, uint16_t val) {
              ((res >> 16) & Z80_CF) |
              ((res >> 8) & (Z80_SF|Z80_YF|Z80_XF)) |
              ((res & 0xFFFF) ? 0 : Z80_ZF);
+}
+
+static inline uint8_t _z80_mirror8(uint8_t val) {
+    val = (uint8_t)(((val & 0xAA) >> 1) | ((val & 0x55) << 1));
+    val = (uint8_t)(((val & 0xCC) >> 2) | ((val & 0x33) << 2));
+    return (uint8_t)((val >> 4) | (val << 4));
+}
+
+static inline uint16_t _z80n_bsra(uint16_t val, unsigned count) {
+    count &= 31;
+    if (count == 0) return val;
+    if (count >= 16) return (val & 0x8000) ? 0xFFFF : 0;
+    return (uint16_t)((int16_t)val >> count);
+}
+
+static inline uint16_t _z80n_bsrf(uint16_t val, unsigned count) {
+    count &= 31;
+    if (count >= 16) return 0xFFFF;
+    return (uint16_t)~((uint16_t)~val >> count);
+}
+
+// S, Z, undocumented bits 5 and 3 only (parity/half-carry cleared)
+static inline uint8_t _z80n_sz53(uint8_t val) {
+    return (uint8_t)(_z80_szp_flags[val] & ~(uint8_t)Z80_PF);
+}
+
+// PIXELDN: advance HL one pixel row using the FPGA's Y-bitfield form,
+// which differs from the classic INC H trick at the Y-wrap boundary.
+static inline uint16_t _z80n_pixeldn(uint16_t hl) {
+    const uint8_t h = (uint8_t)(hl >> 8);
+    const uint8_t l = (uint8_t)hl;
+    uint16_t y = (uint16_t)(((uint16_t)(h & 0x18) << 3) |
+        ((uint16_t)(l & 0xE0) >> 2) | (uint16_t)(h & 0x07));
+    y = (y + 1) & 0xFF;
+    const uint8_t nh = (uint8_t)((h & 0xE0) | ((y & 0xC0) >> 3) | (y & 0x07));
+    const uint8_t nl = (uint8_t)(((y & 0x38) << 2) | (l & 0x1F));
+    return (uint16_t)(((uint16_t)nh << 8) | nl);
 }
 
 static inline bool _z80_ldi_ldd(z80_t* cpu, uint8_t val) {
@@ -1363,26 +1480,26 @@ uint64_t z80_tick(z80_t* cpu, uint64_t pins) {
         case  288: _fetch(); // ED NOP (0)
         case  289: _fetch(); // ED NOP (0)
         case  290: _fetch(); // ED NOP (0)
-        case  291: _fetch(); // ED NOP (0)
-        case  292: _fetch(); // ED NOP (0)
+        case  291: if(cpu->z80n_enabled){cpu->a=(uint8_t)((cpu->a<<4)|(cpu->a>>4));};_fetch(); // SWAPNIB / ED NOP
+        case  292: if(cpu->z80n_enabled){cpu->a=_z80_mirror8(cpu->a);};_fetch(); // MIRROR A / ED NOP
         case  293: _fetch(); // ED NOP (0)
         case  294: _fetch(); // ED NOP (0)
-        case  295: _fetch(); // ED NOP (0)
-        case  296: _fetch(); // ED NOP (0)
-        case  297: _fetch(); // ED NOP (0)
-        case  298: _fetch(); // ED NOP (0)
-        case  299: _fetch(); // ED NOP (0)
-        case  300: _fetch(); // ED NOP (0)
+        case  295: if(cpu->z80n_enabled){_goto(Z80N_TEST_T1);};_fetch(); // TEST n / ED NOP
+        case  296: if(cpu->z80n_enabled){const unsigned n=cpu->b&31;cpu->de=(n>=16)?0:(uint16_t)(cpu->de<<n);};_fetch(); // BSLA DE,B / ED NOP
+        case  297: if(cpu->z80n_enabled){cpu->de=_z80n_bsra(cpu->de,cpu->b);};_fetch(); // BSRA DE,B / ED NOP
+        case  298: if(cpu->z80n_enabled){const unsigned n=cpu->b&31;cpu->de=(n>=16)?0:(uint16_t)(cpu->de>>n);};_fetch(); // BSRL DE,B / ED NOP
+        case  299: if(cpu->z80n_enabled){cpu->de=_z80n_bsrf(cpu->de,cpu->b);};_fetch(); // BSRF DE,B / ED NOP
+        case  300: if(cpu->z80n_enabled){const unsigned n=cpu->b&15;cpu->de=(uint16_t)((cpu->de<<n)|(cpu->de>>((16-n)&15)));};_fetch(); // BRLC DE,B / ED NOP
         case  301: _fetch(); // ED NOP (0)
         case  302: _fetch(); // ED NOP (0)
         case  303: _fetch(); // ED NOP (0)
-        case  304: _fetch(); // ED NOP (0)
-        case  305: _fetch(); // ED NOP (0)
-        case  306: _fetch(); // ED NOP (0)
-        case  307: _fetch(); // ED NOP (0)
-        case  308: _fetch(); // ED NOP (0)
-        case  309: _fetch(); // ED NOP (0)
-        case  310: _fetch(); // ED NOP (0)
+        case  304: if(cpu->z80n_enabled){cpu->de=(uint16_t)(cpu->d*cpu->e);};_fetch(); // MUL D,E / ED NOP
+        case  305: if(cpu->z80n_enabled){cpu->hl=(uint16_t)(cpu->hl+cpu->a);};_fetch(); // ADD HL,A / ED NOP
+        case  306: if(cpu->z80n_enabled){cpu->de=(uint16_t)(cpu->de+cpu->a);};_fetch(); // ADD DE,A / ED NOP
+        case  307: if(cpu->z80n_enabled){cpu->bc=(uint16_t)(cpu->bc+cpu->a);};_fetch(); // ADD BC,A / ED NOP
+        case  308: if(cpu->z80n_enabled){_goto(Z80N_ADDNN_T1);};_fetch(); // ADD HL,nn / ED NOP
+        case  309: if(cpu->z80n_enabled){_goto(Z80N_ADDNN_T1);};_fetch(); // ADD DE,nn / ED NOP
+        case  310: if(cpu->z80n_enabled){_goto(Z80N_ADDNN_T1);};_fetch(); // ADD BC,nn / ED NOP
         case  311: _fetch(); // ED NOP (0)
         case  312: _fetch(); // ED NOP (0)
         case  313: _fetch(); // ED NOP (0)
@@ -1466,21 +1583,21 @@ uint64_t z80_tick(z80_t* cpu, uint64_t pins) {
         case  391: _fetch(); // ED NOP (0)
         case  392: _fetch(); // ED NOP (0)
         case  393: _fetch(); // ED NOP (0)
-        case  394: _fetch(); // ED NOP (0)
+        case  394: if(cpu->z80n_enabled){_goto(Z80N_PUSHNN_T1);};_fetch(); // PUSH nn / ED NOP
         case  395: _fetch(); // ED NOP (0)
         case  396: _fetch(); // ED NOP (0)
         case  397: _fetch(); // ED NOP (0)
         case  398: _fetch(); // ED NOP (0)
         case  399: _fetch(); // ED NOP (0)
-        case  400: _fetch(); // ED NOP (0)
-        case  401: _fetch(); // ED NOP (0)
-        case  402: _fetch(); // ED NOP (0)
-        case  403: _fetch(); // ED NOP (0)
-        case  404: _fetch(); // ED NOP (0)
-        case  405: _fetch(); // ED NOP (0)
+        case  400: if(cpu->z80n_enabled){_wait();_mread(cpu->hl);_goto(Z80N_OUTINB_T1);};_fetch(); // OUTINB / ED NOP
+        case  401: if(cpu->z80n_enabled){_goto(Z80N_NEXTREGNN_T1);};_fetch(); // NEXTREG n,n / ED NOP
+        case  402: if(cpu->z80n_enabled){_goto(Z80N_NEXTREGA_T1);};_fetch(); // NEXTREG n,A / ED NOP
+        case  403: if(cpu->z80n_enabled){cpu->hl=_z80n_pixeldn(cpu->hl);};_fetch(); // PIXELDN / ED NOP
+        case  404: if(cpu->z80n_enabled){cpu->hl=(uint16_t)(0x4000+((cpu->d&0xC0)<<5)+((cpu->d&7)<<8)+((cpu->d&0x38)<<2)+(cpu->e>>3));};_fetch(); // PIXELAD / ED NOP
+        case  405: if(cpu->z80n_enabled){cpu->a=(uint8_t)(0x80>>(cpu->e&7));};_fetch(); // SETAE / ED NOP
         case  406: _fetch(); // ED NOP (0)
         case  407: _fetch(); // ED NOP (0)
-        case  408: _fetch(); // ED NOP (0)
+        case  408: if(cpu->z80n_enabled){_wait();_ioread(cpu->bc);_goto(Z80N_JPC_T1);};_fetch(); // JP (C) / ED NOP
         case  409: _fetch(); // ED NOP (0)
         case  410: _fetch(); // ED NOP (0)
         case  411: _fetch(); // ED NOP (0)
@@ -1492,15 +1609,15 @@ uint64_t z80_tick(z80_t* cpu, uint64_t pins) {
         case  417: _goto(1452); // CPI (0)
         case  418: _goto(1460); // INI (0)
         case  419: _goto(1468); // OUTI (0)
-        case  420: _fetch(); // ED NOP (0)
-        case  421: _fetch(); // ED NOP (0)
+        case  420: if(cpu->z80n_enabled){_wait();_mread(cpu->hl);_goto(Z80N_LDIX_T1);};_fetch(); // LDIX / ED NOP
+        case  421: if(cpu->z80n_enabled){_wait();_mread(cpu->hl);_goto(Z80N_LDWS_T1);};_fetch(); // LDWS / ED NOP
         case  422: _fetch(); // ED NOP (0)
         case  423: _fetch(); // ED NOP (0)
         case  424: _goto(1476); // LDD (0)
         case  425: _goto(1484); // CPD (0)
         case  426: _goto(1492); // IND (0)
         case  427: _goto(1500); // OUTD (0)
-        case  428: _fetch(); // ED NOP (0)
+        case  428: if(cpu->z80n_enabled){_wait();_mread(cpu->hl);_goto(Z80N_LDIX_T1);};_fetch(); // LDDX / ED NOP
         case  429: _fetch(); // ED NOP (0)
         case  430: _fetch(); // ED NOP (0)
         case  431: _fetch(); // ED NOP (0)
@@ -1508,15 +1625,15 @@ uint64_t z80_tick(z80_t* cpu, uint64_t pins) {
         case  433: _goto(1521); // CPIR (0)
         case  434: _goto(1534); // INIR (0)
         case  435: _goto(1547); // OTIR (0)
-        case  436: _fetch(); // ED NOP (0)
+        case  436: if(cpu->z80n_enabled){_wait();_mread(cpu->hl);_goto(Z80N_LDIX_T1);};_fetch(); // LDIRX / ED NOP
         case  437: _fetch(); // ED NOP (0)
         case  438: _fetch(); // ED NOP (0)
-        case  439: _fetch(); // ED NOP (0)
+        case  439: if(cpu->z80n_enabled){cpu->wz=(uint16_t)((cpu->hl&0xFFF8)|(cpu->de&7));_wait();_mread(cpu->wz);_goto(Z80N_LDPIRX_T1);};_fetch(); // LDPIRX / ED NOP
         case  440: _goto(1560); // LDDR (0)
         case  441: _goto(1573); // CPDR (0)
         case  442: _goto(1586); // INDR (0)
         case  443: _goto(1599); // OTDR (0)
-        case  444: _fetch(); // ED NOP (0)
+        case  444: if(cpu->z80n_enabled){_wait();_mread(cpu->hl);_goto(Z80N_LDIX_T1);};_fetch(); // LDDRX / ED NOP
         case  445: _fetch(); // ED NOP (0)
         case  446: _fetch(); // ED NOP (0)
         case  447: _fetch(); // ED NOP (0)
@@ -2758,6 +2875,74 @@ uint64_t z80_tick(z80_t* cpu, uint64_t pins) {
         case 1683: _goto(1684); // nmi (9)
         case 1684: _fetch(); // nmi (10)
         // %>
+        //=== ZX Spectrum Next immediate operands
+        case Z80N_TEST_T1: _wait();_mread(cpu->pc++);_goto(Z80N_TEST_T2);
+        case Z80N_TEST_T2: cpu->dlatch=_gd();_goto(Z80N_TEST_T3);
+        case Z80N_TEST_T3: cpu->f=_z80_szp_flags[cpu->a&cpu->dlatch]|Z80_HF;_fetch();
+        case Z80N_ADDNN_T1: _wait();_mread(cpu->pc++);_goto(Z80N_ADDNN_T2);
+        case Z80N_ADDNN_T2: cpu->wzl=_gd();_goto(Z80N_ADDNN_T3);
+        case Z80N_ADDNN_T3: _goto(Z80N_ADDNN_T4);
+        case Z80N_ADDNN_T4: _wait();_mread(cpu->pc++);_goto(Z80N_ADDNN_T5);
+        case Z80N_ADDNN_T5: cpu->wzh=_gd();_goto(Z80N_ADDNN_T6);
+        case Z80N_ADDNN_T6: _goto(Z80N_ADDNN_T7);
+        case Z80N_ADDNN_T7:
+            if(cpu->opcode==0x34)cpu->hl=(uint16_t)(cpu->hl+cpu->wz);
+            else if(cpu->opcode==0x35)cpu->de=(uint16_t)(cpu->de+cpu->wz);
+            else cpu->bc=(uint16_t)(cpu->bc+cpu->wz);
+            _goto(Z80N_ADDNN_T8);
+        case Z80N_ADDNN_T8: _fetch();
+        case Z80N_NEXTREGNN_T1: _wait();_mread(cpu->pc++);_goto(Z80N_NEXTREGNN_T2);
+        case Z80N_NEXTREGNN_T2: cpu->wzl=_gd();_goto(Z80N_NEXTREGNN_T3);
+        case Z80N_NEXTREGNN_T3: _goto(Z80N_NEXTREGNN_T4);
+        case Z80N_NEXTREGNN_T4: _wait();_mread(cpu->pc++);_goto(Z80N_NEXTREGNN_T5);
+        case Z80N_NEXTREGNN_T5: cpu->wzh=_gd();_goto(Z80N_NEXTREGNN_T6);
+        case Z80N_NEXTREGNN_T6:
+            if(cpu->z80n_nextreg_write)cpu->z80n_nextreg_write(cpu->z80n_user_data,cpu->wzl,cpu->wzh);
+            _fetch();
+        case Z80N_NEXTREGA_T1: _wait();_mread(cpu->pc++);_goto(Z80N_NEXTREGA_T2);
+        case Z80N_NEXTREGA_T2: cpu->dlatch=_gd();_goto(Z80N_NEXTREGA_T3);
+        case Z80N_NEXTREGA_T3:
+            if(cpu->z80n_nextreg_write)cpu->z80n_nextreg_write(cpu->z80n_user_data,cpu->dlatch,cpu->a);
+            _fetch();
+        case Z80N_PUSHNN_T1: _wait();_mread(cpu->pc++);_goto(Z80N_PUSHNN_T2);
+        case Z80N_PUSHNN_T2: cpu->wzh=_gd();_goto(Z80N_PUSHNN_T3);
+        case Z80N_PUSHNN_T3: _goto(Z80N_PUSHNN_T4);
+        case Z80N_PUSHNN_T4: _wait();_mread(cpu->pc++);_goto(Z80N_PUSHNN_T5);
+        case Z80N_PUSHNN_T5: cpu->wzl=_gd();_goto(Z80N_PUSHNN_T6);
+        case Z80N_PUSHNN_T6: _goto(Z80N_PUSHNN_T7);
+        case Z80N_PUSHNN_T7: _goto(Z80N_PUSHNN_T8);
+        case Z80N_PUSHNN_T8: _wait();_mwrite(--cpu->sp,cpu->wzh);_goto(Z80N_PUSHNN_T9);
+        case Z80N_PUSHNN_T9: _goto(Z80N_PUSHNN_T10);
+        case Z80N_PUSHNN_T10: _goto(Z80N_PUSHNN_T11);
+        case Z80N_PUSHNN_T11: _wait();_mwrite(--cpu->sp,cpu->wzl);_goto(Z80N_PUSHNN_T12);
+        case Z80N_PUSHNN_T12: _goto(Z80N_PUSHNN_T13);
+        case Z80N_PUSHNN_T13: _fetch();
+        //=== ZX Spectrum Next block / system instructions
+        case Z80N_LDIX_T1: cpu->dlatch=_gd();_goto(Z80N_LDIX_T2);
+        case Z80N_LDIX_T2: if(cpu->opcode==0xAC||cpu->opcode==0xBC){cpu->hl--;}else{cpu->hl++;}if(cpu->dlatch!=cpu->a){_wait();_mwrite(cpu->de,cpu->dlatch);_goto(Z80N_LDIX_T3);};_goto(Z80N_LDIX_T4);
+        case Z80N_LDIX_T3: _goto(Z80N_LDIX_T4);
+        case Z80N_LDIX_T4:
+            // LDIX/LDIRX and LDDX/LDDRX all increment DE; only HL direction differs
+            cpu->de++;
+            _z80_ldi_ldd(cpu,cpu->dlatch);
+            if((cpu->opcode==0xB4||cpu->opcode==0xBC)&&cpu->bc!=0){cpu->wz=--cpu->pc;--cpu->pc;_fetch();}
+            _fetch();
+        case Z80N_LDWS_T1: cpu->dlatch=_gd();_goto(Z80N_LDWS_T2);
+        case Z80N_LDWS_T2: _wait();_mwrite(cpu->de,cpu->dlatch);_goto(Z80N_LDWS_T3);
+        // LDWS = LD (DE),(HL) : INC L : INC D, with flags set as by INC D
+        case Z80N_LDWS_T3: cpu->l++;cpu->d=_z80_inc8(cpu,cpu->d);_fetch();
+        case Z80N_LDPIRX_T1: cpu->dlatch=_gd();_goto(Z80N_LDPIRX_T2);
+        case Z80N_LDPIRX_T2: if(cpu->dlatch!=cpu->a){_wait();_mwrite(cpu->de,cpu->dlatch);_goto(Z80N_LDPIRX_T3);};_goto(Z80N_LDPIRX_T4);
+        case Z80N_LDPIRX_T3: _goto(Z80N_LDPIRX_T4);
+        case Z80N_LDPIRX_T4:
+            cpu->de++;
+            _z80_ldi_ldd(cpu,cpu->dlatch);
+            if(cpu->bc!=0){cpu->wz=--cpu->pc;--cpu->pc;_fetch();}
+            _fetch();
+        case Z80N_OUTINB_T1: cpu->dlatch=_gd();_goto(Z80N_OUTINB_T2);
+        case Z80N_OUTINB_T2: _iowrite(cpu->bc,cpu->dlatch);_goto(Z80N_OUTINB_T3);
+        case Z80N_OUTINB_T3: _wait();cpu->hl++;_fetch();
+        case Z80N_JPC_T1: cpu->pc=(uint16_t)((cpu->pc&0xC000)|((uint16_t)_gd()<<6));_fetch();
         //=== shared fetch machine cycle for DD/FD-prefixed ops
         case Z80_DDFD_M1_T2: _wait(); cpu->opcode = _gd(); _goto(Z80_DDFD_M1_T3);
         case Z80_DDFD_M1_T3: pins = _z80_refresh(cpu, pins); _goto(Z80_DDFD_M1_T4);

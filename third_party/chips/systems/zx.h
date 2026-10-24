@@ -385,6 +385,8 @@ void zx_mouse(zx_t* sys, uint8_t x, uint8_t y, uint8_t buttons);
 void zx_set_expansion_audio(zx_t* sys, bool fuller_audio, bool specdrum, bool covox);
 // enable/disable an already configured Multiface and press its red NMI button
 void zx_set_multiface_enabled(zx_t* sys, bool enabled);
+// page out the Multiface and Interface 1 ROMs (used before restoring a snapshot)
+void zx_unpage_peripherals(zx_t* sys);
 void zx_multiface_nmi(zx_t* sys);
 // set a callback used for EAR/tape input sampling during ULA reads
 void zx_set_tape_input(zx_t* sys, zx_tape_input_callback_t callback, void *user_data);
@@ -1181,18 +1183,25 @@ static bool _zx_plus3_fdc_next_id(
     return true;
 }
 
-static void _zx_plus3_fdc_follow_sector(
+/* Physical head selected by the HD bit of the current command. */
+static uint8_t _zx_plus3_fdc_head(const zx_t* sys) {
+    return (uint8_t)((sys->plus3_fdc.params[0] >> 2) & 1);
+}
+
+/*
+    Search the physical track from the current rotational position for an ID
+    field matching the command's full C/H/R/N, as a real uPD765 does.
+*/
+static bool _zx_plus3_fdc_find_sector(
     zx_t* sys,
     uint8_t drive,
     uint8_t cylinder,
-    uint8_t head,
-    uint8_t r,
-    uint8_t n)
+    uint8_t head)
 {
     const uint8_t count =
         _zx_plus3_fdc_sector_count(sys, drive, cylinder, head);
     if (count == 0) {
-        return;
+        return false;
     }
     uint8_t start = sys->plus3_fdc.id_index[drive][head];
     if (start >= count) {
@@ -1207,12 +1216,16 @@ static void _zx_plus3_fdc_follow_sector(
         if (sys->disk_sector_id(
                 sys->disk_user_data, drive, cylinder, head, index,
                 &id_c, &id_h, &id_r, &id_n, 0, 0) &&
-            id_c == cylinder && id_h == head && id_r == r && id_n == n) {
+            id_c == sys->plus3_fdc.transfer_c &&
+            id_h == sys->plus3_fdc.transfer_h &&
+            id_r == sys->plus3_fdc.transfer_r &&
+            id_n == sys->plus3_fdc.transfer_n) {
             sys->plus3_fdc.id_index[drive][head] =
                 (uint8_t)((index + 1) < count ? index + 1 : 0);
-            return;
+            return true;
         }
     }
+    return false;
 }
 
 static void _zx_plus3_fdc_finish_data(zx_t* sys, uint8_t st0, uint8_t st1, uint8_t st2) {
@@ -1232,18 +1245,21 @@ static bool _zx_plus3_fdc_load_read_sector(zx_t* sys) {
     uint8_t st1 = 0;
     uint8_t st2 = 0;
     const uint8_t drive = sys->plus3_fdc.last_drive;
-    const uint8_t head_drive = (uint8_t)(drive | ((sys->plus3_fdc.transfer_h & 1) << 2));
+    const uint8_t head = _zx_plus3_fdc_head(sys);
+    const uint8_t cylinder = sys->plus3_fdc.cylinder[drive];
+    const uint8_t head_drive = (uint8_t)(drive | (head << 2));
 
     if (!_zx_plus3_disk_ready(sys, drive)) {
         _zx_plus3_fdc_finish_data(sys, (uint8_t)(0x48 | head_drive), 0, 0);
         return false;
     }
     if (sys->disk_read_sector == 0 ||
+        !_zx_plus3_fdc_find_sector(sys, drive, cylinder, head) ||
         !sys->disk_read_sector(
             sys->disk_user_data,
             drive,
-            sys->plus3_fdc.transfer_c,
-            sys->plus3_fdc.transfer_h,
+            cylinder,
+            head,
             sys->plus3_fdc.transfer_r,
             sys->plus3_fdc.transfer_n,
             sys->plus3_fdc.transfer,
@@ -1297,13 +1313,6 @@ static bool _zx_plus3_fdc_load_read_sector(zx_t* sys) {
         }
     }
 
-    _zx_plus3_fdc_follow_sector(
-        sys,
-        drive,
-        sys->plus3_fdc.transfer_c,
-        sys->plus3_fdc.transfer_h,
-        sys->plus3_fdc.transfer_r,
-        sys->plus3_fdc.transfer_n);
     sys->plus3_fdc.transfer_st1 = st1;
     sys->plus3_fdc.transfer_st2 = st2;
     sys->plus3_fdc.transfer_size = data_size;
@@ -1316,22 +1325,34 @@ static bool _zx_plus3_fdc_load_read_sector(zx_t* sys) {
 
 static void _zx_plus3_fdc_complete_sector(zx_t* sys, bool writing) {
     const uint8_t drive = sys->plus3_fdc.last_drive;
-    const uint8_t head_drive = (uint8_t)(drive | ((sys->plus3_fdc.transfer_h & 1) << 2));
+    const uint8_t head = _zx_plus3_fdc_head(sys);
+    const uint8_t cylinder = sys->plus3_fdc.cylinder[drive];
+    const uint8_t head_drive = (uint8_t)(drive | (head << 2));
 
     if (writing) {
+        /* Bit 7 of the drive argument requests a deleted data mark. */
+        const uint8_t deleted =
+            (uint8_t)((sys->plus3_fdc.command & 0x1F) == 0x09 ? 0x80 : 0);
+        uint32_t size = sys->plus3_fdc.transfer_size;
         if (sys->disk_write_sector == 0) {
             _zx_plus3_fdc_finish_data(sys, (uint8_t)(0x40 | head_drive), 0x02, 0);
             return;
         }
-        if (!sys->disk_write_sector(
+        if (sys->plus3_fdc.transfer_n == 0 && size < 128) {
+            /* N=0 with a short DTL writes the rest of the sector as zeros. */
+            memset(sys->plus3_fdc.transfer + size, 0, 128 - size);
+            size = 128;
+        }
+        if (!_zx_plus3_fdc_find_sector(sys, drive, cylinder, head) ||
+            !sys->disk_write_sector(
                 sys->disk_user_data,
-                drive,
-                sys->plus3_fdc.transfer_c,
-                sys->plus3_fdc.transfer_h,
+                (uint8_t)(drive | deleted),
+                cylinder,
+                head,
                 sys->plus3_fdc.transfer_r,
                 sys->plus3_fdc.transfer_n,
                 sys->plus3_fdc.transfer,
-                sys->plus3_fdc.transfer_size)) {
+                size)) {
             _zx_plus3_fdc_finish_data(sys, (uint8_t)(0x40 | head_drive), 0x04, 0);
             return;
         }
@@ -1365,10 +1386,11 @@ static void _zx_plus3_fdc_complete_sector(zx_t* sys, bool writing) {
         return;
     }
 
-    if ((sys->plus3_fdc.command & 0x80) != 0 &&
-        sys->plus3_fdc.transfer_h == 0) {
+    if ((sys->plus3_fdc.command & 0x80) != 0 && head == 0) {
+        /* Multi-track continues on side 1 from sector 1. */
+        sys->plus3_fdc.params[0] |= 0x04;
         sys->plus3_fdc.transfer_h = 1;
-        sys->plus3_fdc.transfer_r = sys->plus3_fdc.params[3];
+        sys->plus3_fdc.transfer_r = 1;
         if (writing) {
             sys->plus3_fdc.transfer_pos = 0;
             sys->plus3_fdc.data_ready_tick =
@@ -1418,6 +1440,13 @@ static void _zx_plus3_fdc_begin_data(zx_t* sys, bool writing) {
     }
     if (writing) {
         const uint32_t size = _zx_plus3_fdc_requested_size(sys);
+        /* A NULL, zero-length write asks whether the disk is writable. */
+        if (sys->disk_write_sector == 0 ||
+            !sys->disk_write_sector(
+                sys->disk_user_data, drive, 0, 0, 0, 0, 0, 0)) {
+            _zx_plus3_fdc_finish_data(sys, (uint8_t)(0x40 | head_drive), 0x02, 0);
+            return;
+        }
         if (size == 0 || size > sizeof(sys->plus3_fdc.transfer)) {
             _zx_plus3_fdc_finish_data(sys, (uint8_t)(0x40 | head_drive), 0x04, 0);
             return;
@@ -1451,6 +1480,10 @@ static void _zx_plus3_fdc_execute(zx_t* sys) {
             break;
         case 0x04: { /* Sense Drive Status */
             const bool ready = _zx_plus3_disk_ready(sys, drive);
+            const bool write_protected = ready &&
+                (sys->disk_write_sector == 0 ||
+                 !sys->disk_write_sector(
+                     sys->disk_user_data, drive, 0, 0, 0, 0, 0, 0));
             bool double_sided = false;
             if (ready && sys->disk_sector_id != 0) {
                 double_sided = sys->disk_sector_id(
@@ -1465,6 +1498,7 @@ static void _zx_plus3_fdc_execute(zx_t* sys) {
                 head_drive |
                 (sys->plus3_fdc.cylinder[drive] == 0 ? 0x10 : 0) |
                 (ready ? 0x20 : 0) |
+                (write_protected ? 0x40 : 0) |
                 (double_sided ? 0x08 : 0));
             _zx_plus3_fdc_set_results(sys, results, 1);
             break;
@@ -2472,6 +2506,18 @@ void zx_set_expansion_audio(zx_t* sys, bool fuller_audio, bool specdrum, bool co
     sys->covox_enabled = covox;
 }
 
+void zx_unpage_peripherals(zx_t* sys) {
+    CHIPS_ASSERT(sys && sys->valid);
+    sys->multiface_nmi_ticks = 0;
+    sys->pins &= ~Z80_NMI;
+    if (sys->multiface_paged) {
+        _zx_multiface_unpage(sys);
+    }
+    if (sys->interface1_paged) {
+        _zx_interface1_unpage(sys);
+    }
+}
+
 void zx_set_multiface_enabled(zx_t* sys, bool enabled) {
     CHIPS_ASSERT(sys && sys->valid);
     if (!enabled && sys->multiface_paged) {
@@ -2768,6 +2814,8 @@ bool zx_quickload(zx_t* sys, chips_range_t data) {
         return false;
     }
     const _zx_z80_header* hdr = (const _zx_z80_header*) ptr;
+    // the .z80 format says byte 12 == 255 must be treated as 1
+    const uint8_t flags0 = (hdr->flags0 == 0xFF) ? 1 : hdr->flags0;
     ptr += sizeof(_zx_z80_header);
     const _zx_z80_ext_header* ext_hdr = 0;
     uint16_t ext_hdr_len = 0;
@@ -2795,7 +2843,7 @@ bool zx_quickload(zx_t* sys, chips_range_t data) {
     }
     if (is_version1) {
         const size_t src_len = (size_t)(end_ptr - ptr);
-        if (hdr->flags0 & (1<<5)) {
+        if (flags0 & (1<<5)) {
             if (!_zx_z80_expand(ptr, src_len, sys->ram[0], 0xC000, true)) return false;
         }
         else {
@@ -2840,7 +2888,7 @@ bool zx_quickload(zx_t* sys, chips_range_t data) {
     sys->cpu.hl2 = (hdr->H_<<8)|hdr->L_;
     sys->cpu.sp = (hdr->SP_h<<8)|hdr->SP_l;
     sys->cpu.i = hdr->I;
-    sys->cpu.r = (hdr->R & 0x7F) | ((hdr->flags0 & 1)<<7);
+    sys->cpu.r = (hdr->R & 0x7F) | ((flags0 & 1)<<7);
     sys->cpu.iff2 = (hdr->IFF2 != 0);
     sys->cpu.iff1 = (hdr->EI != 0);
     if (hdr->flags1 != 0xFF) {
@@ -2873,7 +2921,7 @@ bool zx_quickload(zx_t* sys, chips_range_t data) {
     else {
         sys->pins = z80_prefetch(&sys->cpu, (hdr->PC_h<<8)|hdr->PC_l);
     }
-    sys->border_color = (hdr->flags0>>1) & 7;
+    sys->border_color = (flags0>>1) & 7;
     return true;
 }
 
