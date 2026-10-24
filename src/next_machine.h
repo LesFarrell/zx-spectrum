@@ -15,6 +15,7 @@
 #include "next_sd.h"
 #include "next_sprite.h"
 #include "next_rtc.h"
+#include "next_wifi.h"
 
 enum {
     NEXT_ADDRESS_SPACE_SIZE = 0x10000,
@@ -104,6 +105,7 @@ typedef struct NextMachine {
     NextSpriteEngine sprites;
     NextSdCard sd_card;
     NextRtc rtc;
+    NextWifi *wifi;
     uint8_t *ram;
     uint8_t rom[NEXT_ROM_SIZE];
     uint8_t divmmc_rom[NEXT_BOOT_ROM_SIZE];
@@ -225,6 +227,8 @@ void next_machine_render_frame(NextMachine *machine);
 void next_machine_key_down(NextMachine *machine, int key_code);
 void next_machine_key_up(NextMachine *machine, int key_code);
 void next_machine_set_joystick_mask(NextMachine *machine, uint8_t mask);
+void next_machine_set_host_networking(NextMachine *machine, bool enabled);
+bool next_machine_host_networking_enabled(const NextMachine *machine);
 
 bool next_machine_load_nex_data(
     NextMachine *machine,

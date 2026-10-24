@@ -96,6 +96,7 @@ enum
     APP_MENU_MACHINE_SPEED_8X = 1215,
     APP_MENU_MACHINE_MULTIFACE = 1216,
     APP_MENU_MACHINE_MULTIFACE_NMI = 1217,
+    APP_MENU_MACHINE_HOST_NETWORKING = 1218,
     APP_MENU_MACHINE_REWIND = 1219,
     APP_MENU_VIEW_FULLSCREEN = 1250,
     APP_MENU_VIEW_INTEGER_SCALING = 1251,
@@ -538,6 +539,7 @@ struct AppState
     bool specdrum_enabled;
     bool covox_enabled;
     bool multiface_enabled;
+    bool host_networking_enabled;
     uint8_t mouse_x;
     uint8_t mouse_y;
     uint8_t mouse_buttons;
@@ -1029,6 +1031,8 @@ static HMENU app_create_menu(void)
     AppendMenuA(machine_menu, MF_SEPARATOR, 0, NULL);
     AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_MULTIFACE, "Enable &Multiface");
     AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_MULTIFACE_NMI, "Multiface &NMI\tAlt+F5");
+    AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_HOST_NETWORKING,
+                "Next Host &Networking");
     AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_REWIND, "&Rewind 2 Seconds\tF8");
     AppendMenuA(view_menu, MF_STRING, APP_MENU_VIEW_FULLSCREEN, "&Fullscreen\tF11");
     AppendMenuA(view_menu, MF_STRING, APP_MENU_VIEW_INTEGER_SCALING, "&Integer Scaling");
@@ -1304,6 +1308,14 @@ static void app_update_runtime_menu(HWND hwnd, const AppState *app)
     CheckMenuItem(menu, APP_MENU_MACHINE_MULTIFACE, MF_BYCOMMAND | (app->multiface_enabled ? MF_CHECKED : MF_UNCHECKED));
     EnableMenuItem(menu, APP_MENU_MACHINE_MULTIFACE, MF_BYCOMMAND | (app->machine_kind == APP_MACHINE_CLASSIC && (app->spec.multiface_rom_loaded || app->spec.machine.multiface_16k_ram_mode) ? MF_ENABLED : MF_GRAYED));
     EnableMenuItem(menu, APP_MENU_MACHINE_MULTIFACE_NMI, MF_BYCOMMAND | (app->machine_kind == APP_MACHINE_CLASSIC && app->multiface_enabled && (app->spec.multiface_rom_loaded || app->spec.machine.multiface_16k_ram_mode) ? MF_ENABLED : MF_GRAYED));
+    CheckMenuItem(
+        menu,
+        APP_MENU_MACHINE_HOST_NETWORKING,
+        MF_BYCOMMAND | (app->host_networking_enabled ? MF_CHECKED : MF_UNCHECKED));
+    EnableMenuItem(
+        menu,
+        APP_MENU_MACHINE_HOST_NETWORKING,
+        MF_BYCOMMAND | (app->machine_kind == APP_MACHINE_NEXT ? MF_ENABLED : MF_GRAYED));
     CheckMenuItem(
         menu,
         APP_MENU_VIEW_FULLSCREEN,
@@ -4635,6 +4647,8 @@ static bool app_prepare_next(
     {
         return false;
     }
+    next_machine_set_host_networking(&app->next,
+                                     app->host_networking_enabled);
     {
         chips_audio_callback_t audio_callback;
         ZeroMemory(&audio_callback, sizeof(audio_callback));
@@ -5999,6 +6013,14 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                     spectrum_multiface_nmi(&app->spec);
                     app_rewind_clear(app);
                 }
+                return 0;
+            case APP_MENU_MACHINE_HOST_NETWORKING:
+                app->host_networking_enabled = !app->host_networking_enabled;
+                next_machine_set_host_networking(
+                    &app->next, app->host_networking_enabled);
+                app_save_toggle("next_host_networking",
+                                app->host_networking_enabled);
+                app_update_runtime_menu(hwnd, app);
                 return 0;
             case APP_MENU_VIEW_FULLSCREEN:
                 app_set_fullscreen(hwnd, app, !app->fullscreen);
@@ -7649,6 +7671,9 @@ int main(int argc, char **argv)
     app.multiface_enabled = has_saved_multiface_enabled
                                 ? saved_multiface_enabled
                                 : false;
+    app.host_networking_enabled = false;
+    app_load_saved_toggle("next_host_networking",
+                          &app.host_networking_enabled);
     app.mouse_x = 128;
     app.mouse_y = 96;
     app.integer_scaling = true;

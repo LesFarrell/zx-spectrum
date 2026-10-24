@@ -666,6 +666,17 @@ bool next_machine_init(
         next_set_error(error_buffer, error_buffer_size, "Unable to allocate the Next framebuffer.");
         return false;
     }
+    machine->wifi = next_wifi_create();
+    if (machine->wifi == NULL)
+    {
+        free(machine->ram);
+        free(machine->framebuffer);
+        machine->ram = NULL;
+        machine->framebuffer = NULL;
+        next_set_error(error_buffer, error_buffer_size,
+                       "Unable to initialize Next host networking.");
+        return false;
+    }
 
     machine->initialized = true;
     next_sd_init(&machine->sd_card);
@@ -706,6 +717,7 @@ void next_machine_discard(NextMachine *machine)
 {
     if (machine == NULL)
         return;
+    next_wifi_destroy(machine->wifi);
     next_sd_close(&machine->sd_card);
     free(machine->ram);
     free(machine->framebuffer);
@@ -735,6 +747,7 @@ void next_machine_reset(NextMachine *machine)
 
     if (machine == NULL || !machine->initialized)
         return;
+    next_wifi_reset(machine->wifi);
     memset(machine->nextregs, 0, sizeof(machine->nextregs));
     memcpy(machine->mmu, default_mmu, sizeof(machine->mmu));
     machine->selected_nextreg = 0;
@@ -1577,13 +1590,18 @@ uint8_t next_machine_read_port(NextMachine *machine, uint16_t port)
         return machine->layer2_control;
     if (port == 0x133B)
     {
-        /* No serial peer is attached. Report an empty transmitter and no
-           receive/error state so debug-output polling cannot deadlock the
-           emulated machine. */
-        return 0x10;
+        return (next_wifi_read_control(machine->wifi) & 0x40) == 0
+                   ? next_wifi_read_status(machine->wifi)
+                   : 0x10;
     }
     if (port == 0x143B)
-        return 0x00;
+        return (next_wifi_read_control(machine->wifi) & 0x40) == 0
+                   ? next_wifi_read_rx(machine->wifi)
+                   : 0x00;
+    if (port == 0x153B)
+        return next_wifi_read_control(machine->wifi);
+    if (port == 0x163B)
+        return next_wifi_read_frame(machine->wifi);
     if (port == 0x113B)
     {
         /* i2c SDA read-back: the open-drain bus floats high unless the
@@ -1685,8 +1703,23 @@ void next_machine_write_port(NextMachine *machine, uint16_t port, uint8_t value)
     }
     if (port == 0x133B)
     {
-        /* Treat transmitted bytes as consumed immediately when no UART peer
-           is connected. */
+        if ((next_wifi_read_control(machine->wifi) & 0x40) == 0)
+            next_wifi_write_tx(machine->wifi, value);
+        return;
+    }
+    if (port == 0x143B)
+    {
+        next_wifi_write_prescaler(machine->wifi, value);
+        return;
+    }
+    if (port == 0x153B)
+    {
+        next_wifi_write_control(machine->wifi, value);
+        return;
+    }
+    if (port == 0x163B)
+    {
+        next_wifi_write_frame(machine->wifi, value);
         return;
     }
     if (port_lsb == 0x3B && (port >> 8) == 0x10)
@@ -2166,6 +2199,18 @@ void next_machine_set_joystick_mask(NextMachine *machine, uint8_t mask)
 {
     if (machine != NULL)
         machine->joystick_mask = mask;
+}
+
+void next_machine_set_host_networking(NextMachine *machine, bool enabled)
+{
+    if (machine != NULL && machine->initialized)
+        next_wifi_set_enabled(machine->wifi, enabled);
+}
+
+bool next_machine_host_networking_enabled(const NextMachine *machine)
+{
+    return machine != NULL && machine->initialized &&
+           next_wifi_is_enabled(machine->wifi);
 }
 
 static uint8_t next_ula_palette_index(uint8_t attribute, bool ink)

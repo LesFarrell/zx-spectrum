@@ -46,7 +46,8 @@ Spectrum Next, and includes a debugger, an assembler, and a poke tool.
   page ports, NMI button, lockout state, and 8 KB or 16 KB RAM modes
 - ZX Spectrum Next with NextZXOS booting from an SD card image, Z80N CPU at
   3.5-28 MHz, 2 MB RAM and MMU, Layer 2, sprites, tilemap, Copper, zxnDMA,
-  three AY chips, DACs, divMMC, and `.nex`/`.snx` loading; see
+  three AY chips, DACs, divMMC, optional host-backed ESP-AT networking, and
+  `.nex`/`.snx` loading; see
   [docs/spectrum-next.md](docs/spectrum-next.md)
 - `.tap` tape loading
 - `.tzx` v1.20 tape loading, including direct recording, RLE/Z-RLE CSW,

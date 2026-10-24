@@ -33,6 +33,7 @@ zig cc ^
     next_sprite.c ^
     next_sd.c ^
     next_rtc.c ^
+    next_wifi.c ^
     szx_inflate.c ^
     zip.c ^
     disk.c ^
@@ -45,6 +46,7 @@ zig cc ^
     -lshell32 ^
     -luser32 ^
     -lwinmm ^
+    -lws2_32 ^
     -Wl,/subsystem:windows ^
     -o "..\bin\zx-spectrum.exe"
 

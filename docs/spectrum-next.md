@@ -62,6 +62,20 @@ The keyboard is mapped as on the other models (`Shift` is CAPS SHIFT and
 appear as a Kempston joystick on port `1F`. Pause, the 1x-8x speed settings,
 mute, fullscreen, integer scaling, and scanlines all work on the Next.
 
+### Host networking
+
+`Machine -> Next Host Networking` attaches an emulated ESP8266 to the Next
+UART and routes its connections through the Windows network stack. It is off
+by default. Once changed, the setting is remembered between launches.
+
+The emulated Wi-Fi network is named `HOST NETWORK`; its credentials are not
+used because Windows already owns the physical Wi-Fi, Ethernet, or VPN
+connection. Next software communicates through the real UART ports `133B`,
+`143B`, `153B`, and `163B`. The ESP-AT commands needed for station setup,
+DNS-backed TCP/UDP client connections, connection status, sending, and
+`+IPD` receive data are supported. A Next program therefore gets the same
+outbound and local-network access as the emulator process.
+
 These commands are classic-only and are greyed out on the Next: Save Snapshot,
 Save Screen, Save Program/RAM To Tape, Play/Stop Tape, Save/Eject Disk,
 Rewind, the external Multiface menu entries, and Poke. The Next has its own
@@ -83,6 +97,8 @@ Multiface, which NextZXOS uses itself.
   prescaler
 - **Storage**: divMMC with automatic mapping and SD card access to the
   NextZXOS image
+- **Networking**: both UART FIFO interfaces and an optional ESP-AT device
+  backed by asynchronous Windows TCP/UDP sockets
 - **Other**: Multiface NMI (NextZXOS uses it to finish launching snapshots),
   stackless NMI, the real-time clock, and line interrupts
 
@@ -102,3 +118,5 @@ The built-in assembler accepts the Z80N instructions too; see
 - Next snapshots cannot be saved, and rewind is not available on the Next.
 - The FPGA bitstream itself is not emulated; the boot loader ROM stands in for
   it.
+- ESP transparent mode, TCP server mode, and SSL commands are not currently
+  implemented. Software using ordinary ESP-AT TCP or UDP clients is supported.
