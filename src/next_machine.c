@@ -2115,7 +2115,15 @@ static inline uint64_t next_machine_tick_inline(NextMachine *machine)
             machine->int_counter = 0;
         }
     }
+    if (machine->debug.callback.func != NULL)
+        machine->debug.callback.func(machine->debug.callback.user_data, pins);
     return pins;
+}
+
+/* True once a debugger hook has asked execution to stop. */
+static bool next_machine_debug_stopped(const NextMachine *machine)
+{
+    return machine->debug.stopped != NULL && *machine->debug.stopped;
 }
 
 uint64_t next_machine_tick(NextMachine *machine)
@@ -2129,7 +2137,7 @@ void next_machine_exec_ticks(NextMachine *machine, uint32_t ticks)
 {
     if (machine == NULL || !machine->initialized)
         return;
-    while (ticks-- > 0)
+    while (ticks-- > 0 && !next_machine_debug_stopped(machine))
         next_machine_tick_inline(machine);
 }
 
@@ -2140,8 +2148,23 @@ void next_machine_exec_frame(NextMachine *machine)
     if (machine == NULL || !machine->initialized)
         return;
     target = machine->frame_count + 1;
-    while (machine->frame_count < target)
-        next_machine_tick_inline(machine);
+    if (machine->debug.callback.func != NULL)
+    {
+        /* A debugger stop leaves the frame unfinished; the next call
+           completes it, so the frame is only rendered (and the Copper
+           advanced) once. */
+        while (machine->frame_count < target)
+        {
+            next_machine_tick_inline(machine);
+            if (next_machine_debug_stopped(machine))
+                return;
+        }
+    }
+    else
+    {
+        while (machine->frame_count < target)
+            next_machine_tick_inline(machine);
+    }
     kbd_update(&machine->keyboard, 20000);
     next_machine_render_frame_internal(machine, true);
 }

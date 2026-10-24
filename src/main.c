@@ -143,6 +143,9 @@ enum
     APP_CTRL_DEBUG_POINTS_GROUP = 2024,
     APP_CTRL_DEBUG_STACK = 2025,
     APP_CTRL_DEBUG_STACK_GROUP = 2026,
+    APP_CTRL_DEBUG_STEP_OUT = 2040,
+    APP_CTRL_DEBUG_COMMAND = 2041,
+    APP_CTRL_DEBUG_COMMAND_RUN = 2042,
     APP_CTRL_ASM_SOURCE = 2102,
     APP_CTRL_ASM_APPLY = 2103,
     APP_CTRL_ASM_STATUS = 2104,
@@ -325,6 +328,30 @@ typedef struct VideoBackbuffer
     int height;
 } VideoBackbuffer;
 
+typedef enum AppDebugPointKind
+{
+    APP_DEBUG_POINT_EXEC = 0,
+    APP_DEBUG_POINT_READ,
+    APP_DEBUG_POINT_WRITE,
+    APP_DEBUG_POINT_IN,
+    APP_DEBUG_POINT_OUT
+} AppDebugPointKind;
+
+/* One debugger breakpoint: execution, memory read/write or port in/out over
+   an inclusive address range, with optional data match, condition and hit
+   count. */
+typedef struct AppDebugPoint
+{
+    AppDebugPointKind kind;
+    bool enabled;
+    uint16_t start;
+    uint16_t end;
+    int value;
+    uint32_t hit_target;
+    uint32_t hits;
+    char condition[96];
+} AppDebugPoint;
+
 typedef struct DebugState
 {
     HWND debugger_hwnd;
@@ -350,12 +377,16 @@ typedef struct DebugState
     HWND debugger_page_up_button;
     HWND debugger_page_down_button;
     HWND debugger_points_list;
+    HWND debugger_step_out_button;
+    HWND debugger_command_edit;
+    HWND debugger_command_button;
     HBRUSH debugger_background_brush;
     HBRUSH debugger_surface_brush;
     HBRUSH debugger_input_brush;
     HACCEL debugger_accel;
     WNDPROC debugger_address_edit_wndproc;
     WNDPROC debugger_points_list_wndproc;
+    WNDPROC debugger_command_edit_wndproc;
     HWND assembler_hwnd;
     HWND assembler_panel;
     HWND assembler_source;
@@ -387,30 +418,25 @@ typedef struct DebugState
     bool paused;
     bool stepping;
     bool stop_requested;
-    bool breakpoint_hit;
-    bool watchpoint_hit;
+    bool point_hit;
+    bool access_pending;
+    bool step_out_active;
     bool debugger_view_sync_pc;
     bool debugger_view_initialized;
     bool debugger_run_to_active;
     bool debugger_run_to_hit;
-    bool debugger_watchpoint_pending;
     bool debugger_skip_breakpoint_once;
     bool debugger_step_left_boundary;
     uint16_t debugger_view_address;
-    uint16_t last_breakpoint_address;
     uint16_t debugger_run_to_address;
-    uint16_t last_run_to_address;
     uint16_t debugger_skip_breakpoint_address;
-    uint16_t last_watchpoint_address;
-    uint16_t pending_watchpoint_address;
-    uint16_t *breakpoints;
-    size_t breakpoint_count;
-    size_t breakpoint_capacity;
-    uint16_t *watchpoints;
-    size_t watchpoint_count;
-    size_t watchpoint_capacity;
-    uint8_t last_watchpoint_value;
-    uint8_t pending_watchpoint_value;
+    uint16_t step_out_sp;
+    uint16_t instruction_pc;
+    AppDebugPoint *points;
+    size_t point_count;
+    size_t point_capacity;
+    char hit_text[160];
+    char pending_text[128];
     uint64_t last_pins;
 } DebugState;
 
@@ -674,16 +700,10 @@ static void app_controller_poll(AppState *app);
 static void app_audio_flush(AppState *app);
 static void app_release_all_keys(AppState *app);
 static bool app_debug_has_breakpoint(const AppState *app, uint16_t address);
-static bool app_debug_reserve_breakpoints(AppState *app, size_t required_count);
-static bool app_debug_has_watchpoint(const AppState *app, uint16_t address);
-static bool app_debug_reserve_watchpoints(AppState *app, size_t required_count);
-static bool app_debug_toggle_breakpoint(AppState *app, uint16_t address, bool *enabled);
-static bool app_debug_toggle_watchpoint(AppState *app, uint16_t address, bool *enabled);
 static void app_debug_refresh_points_list(AppState *app);
-static bool app_debug_remove_selected_point(AppState *app);
 static void app_debug_free_storage(AppState *app);
-static void app_debug_append_point_summary(char *buffer, size_t buffer_size, size_t *used, const AppState *app);
-static bool app_debug_is_step_over_candidate(const Spectrum *spec, uint16_t address);
+static void app_debug_load_points(AppState *app);
+static bool app_debug_is_step_over_candidate(const AppState *app, uint16_t address);
 static void app_debug_pause(AppState *app);
 static void app_debug_resume(AppState *app);
 static void app_debug_step_over_instruction(AppState *app);
@@ -697,6 +717,8 @@ static HMENU app_create_debugger_menu(void);
 static void app_show_debugger_help(HWND hwnd);
 static HMENU app_create_assembler_menu(void);
 static void app_save_model(SpectrumModel model);
+static void app_save_machine_is_next(bool next);
+static void app_switch_model(HWND hwnd, AppState *app, SpectrumModel model);
 static void app_save_tape_autoload(bool enabled);
 static void app_save_fast_tape_loading(bool enabled);
 static void app_save_sound_muted(bool muted);
@@ -1073,7 +1095,6 @@ static const UINT app_classic_only_commands[] = {
     APP_MENU_MACHINE_REWIND,
     APP_MENU_MACHINE_MULTIFACE,
     APP_MENU_MACHINE_MULTIFACE_NMI,
-    APP_MENU_TOOLS_DEBUGGER,
     APP_MENU_TOOLS_POKE};
 
 static bool app_command_is_classic_only(UINT command)
@@ -3388,6 +3409,26 @@ static bool app_tape_assume_128k(
     return requested_128k;
 }
 
+/* Classic media belongs to the Sinclair machine, so opening it while the Next
+   is running switches back to the last Sinclair model first. */
+static bool app_leave_next(
+    HWND hwnd,
+    AppState *app,
+    char *error_buffer,
+    size_t error_buffer_size)
+{
+    if (app->machine_kind != APP_MACHINE_NEXT)
+        return true;
+    app_switch_model(hwnd, app, app->spec.model);
+    if (app->machine_kind == APP_MACHINE_NEXT)
+    {
+        snprintf(error_buffer, error_buffer_size,
+                 "Could not switch to the %s to open this file.", app_model_name(app->spec.model));
+        return false;
+    }
+    return true;
+}
+
 static bool app_load_zip_file(
     HWND hwnd,
     AppState *app,
@@ -3500,6 +3541,10 @@ static bool app_load_zip_file(
             app_activate_next(hwnd, app);
             app_add_recent_media(app, path);
         }
+    }
+    else if (!app_leave_next(hwnd, app, error_buffer, error_buffer_size))
+    {
+        loaded = false;
     }
     else if (_stricmp(extension, ".dsk") == 0)
     {
@@ -3827,6 +3872,11 @@ static bool app_load_media_path(
             assume_128k,
             error_buffer,
             error_buffer_size);
+    }
+
+    if (!app_leave_next(hwnd, app, error_buffer, error_buffer_size))
+    {
+        return false;
     }
 
     if (extension != NULL && _stricmp(extension, ".dsk") == 0)
@@ -4662,6 +4712,7 @@ static void app_activate_next(HWND hwnd, AppState *app)
         EnableMenuItem(menu, app_classic_only_commands[i], MF_BYCOMMAND | MF_GRAYED);
     }
     SetWindowTextA(hwnd, "ZX Spectrum Emulator (Next)");
+    app_save_machine_is_next(true);
     app_update_runtime_menu(hwnd, app);
     InvalidateRect(hwnd, NULL, FALSE);
 }
@@ -4933,7 +4984,20 @@ static void app_tick_emulator(AppState *app)
         {
             while (app_frame_due(app, frame_ms, &now))
             {
-                next_machine_exec_frame(&app->next);
+                if (app->debug.debugger_hwnd != NULL)
+                {
+                    /* The debugger arms breakpoints and may pause mid-frame. */
+                    app_debug_run_frame(app, true);
+                    if (app->debug.paused)
+                    {
+                        app->emulation_accumulator_ms = 0.0;
+                        break;
+                    }
+                }
+                else
+                {
+                    next_machine_exec_frame(&app->next);
+                }
                 app_run_next_nexload(app);
                 app->emulation_accumulator_ms -= frame_ms;
                 rendered = true;
@@ -6448,6 +6512,23 @@ static bool app_settings_path(char *out_path, size_t out_size)
     }
 }
 
+/* Reports whether the ZX Spectrum Next was the active machine when the
+   emulator last ran. The Sinclair model is kept separately under "model" so
+   switching back from the Next restores the last classic choice. */
+static bool app_load_saved_machine_is_next(void)
+{
+    char path[MAX_PATH];
+    char value[16];
+
+    if (!app_settings_path(path, sizeof(path)))
+    {
+        return false;
+    }
+
+    GetPrivateProfileStringA("emulator", "machine", "", value, sizeof(value), path);
+    return strcmp(value, "next") == 0;
+}
+
 /* Reads the user's preferred startup machine model from the persisted INI
    file, returning false when no valid selection has been stored yet. */
 static bool app_load_saved_model(SpectrumModel *model)
@@ -6729,6 +6810,18 @@ static void app_save_model(SpectrumModel model)
         "model",
         app_model_settings_value(model),
         path);
+    app_save_machine_is_next(false);
+}
+
+/* Persists whether the Next or a Sinclair model is the active machine. */
+static void app_save_machine_is_next(bool next)
+{
+    char path[MAX_PATH];
+    if (!app_settings_path(path, sizeof(path)))
+    {
+        return;
+    }
+    WritePrivateProfileStringA("emulator", "machine", next ? "next" : "classic", path);
 }
 
 /* Persists whether opening a tape should immediately begin the standard ROM
@@ -7418,6 +7511,18 @@ static bool app_resolve_roms(
         return app_rom_set_is_available(app_rom_set_for_model_const(selection, model));
     }
 
+    /* A .tap opened from Explorer starts on the 128K so its Tape Loader can
+       run it; the saved model is left as the user chose it. */
+    if (*media_path != NULL && app_rom_set_is_available(&selection->rom_128k))
+    {
+        const char *extension = strrchr(*media_path, '.');
+        if (extension != NULL && _stricmp(extension, ".tap") == 0)
+        {
+            selection->model = SPECTRUM_MODEL_128K;
+            return true;
+        }
+    }
+
     if (has_saved_model && app_rom_set_is_available(app_rom_set_for_model_const(selection, saved_model)))
     {
         selection->model = saved_model;
@@ -7675,6 +7780,14 @@ int main(int argc, char **argv)
         app.tape_autoload_enabled,
         app.fast_tape_loading_enabled);
     app.running = true;
+    app_debug_load_points(&app);
+    /* A plain launch returns to the Next if it was the last machine used.
+       Command-line models, ROMs, and media choose the machine themselves. */
+    if (argc <= 1 && app_load_saved_machine_is_next() &&
+        !app_switch_next(hwnd, &app, error_buffer, sizeof(error_buffer)))
+    {
+        app_save_machine_is_next(false);
+    }
     app_debug_machine_changed(&app);
     if (startup_media_path != NULL &&
         !app_load_media_path(
@@ -7755,6 +7868,9 @@ int main(int argc, char **argv)
        while the window was alive; this is the belt-and-braces pass. */
     app_drain_load_completions(&app);
     timeEndPeriod(1);
+    /* Media opened from the command line can change machine without a menu
+       choice, so record whichever machine was running at exit. */
+    app_save_machine_is_next(app.machine_kind == APP_MACHINE_NEXT);
 
     /* The menu bar is normally destroyed with the window, but destroy it here
        too if it is still alive so the handle never leaks at exit. */

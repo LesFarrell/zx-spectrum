@@ -22,7 +22,7 @@ Use four-space indentation, C11 constructs, explicit-width integer types, and th
 
 ## Testing Guidelines
 
-Build after every functional change. Manually exercise affected models and media types, including failure paths and file round trips. For UI or rendering changes, verify window resizing, fullscreen, and integer scaling. Temporary test harnesses must be removed before commit; keep permanent tests deterministic and name them `*_test.c`.
+Build after every functional change. Automatically exercise affected models and media types, including failure paths and file round trips. For UI or rendering changes, verify window resizing, fullscreen, and integer scaling. Temporary test harnesses must be removed before commit; keep permanent tests deterministic and name them `*_test.c`.
 
 ## Commit & Pull Request Guidelines
 

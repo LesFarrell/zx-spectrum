@@ -2,6 +2,18 @@
 
 Small ZX Spectrum emulator in C for Windows. It uses the Win32 API for display, input, and audio, and currently builds with `zig rc` and `zig cc`.
 
+It emulates the 48K, 128K, +2, +2A, and +3 Sinclair models and the ZX
+Spectrum Next, and includes a debugger, an assembler, and a poke tool.
+
+## Documentation
+
+- [Spectrum Next](docs/spectrum-next.md) - setting up NextZXOS, running NEX
+  and SNX files, and what the Next model emulates
+- [Debugger](docs/debugger.md) - breakpoints, watchpoints, conditions,
+  stepping, and the command box
+- [Assembler](docs/assembler.md) - editor keys, syntax, directives, Z80N
+  instructions, and the sample programs
+
 ## Current scope
 
 - 48K model
@@ -32,6 +44,10 @@ Small ZX Spectrum emulator in C for Windows. It uses the Win32 API for display, 
   and Covox DAC on port `0xFB`
 - Multiface 1, Multiface 128, and Multiface 3 ROM/RAM paging with software
   page ports, NMI button, lockout state, and 8 KB or 16 KB RAM modes
+- ZX Spectrum Next with NextZXOS booting from an SD card image, Z80N CPU at
+  3.5-28 MHz, 2 MB RAM and MMU, Layer 2, sprites, tilemap, Copper, zxnDMA,
+  three AY chips, DACs, divMMC, and `.nex`/`.snx` loading; see
+  [docs/spectrum-next.md](docs/spectrum-next.md)
 - `.tap` tape loading
 - `.tzx` v1.20 tape loading, including direct recording, RLE/Z-RLE CSW,
   generalized data, loop/jump/call flow, and interactive select blocks
@@ -54,8 +70,11 @@ Small ZX Spectrum emulator in C for Windows. It uses the Win32 API for display, 
   supported files
 - Pause, selectable 1x/2x/4x/8x speed, borderless fullscreen, and centered
   integer display scaling
-- A five-second in-memory rewind history sampled every 25 emulated frames
-  (approximately 500 ms)
+- A two-second in-memory rewind history sampled every 25 emulated frames
+  (approximately 500 ms) on the Sinclair models
+- A debugger with execution, memory read/write, and port breakpoints,
+  conditions, hit counts, step over/out, and breakpoints saved between runs
+- A Z80 and Z80N assembler that writes straight into emulated RAM
 - Eight remembered recent-media paths
 
 ## Not implemented
@@ -70,6 +89,9 @@ Small ZX Spectrum emulator in C for Windows. It uses the Win32 API for display, 
 - Saving +2A/+3 snapshots as `.sna`; use the supported `.z80` writer instead
 - Interface 1 RS-232 and Sinclair Network connections, and raw/unformatted
   Microdrive media (standard formatted `.mdr` images are supported)
+
+See [docs/spectrum-next.md](docs/spectrum-next.md#known-limitations) for the
+Next model's limitations.
 
 ## Build
 
@@ -86,7 +108,11 @@ With no arguments, the emulator looks for `plus3.rom`, `plus2a.rom`,
 `plus2.rom`, `128.rom`, and `48.rom` in `.\bin\roms`. It enables Interface 1 on
 48K/128K/+2 machines when `Interface1-v2.rom` is present there. When dedicated +2
 or +2A ROMs are absent, the 128K or +3 ROM set is used as a compatible
-fallback. It restores the last selected model when its ROM is available.
+fallback. It restores the last selected model when its ROM is available, or the ZX
+Spectrum Next if that was in use and NextZXOS is installed.
+
+The ZX Spectrum Next needs the NextZXOS emulator package unpacked into
+`.\bin\nextzxos`; see [docs/spectrum-next.md](docs/spectrum-next.md#setting-up-nextzxos).
 
 Optional Multiface ROMs are discovered in the same folder as
 `multiface1.rom`, `multiface128.rom`, and `multiface3.rom`. The matching image
@@ -154,7 +180,8 @@ Spectrum +3 with one combined 64 KB ROM:
 
 ## Menu
 
-- `File -> Open Media/Snapshot...` opens `.zip`, `.tap`, `.tzx`, `.pzx`, `.mdr`, `.dsk`, `.scr`, `.z80`, `.sna`, or `.szx` files
+- `File -> Open Media/Snapshot...` opens `.nex`, `.snx`, `.zip`, `.tap`, `.tzx`, `.pzx`, `.mdr`, `.dsk`, `.scr`, `.z80`, `.sna`, or `.szx` files
+- Opening a `.nex` or `.snx` file switches to the ZX Spectrum Next and starts it
 - `File -> Save Snapshot...` writes every supported model as `.z80`, or writes
   48K/128K/+2 machines as `.sna` when that extension is selected
 - `File -> Save Screen...` writes the visible Spectrum screen as a 6912-byte `.scr`
@@ -192,11 +219,16 @@ Spectrum +3 with one combined 64 KB ROM:
 - `File -> Save RAM To Tape...` writes the visible `0x4000`-`0xFFFF` RAM range
   as a CODE block in a `.tap` image
 - `File -> Exit` closes the emulator
-- `Machine` switches among 48K, 128K, +3, +2, and +2A and remembers the choice
-- `Ctrl+1` through `Ctrl+5` select 48K, 128K, +3, +2, and +2A
+- `Machine` switches among 48K, 128K, +3, +2, +2A, and ZX Spectrum Next. The
+  machine in use when the emulator closes is started again next time; a model
+  flag, ROM path, or media file on the command line takes precedence
+- A `.tap` file opened from Explorer or the command line starts on the 128K
+  (when `128.rom` is available) so the 128K Tape Loader runs it; this does not
+  change the saved model. A model flag such as `--48` overrides it
+- `Ctrl+1` through `Ctrl+6` select 48K, 128K, +3, +2, +2A, and the Next
 - `Machine -> Speed` selects 1x, 2x, 4x, or 8x and remembers the selection
 - `F2` pauses and `F6` cycles through the speed choices
-- `F8` or `Machine -> Rewind 5 Seconds` rewinds five emulated seconds, or to
+- `F8` or `Machine -> Rewind 2 Seconds` rewinds two emulated seconds, or to
   the oldest available half-second checkpoint when less history exists
 - `F11` toggles fullscreen; `Escape` leaves fullscreen
 - `View -> Integer Scaling` keeps the image at a centered whole-number scale
@@ -205,41 +237,18 @@ Spectrum +3 with one combined 64 KB ROM:
 - `Sound -> Mute Sound` or `Ctrl+M` toggles all emulator audio and remembers the choice between runs
 - The Sound menu also enables Fuller AY, SpecDrum, and Covox; the Machine menu
   attaches the matching Multiface and `Alt+F5` presses its NMI button
-- `Tools -> Assembler...` opens a small RAM patching assembler with support for common Z80 instructions plus `ORG`, `DB`, `DW`, `DS`/`DEFS`, `INCBIN`, `INCLUDE`, and TAP export
-- `Tools -> Debugger...` opens a separate debugger window with pause, run, single-step, register state, and memory/disassembly views
-- `Tools -> Poke...` opens a small RAM poke tool for writing one or more byte values directly to memory
+- `Tools -> Assembler...` (`Ctrl+Shift+A`) opens a small RAM patching
+  assembler; see [docs/assembler.md](docs/assembler.md)
+- `Tools -> Debugger...` (`Ctrl+Shift+D`) opens the debugger on any model,
+  including the Next; see [docs/debugger.md](docs/debugger.md)
+- `Tools -> Poke...` (`Ctrl+Shift+P`) opens a small RAM poke tool for writing
+  one or more byte values directly to memory
 
-## Assembler Notes
+## Settings
 
-- The built-in assembler is intentionally small: it supports labels, `EQU` constants, and a practical subset of Z80 mnemonics, not a full macro assembler
-- `File -> New` clears the current source after prompting to save when needed
-- The current assembler file is watched for external edits and prompts to reload automatically
-- `File -> Reload`, `Ctrl+R`, or `F5` reloads the current assembler file manually; dirty in-editor changes must be discarded first
-- `DS count[, fill]` is an alias for `DEFS`
-- `DEFS count[, fill]` emits repeated bytes into RAM and advances the assembly address; omitted `fill` defaults to `0`
-- `INCBIN "file.bin"` copies raw binary data into RAM at the current assembly address
-- `Export TAP...` writes the assembled output as one standard Spectrum `CODE` block in a `.tap` file
-- TAP export requires one contiguous assembled output range; sources that jump around with `ORG` cannot be written as a single block
-- `INCLUDE "file.asm"` expands another source file in place during assembly, so it can appear in the middle of a source file; relative paths are resolved from the current source file
-- `Ctrl+B` assembles the current source
-- `Ctrl+F5` assembles the current source and starts execution at its `ORG` address
-- `Ctrl+F` opens Find and `Ctrl+H` opens Find and Replace; both support match case and whole-word searches, and searches wrap around the document
-- `Ctrl+A`, `Ctrl+Z`, `Ctrl+X`, `Ctrl+C`, and `Ctrl+V` work like a normal text editor inside the assembler source box
-- Assembler writes are limited to RAM at `0x4000`-`0xFFFF`; ROM addresses are read-only in the running machine
-- Working samples are included at [hello.asm](src/examples/hello.asm),
-  [include-main.asm](src/examples/include-main.asm), and
-  [space-invaders.asm](src/examples/space-invaders.asm)
-
-### Space Invaders sample
-
-The included `space-invaders.asm` is a complete 48K mini-game and a larger example of the integrated assembler. Open it in `Tools -> Assembler...` and press `Ctrl+F5` to assemble it at `8000h` and start it immediately.
-
-- Use `5` and `8` to move and `0` to fire; invader and player explosions have a dedicated beeper effect
-- The game includes a three-row animated alien formation, aimed alien bombs, four destructible shield bases, collision detection, score, lives, and win/game-over screens
-- Eleven custom 8x8 UDG characters provide the player, projectiles, explosion, bases, and two animation frames for each alien type
-- Spectrum attributes give the alien rows and game objects distinct colours
-- The 48K beeper provides firing, impact, alien movement, and bomb-drop effects
-- Each occupied shield cell absorbs one player laser or alien bomb before being destroyed
+Settings are stored in `%APPDATA%\zxspecemu.ini`: the selected machine, speed,
+mute, input choices, tape options, recent media, and debugger breakpoints.
+Delete the file to return to the defaults.
 
 ## Notes
 

@@ -168,6 +168,9 @@ typedef struct NextMachine {
     uint8_t tilemap_clip[4];
     uint8_t tilemap_clip_index;
 
+    /* Optional per-tick debugger hook, matching the classic core's. When
+       *stopped becomes true the exec functions return early. */
+    chips_debug_t debug;
     uint16_t initial_pc;
     uint16_t initial_sp;
     uint32_t *framebuffer;
