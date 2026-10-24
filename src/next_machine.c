@@ -365,7 +365,6 @@ static void next_soft_reset(NextMachine *machine)
     machine->port_1ffd = 0;
     machine->port_dffd = 0;
     machine->timex_video_mode = 0;
-    machine->mmu_override_mask = 0;
     machine->paging_locked = false;
     machine->divmmc_automap = false;
     machine->divmmc_automap_pending = false;
@@ -750,7 +749,6 @@ void next_machine_reset(NextMachine *machine)
     machine->port_1ffd = 0;
     machine->port_dffd = 0;
     machine->timex_video_mode = 0;
-    machine->mmu_override_mask = 0;
     machine->paging_locked = false;
     machine->nextregs[0x05] = 0x01;
     machine->nextregs[0x06] = 0xA0;
@@ -808,8 +806,6 @@ void next_machine_reset(NextMachine *machine)
     machine->cpu_pins = z80_reset(&machine->cpu);
     z80_set_z80n_enabled(&machine->cpu, true);
     z80_set_z80n_nextreg_callback(&machine->cpu, next_z80n_write_reg, machine);
-    machine->palette_loaded = false;
-    machine->copper_loaded = false;
     machine->sprite_clip[0] = 0x00;
     machine->sprite_clip[1] = 0xFF;
     machine->sprite_clip[2] = 0x00;
@@ -859,7 +855,6 @@ bool next_machine_load_rom_data(
     memcpy(machine->rom, rom, NEXT_ROM_SIZE);
     memcpy(machine->divmmc_rom, boot_rom, NEXT_BOOT_ROM_SIZE);
     machine->rom_loaded = true;
-    machine->divmmc_rom_loaded = true;
     return true;
 }
 
@@ -1380,7 +1375,6 @@ void next_machine_write_nextreg(NextMachine *machine, uint8_t reg, uint8_t value
     {
         const unsigned slot = reg - NEXT_REG_MMU0;
         machine->mmu[slot] = value;
-        machine->mmu_override_mask |= (uint8_t)(1u << slot);
     }
     if (reg == NEXT_REG_ROM_MAPPING)
     {
@@ -1399,7 +1393,6 @@ void next_machine_write_nextreg(NextMachine *machine, uint8_t reg, uint8_t value
             machine->port_7ffd = (uint8_t)((machine->port_7ffd & 0xF8) |
                                            (bank & 7));
             machine->port_dffd = (uint8_t)((value >> 7) & 1);
-            machine->mmu_override_mask &= 0x3F;
             machine->mmu[6] = (uint8_t)(bank * 2);
             machine->mmu[7] = (uint8_t)(bank * 2 + 1);
             machine->nextregs[NEXT_REG_MMU0 + 6] = machine->mmu[6];
@@ -1633,7 +1626,6 @@ static void next_set_legacy_mmu_page(
 {
     machine->mmu[slot] = page;
     machine->nextregs[NEXT_REG_MMU0 + slot] = page;
-    machine->mmu_override_mask &= (uint8_t)~(1u << slot);
 }
 
 static void next_apply_normal_paging(NextMachine *machine)
@@ -1875,7 +1867,7 @@ void next_machine_write_port(NextMachine *machine, uint16_t port, uint8_t value)
 
 /* One CPU clock. Inlined into the frame loop: this is the emulator's hot
    path, so rarely-changing state is tested as cheaply as possible. */
-static inline uint64_t next_machine_tick_inline(NextMachine *machine)
+static inline __attribute__((always_inline)) uint64_t next_machine_tick_inline(NextMachine *machine)
 {
     uint64_t pins;
 
@@ -2124,21 +2116,6 @@ static inline uint64_t next_machine_tick_inline(NextMachine *machine)
 static bool next_machine_debug_stopped(const NextMachine *machine)
 {
     return machine->debug.stopped != NULL && *machine->debug.stopped;
-}
-
-uint64_t next_machine_tick(NextMachine *machine)
-{
-    if (machine == NULL || !machine->initialized)
-        return 0;
-    return next_machine_tick_inline(machine);
-}
-
-void next_machine_exec_ticks(NextMachine *machine, uint32_t ticks)
-{
-    if (machine == NULL || !machine->initialized)
-        return;
-    while (ticks-- > 0 && !next_machine_debug_stopped(machine))
-        next_machine_tick_inline(machine);
 }
 
 void next_machine_exec_frame(NextMachine *machine)
@@ -2589,15 +2566,16 @@ static int next_ulanext_ink_bits(uint8_t mask)
     return mask == (uint8_t)((1u << bits) - 1u) && bits > 0 && bits < 8 ? bits : -1;
 }
 
-/* ULANext packs INKs from palette index 0 and PAPERs from index 128. */
+/* ULANext packs INKs from palette index 0 and PAPERs from index 128.
+   ink_bits is next_ulanext_ink_bits(NR$42). */
 static uint8_t next_ula_palette_entry(
-    const NextMachine *machine, uint8_t attribute, bool ink, bool *use_fallback)
+    const NextMachine *machine, uint8_t attribute, bool ink, int ink_bits,
+    bool *use_fallback)
 {
     *use_fallback = false;
     if ((machine->nextregs[NEXT_REG_PALETTE_CONTROL] & 0x01) != 0)
     {
         const uint8_t mask = machine->nextregs[0x42];
-        const int ink_bits = next_ulanext_ink_bits(mask);
         if (ink)
             return (uint8_t)(attribute & mask);
         if (ink_bits < 0)
@@ -2792,6 +2770,27 @@ static void next_render_scanline(NextMachine *machine, int y, int width)
     uint8_t sprite_present[NEXT_SPRITE_DISPLAY_WIDTH] = {0};
     int tm_width = 0;
     uint32_t *row = machine->framebuffer + (size_t)y * (size_t)width;
+    /* Registers and palettes only change between scanlines (the Copper runs
+       before each one), so per-line values are worked out once here. */
+    const int ulanext_ink_bits = next_ulanext_ink_bits(machine->nextregs[0x42]);
+    const bool classic_ula_lookup = !ula_next && !lores_enabled;
+    bool ula_standard[32];
+    NextMixerInput input;
+
+    if (classic_ula_lookup)
+    {
+        for (unsigned i = 0; i < 32; ++i)
+            ula_standard[i] = next_ula_entry_is_standard(
+                machine->hw_palette[ula_palette][i], (uint8_t)(i & 0x0F));
+    }
+    input.ula_enabled = ula_enabled;
+    input.tile_enabled = tile_enabled;
+    input.tile_textmode = tile_textmode;
+    input.transparency = machine->nextregs[NEXT_REG_GLOBAL_TRANSPARENCY];
+    input.fallback = machine->nextregs[0x4A];
+    input.blend_mode = (machine->nextregs[0x68] >> 5) & 3;
+    input.priority = (machine->nextregs[0x15] >> 2) & 7;
+    input.stencil_mode = (machine->nextregs[0x68] & 1) != 0;
 
     if (tile_enabled)
         tm_width = next_render_tilemap_scanline(machine, y, tm_indices,
@@ -2821,7 +2820,6 @@ static void next_render_scanline(NextMachine *machine, int y, int width)
         bool sprite_enabled = false;
         bool ula_clipped = false;
         bool classic_ula_output = false;
-        NextMixerInput input;
 
         if (!border)
         {
@@ -2843,7 +2841,8 @@ static void next_render_scanline(NextMachine *machine, int y, int width)
                 const uint8_t bits = next_ula_screen_read(machine, shadow,
                                                           ((column & 1) != 0 ? 0x2000 : 0) + bitmap_row + (column >> 1));
                 ink = (bits & (0x80 >> (hx & 7))) != 0;
-                ula_index = next_ula_palette_entry(machine, hires_attr, ink, &ula_fallback);
+                ula_index = next_ula_palette_entry(machine, hires_attr, ink,
+                                                   ulanext_ink_bits, &ula_fallback);
             }
             else
             {
@@ -2861,7 +2860,8 @@ static void next_render_scanline(NextMachine *machine, int y, int width)
                 /* In ULANext mode bit 7 belongs to INK/PAPER, not FLASH. */
                 if (!ula_next && (attr & 0x80) != 0 && (machine->frame_count & 16) != 0)
                     ink = !ink;
-                ula_index = next_ula_palette_entry(machine, attr, ink, &ula_fallback);
+                ula_index = next_ula_palette_entry(machine, attr, ink,
+                                                   ulanext_ink_bits, &ula_fallback);
             }
         }
         if (tile_enabled)
@@ -2889,47 +2889,37 @@ static void next_render_scanline(NextMachine *machine, int y, int width)
                 machine, lx, ly, &l2_index, &l2_priority);
         }
 
-        memset(&input, 0, sizeof(input));
         if (ula_next && border && !lores_enabled)
         {
             /* The border takes the PAPER colour of the same value. */
-            const int ink_bits = next_ulanext_ink_bits(machine->nextregs[0x42]);
-            ula_fallback = ink_bits < 0;
+            ula_fallback = ulanext_ink_bits < 0;
             ula_index = (uint8_t)(0x80 + (ula_fallback ? 0 : (machine->border_color & 7)));
         }
         input.ula_rgb = ula_fallback
                             ? next_fallback_color(machine->nextregs[0x4A])
                             : machine->hw_palette[ula_palette][ula_index];
-        if (!ula_fallback && !ula_next && !lores_enabled)
+        if (!ula_fallback && classic_ula_lookup)
         {
             /* The standard ULA looks up INKs at 0-15 and PAPERs (and the
                border) at 16-31. Transparency follows the real entry, while
                standard colours keep the classic Spectrum RGB on screen. */
             const uint8_t palette_index = (uint8_t)((ink ? 0 : 16) + (ula_index & 0x0F));
             input.ula_rgb = machine->hw_palette[ula_palette][palette_index];
-            ula_standard_colour = next_ula_entry_is_standard(input.ula_rgb, ula_index & 0x0F);
+            ula_standard_colour = ula_standard[palette_index];
         }
         input.tile_rgb = machine->hw_palette[tile_palette][tile_index];
         input.sprite_rgb = machine->hw_palette[sprite_palette][sprite_index];
         input.layer2_rgb = machine->hw_palette[layer2_palette][l2_index];
-        input.ula_enabled = ula_enabled;
         input.ula_clipped = ula_clipped;
         input.ula_classic_palette = ula_standard_colour;
         input.border = border;
-        input.tile_enabled = tile_enabled;
         input.tile_pixel_enabled = tile_pixel_enabled;
-        input.tile_textmode = tile_textmode;
         input.tile_below = tile_enabled && tm_width > 0 &&
                            tm_below[tm_width == 640 ? (width == 640 ? fb_x : fb_x * 2) : (width == 640 ? fb_x >> 1 : fb_x)] != 0;
         input.sprite_enabled = sprite_enabled;
         input.layer2_enabled = layer2_enabled;
         /* Only palette entries with the priority bit set (NR$44) are priority. */
         input.layer2_priority = l2_priority;
-        input.transparency = machine->nextregs[NEXT_REG_GLOBAL_TRANSPARENCY];
-        input.fallback = machine->nextregs[0x4A];
-        input.blend_mode = (machine->nextregs[0x68] >> 5) & 3;
-        input.priority = (machine->nextregs[0x15] >> 2) & 7;
-        input.stencil_mode = (machine->nextregs[0x68] & 1) != 0;
         if (!tile_enabled && !sprite_enabled && !layer2_enabled &&
             ula_standard_colour && ula_enabled && !ula_clipped &&
             (uint8_t)(input.ula_rgb >> 1) != input.transparency)
@@ -3084,7 +3074,6 @@ bool next_machine_load_nex_data(
     if (has_palette)
     {
         memcpy(machine->palette, data + NEXT_NEX_HEADER_SIZE, NEXT_NEX_PALETTE_SIZE);
-        machine->palette_loaded = true;
         for (unsigned index = 0; index < 256; ++index)
         {
             machine->hw_palette[1][index] = (uint16_t)(((uint16_t)machine->palette[index * 2] << 1) |
@@ -3111,7 +3100,6 @@ bool next_machine_load_nex_data(
             next_copper_set_write_ptr_high_and_mode(
                 &machine->copper_state,
                 (uint8_t)(NEXT_COPPER_START_ON_VBL << 6));
-            machine->copper_loaded = true;
         }
     }
 
@@ -3323,114 +3311,3 @@ bool next_machine_load_snx_data(
     return true;
 }
 
-/* Writes one 16K NEX bank into the unified physical RAM pool. */
-static void next_store_pool_bank(
-    NextMachine *machine, unsigned bank, const uint8_t *data)
-{
-    const uint8_t lower = (uint8_t)(bank * 2);
-    const uint8_t upper = (uint8_t)(bank * 2 + 1);
-
-    memcpy(next_runtime_ram_page(machine, lower), data, NEXT_MMU_SLOT_SIZE);
-    memcpy(next_runtime_ram_page(machine, upper),
-           data + NEXT_MMU_SLOT_SIZE, NEXT_MMU_SLOT_SIZE);
-}
-
-bool next_machine_load_nex_direct(
-    NextMachine *machine,
-    const uint8_t *data,
-    size_t data_size,
-    NextNexLoadResult *result,
-    char *error_buffer,
-    size_t error_buffer_size)
-{
-    NextNexVersion version;
-    bool has_palette;
-    bool has_copper;
-    size_t screen_size;
-    size_t offset = NEXT_NEX_HEADER_SIZE;
-    unsigned bank_count;
-    unsigned loaded = 0;
-
-    if (machine == NULL || !machine->initialized || machine->ram == NULL ||
-        data == NULL || result == NULL)
-    {
-        next_set_error(error_buffer, error_buffer_size, "Invalid NEX load request.");
-        return false;
-    }
-    if (data_size < NEXT_NEX_HEADER_SIZE || memcmp(data, "Next", 4) != 0)
-    {
-        next_set_error(error_buffer, error_buffer_size, "Not a valid NEX file.");
-        return false;
-    }
-    if (!next_nex_version(data, &version))
-    {
-        next_set_error(error_buffer, error_buffer_size, "Unsupported NEX version.");
-        return false;
-    }
-
-    bank_count = next_nex_flagged_bank_count(data);
-    screen_size = next_nex_screen_size(data, version, &has_palette, &has_copper);
-    if (has_palette && !next_add_size(&offset, NEXT_NEX_PALETTE_SIZE, data_size))
-    {
-        next_set_error(error_buffer, error_buffer_size, "Truncated NEX palette.");
-        return false;
-    }
-    if (!next_add_size(&offset, screen_size, data_size))
-    {
-        next_set_error(error_buffer, error_buffer_size, "Truncated NEX loading screen.");
-        return false;
-    }
-    if (has_copper && !next_add_size(&offset, NEXT_COPPER_SIZE, data_size))
-    {
-        next_set_error(error_buffer, error_buffer_size, "Truncated NEX copper program.");
-        return false;
-    }
-    if ((size_t)bank_count * NEXT_NEX_BANK_SIZE > data_size - offset)
-    {
-        next_set_error(error_buffer, error_buffer_size, "Truncated NEX bank data.");
-        return false;
-    }
-
-    {
-        static const uint8_t first_banks[] = {5, 2, 0, 1, 3, 4};
-        for (unsigned order = 0; order < NEXT_NEX_BANK_COUNT; ++order)
-        {
-            const unsigned bank = order < sizeof(first_banks)
-                                      ? first_banks[order]
-                                      : order;
-            if (data[18 + bank] == 0)
-                continue;
-            next_store_pool_bank(
-                machine, bank,
-                data + offset + (size_t)loaded * NEXT_NEX_BANK_SIZE);
-            ++loaded;
-        }
-    }
-
-    machine->initial_sp = next_read_u16(data + 12);
-    machine->initial_pc = next_read_u16(data + 14);
-    machine->cpu_pins = z80_reset(&machine->cpu);
-    machine->cpu.sp = machine->initial_sp;
-    machine->cpu_pins = z80_prefetch(&machine->cpu, machine->initial_pc);
-
-    /* The entry bank is paged at 0xC000 through the classic 7FFD port. */
-    {
-        const uint8_t entry = (uint8_t)(data[139] & 0x07);
-        machine->port_7ffd = (uint8_t)((machine->port_7ffd & 0xF8) | entry);
-        next_set_legacy_mmu_page(machine, 6, (uint8_t)(entry * 2));
-        next_set_legacy_mmu_page(machine, 7, (uint8_t)(entry * 2 + 1));
-    }
-
-    memset(result, 0, sizeof(*result));
-    result->version = version;
-    result->stack_pointer = machine->initial_sp;
-    result->program_counter = machine->initial_pc;
-    result->file_handle_address = next_read_u16(data + 140);
-    result->entry_bank = data[139];
-    result->border_color = data[11] & 0x07;
-    result->banks_loaded = (uint8_t)loaded;
-    result->preserve_nextregs = data[134] != 0;
-    result->runnable = machine->initial_pc != 0;
-    result->appended_data_offset = offset + (size_t)loaded * NEXT_NEX_BANK_SIZE;
-    return true;
-}

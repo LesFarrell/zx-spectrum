@@ -176,11 +176,6 @@ void next_rtc_init(NextRtc *rtc)
     rtc->century = false;
 }
 
-bool next_rtc_read_scl(const NextRtc *rtc)
-{
-    return rtc->scl;
-}
-
 bool next_rtc_read_sda(const NextRtc *rtc)
 {
     return rtc->sda_master && rtc->sda_slave;

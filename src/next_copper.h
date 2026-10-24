@@ -43,7 +43,6 @@ typedef struct NextCopper {
     uint16_t pc;
     bool stopped;
     uint16_t last_scanline;
-    bool wrote;
 } NextCopper;
 
 void next_copper_init(NextCopper *copper);
@@ -59,6 +58,5 @@ int next_copper_step(
     uint16_t hcount,
     int max_clocks
 );
-NextCopperInstruction next_copper_decode(uint16_t word);
 
 #endif

@@ -304,10 +304,6 @@ void next_dma_step(NextMachine *machine, uint64_t now) {
     }
 }
 
-bool next_dma_holds_cpu(const NextDma *dma) {
-    return dma->active_burst && dma->hold_cpu;
-}
-
 uint64_t next_dma_take_charge(NextDma *dma) {
     uint64_t charge = dma->pending_charge;
     dma->pending_charge = 0;

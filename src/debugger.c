@@ -1668,7 +1668,6 @@ static void app_debug_callback(void *user_data, uint64_t pins) {
     if (app == NULL) {
         return;
     }
-    app->debug.last_pins = pins;
     /* Spectrum contention holds the Z80 clock while the system timing keeps
        advancing.  The system hook still runs on those outer ticks, but the
        CPU and its bus state have not advanced, so they must not be mistaken

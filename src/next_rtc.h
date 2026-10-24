@@ -47,7 +47,6 @@ typedef struct
 } NextRtc;
 
 void next_rtc_init(NextRtc *rtc);
-bool next_rtc_read_scl(const NextRtc *rtc);
 bool next_rtc_read_sda(const NextRtc *rtc);
 void next_rtc_write_scl(NextRtc *rtc, bool bit);
 void next_rtc_write_sda(NextRtc *rtc, bool bit);

@@ -113,7 +113,6 @@ typedef struct NextMachine {
     uint8_t multiface_mem[NEXT_MULTIFACE_SIZE];
     uint8_t loader_rom[NEXT_BOOT_ROM_SIZE];
     bool rom_loaded;
-    bool divmmc_rom_loaded;
     bool loader_rom_loaded;
     bool loader_active;
     bool config_mode;
@@ -141,7 +140,6 @@ typedef struct NextMachine {
     uint8_t port_1ffd;
     uint8_t port_dffd;
     uint8_t timex_video_mode;
-    uint8_t mmu_override_mask;
     bool paging_locked;
     uint8_t layer2_control;
     uint8_t layer2_map_control;
@@ -155,8 +153,6 @@ typedef struct NextMachine {
     uint8_t palette_latch;
     bool palette_second_write;
     uint8_t copper[NEXT_COPPER_SIZE];
-    bool palette_loaded;
-    bool copper_loaded;
     uint8_t sprite_clip[4];
     uint8_t sprite_clip_index;
     uint8_t layer2_clip[4];
@@ -224,8 +220,6 @@ uint8_t next_machine_read_nextreg(const NextMachine *machine, uint8_t reg);
 void next_machine_write_nextreg(NextMachine *machine, uint8_t reg, uint8_t value);
 uint8_t next_machine_read_port(NextMachine *machine, uint16_t port);
 void next_machine_write_port(NextMachine *machine, uint16_t port, uint8_t value);
-uint64_t next_machine_tick(NextMachine *machine);
-void next_machine_exec_ticks(NextMachine *machine, uint32_t ticks);
 void next_machine_exec_frame(NextMachine *machine);
 void next_machine_render_frame(NextMachine *machine);
 void next_machine_key_down(NextMachine *machine, int key_code);
@@ -245,19 +239,6 @@ bool next_machine_load_snx_data(
     NextMachine *machine,
     const uint8_t *data,
     size_t data_size,
-    char *error_buffer,
-    size_t error_buffer_size
-);
-
-/* Loads a NEX the way the reference harness does: the banks are copied
-   straight into the memory pool, SP/PC come from the header and the entry
-   bank is paged at 0xC000. No reset, palette, Copper or loading screen is
-   applied, so the machine keeps the state it already had. */
-bool next_machine_load_nex_direct(
-    NextMachine *machine,
-    const uint8_t *data,
-    size_t data_size,
-    NextNexLoadResult *result,
     char *error_buffer,
     size_t error_buffer_size
 );

@@ -437,7 +437,6 @@ typedef struct DebugState
     size_t point_capacity;
     char hit_text[160];
     char pending_text[128];
-    uint64_t last_pins;
 } DebugState;
 
 typedef struct AssemblerLabel

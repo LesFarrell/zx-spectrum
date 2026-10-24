@@ -82,6 +82,5 @@ void next_dma_write_command(struct NextMachine *machine, uint8_t value);
 uint8_t next_dma_read_command(struct NextMachine *machine);
 void next_dma_step(struct NextMachine *machine, uint64_t now);
 uint64_t next_dma_take_charge(NextDma *dma);
-bool next_dma_holds_cpu(const NextDma *dma);
 
 #endif

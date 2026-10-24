@@ -23,8 +23,6 @@ typedef struct NextSdCard {
     uint8_t command[6];
     unsigned command_length;
     uint64_t command_count;
-    uint8_t last_command;
-    uint32_t last_argument;
     uint8_t response[NEXT_SD_RESPONSE_CAPACITY];
     size_t response_read;
     size_t response_write;
@@ -47,7 +45,6 @@ bool next_sd_open_image(
     char *error_buffer,
     size_t error_buffer_size
 );
-void next_sd_set_high_capacity(NextSdCard *card, bool enabled);
 void next_sd_write_chip_select(NextSdCard *card, uint8_t value);
 void next_sd_write_data(NextSdCard *card, uint8_t value);
 uint8_t next_sd_read_data(NextSdCard *card);

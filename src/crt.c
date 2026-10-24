@@ -31,18 +31,14 @@ static const uint32_t *app_crt_apply_effects(AppState *app) {
             ? app->next.framebuffer
             : app->spec.framebuffer,
         count * sizeof(uint32_t));
-    for (int y = 0; y < ZX_SCREEN_HEIGHT; ++y) {
+    /* Only the even lines are dimmed; the odd ones stay as copied. */
+    for (int y = 0; y < ZX_SCREEN_HEIGHT; y += 2) {
         for (int x = 0; x < width; ++x) {
             const size_t index = (size_t)y * (size_t)width + (size_t)x;
             const uint32_t color = app->crt_framebuffer[index];
-            uint8_t r = (uint8_t)((color >> 16) & 0xFFu);
-            uint8_t g = (uint8_t)((color >> 8) & 0xFFu);
-            uint8_t b = (uint8_t)(color & 0xFFu);
-            if ((y & 1) == 0) {
-                r = app_crt_dim(r);
-                g = app_crt_dim(g);
-                b = app_crt_dim(b);
-            }
+            const uint8_t r = app_crt_dim((uint8_t)((color >> 16) & 0xFFu));
+            const uint8_t g = app_crt_dim((uint8_t)((color >> 8) & 0xFFu));
+            const uint8_t b = app_crt_dim((uint8_t)(color & 0xFFu));
             app->crt_framebuffer[index] = app_crt_pack(color, r, g, b);
         }
     }

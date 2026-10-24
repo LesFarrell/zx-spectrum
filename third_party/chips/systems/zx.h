@@ -299,7 +299,6 @@ typedef struct {
     zx_microdrive_write_callback_t microdrive_write;
     void *microdrive_user_data;
     uint8_t interface1_comms_clock;
-    uint8_t interface1_comms_data;
     struct {
         uint32_t head_pos;
         uint16_t transferred;
@@ -813,6 +812,10 @@ static bool _zx_decode_scanline(zx_t* sys) {
             }
         }
         sys->ulaplus_scanline_enabled[y] = resolved_color_line;
+        /* Without ULAplus on this line every pixel is its standard index, so
+           the per-pixel palette event handling below can be skipped. */
+        const bool plain_line =
+            !resolved_color_line && sys->ulaplus_line_event_count == 0;
 
 #define _ZX_APPLY_ULAPLUS_EVENTS(tstate_) do { \
             while ((event_index < sys->ulaplus_line_event_count) && \
@@ -838,7 +841,10 @@ static bool _zx_decode_scanline(zx_t* sys) {
                     : _zx_ulaplus_default_palette[(std_index_) & 0x0F]) \
                 : (std_index_))
 
-        if ((y < 32) || (y >= 224)) {
+        if (plain_line && ((y < 32) || (y >= 224))) {
+            memset(dst, border_standard, (size_t)display_width);
+        }
+        else if ((y < 32) || (y >= 224)) {
             // upper/lower border
             for (int x = 0; x < display_width; x++) {
                 /* The cropped display begins eight t-states into the
@@ -856,10 +862,16 @@ static bool _zx_decode_scanline(zx_t* sys) {
                 ((yy & 0xC0) << 5) | ((yy & 0x07) << 8) | ((yy & 0x38) << 2));
 
             // left border
-            for (int x = 0; x < border_width; x++) {
-                _ZX_APPLY_ULAPLUS_EVENTS(
-                    (uint16_t)(8 + (hires ? (x >> 2) : (x >> 1))));
-                *dst++ = _ZX_RESOLVE_PIXEL(border_standard, border_ulaplus);
+            if (plain_line) {
+                memset(dst, border_standard, (size_t)border_width);
+                dst += border_width;
+            }
+            else {
+                for (int x = 0; x < border_width; x++) {
+                    _ZX_APPLY_ULAPLUS_EVENTS(
+                        (uint16_t)(8 + (hires ? (x >> 2) : (x >> 1))));
+                    *dst++ = _ZX_RESOLVE_PIXEL(border_standard, border_ulaplus);
+                }
             }
 
             if (hires) {
@@ -909,6 +921,12 @@ static bool _zx_decode_scanline(zx_t* sys) {
                     std_fg |= (clr & (1 << 6)) >> 3;
                     std_bg |= (clr & (1 << 6)) >> 3;
 
+                    if (plain_line) {
+                        for (int px = 7; px >= 0; px--) {
+                            *dst++ = (pix & (1 << px)) ? std_fg : std_bg;
+                        }
+                        continue;
+                    }
                     for (int px = 7; px >= 0; px--) {
                         const uint16_t screen_x = (uint16_t)((x * 8) + (7 - px));
                         _ZX_APPLY_ULAPLUS_EVENTS((uint16_t)(24 + (screen_x >> 1)));
@@ -920,10 +938,16 @@ static bool _zx_decode_scanline(zx_t* sys) {
             }
 
             // right border
-            for (int x = 0; x < border_width; x++) {
-                _ZX_APPLY_ULAPLUS_EVENTS(
-                    (uint16_t)(152 + (hires ? (x >> 2) : (x >> 1))));
-                *dst++ = _ZX_RESOLVE_PIXEL(border_standard, border_ulaplus);
+            if (plain_line) {
+                memset(dst, border_standard, (size_t)border_width);
+                dst += border_width;
+            }
+            else {
+                for (int x = 0; x < border_width; x++) {
+                    _ZX_APPLY_ULAPLUS_EVENTS(
+                        (uint16_t)(152 + (hires ? (x >> 2) : (x >> 1))));
+                    *dst++ = _ZX_RESOLVE_PIXEL(border_standard, border_ulaplus);
+                }
             }
         }
 
@@ -1735,7 +1759,6 @@ static void _zx_microdrives_restart(zx_t* sys) {
 static void _zx_interface1_reset(zx_t* sys) {
     sys->interface1_paged = false;
     sys->interface1_comms_clock = 0;
-    sys->interface1_comms_data = 0;
     memset(sys->microdrive, 0, sizeof(sys->microdrive));
     for (uint8_t drive = 0; drive < ZX_MICRODRIVE_COUNT; ++drive) {
         sys->microdrive[drive].last = 0xFF;
@@ -1860,7 +1883,6 @@ static void _zx_interface1_control_out(zx_t* sys, uint8_t value) {
         }
         sys->microdrive[0].motor_on = (value & 1) == 0;
     }
-    sys->interface1_comms_data = value & 1;
     sys->interface1_comms_clock = new_clock;
     _zx_microdrives_restart(sys);
 }
@@ -2065,7 +2087,7 @@ static uint8_t _zx_multiface_page_out_port(const zx_t* sys) {
     return 0xBF;
 }
 
-static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
+static inline __attribute__((always_inline)) uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
     bool new_frame = false;
     bool cpu_stalled = false;
     const bool io_cycle =
@@ -2337,8 +2359,10 @@ static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
     }
 
     // tick the AY at half frequency, use the buffered chip select
-    // pin mask so that the AY doesn't miss any IO requests
-    if (++sys->tick_count & 1) {
+    // pin mask so that the AY doesn't miss any IO requests. A stock 48K has
+    // no AY: unless the Fuller Box supplies one it stays silent and idle.
+    if ((++sys->tick_count & 1) &&
+        (sys->type != ZX_TYPE_48K || sys->fuller_audio_enabled)) {
         ay38910_tick(&sys->ay);
     }
 

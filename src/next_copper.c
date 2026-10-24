@@ -2,7 +2,7 @@
 
 #include "next_machine.h"
 
-NextCopperInstruction next_copper_decode(uint16_t word)
+static NextCopperInstruction next_copper_decode(uint16_t word)
 {
     NextCopperInstruction inst;
     inst.op = NEXT_COPPER_OP_NOOP;
@@ -51,7 +51,6 @@ void next_copper_reset(NextCopper *copper)
     copper->pc = 0;
     copper->stopped = true;
     copper->last_scanline = 0;
-    copper->wrote = false;
 }
 
 void next_copper_write_data(NextCopper *copper, uint8_t value)
@@ -105,7 +104,6 @@ int next_copper_step(
     int max_clocks)
 {
     int spent = 0;
-    copper->wrote = false;
     if (copper->mode == NEXT_COPPER_START_ON_VBL && scanline < copper->last_scanline)
     {
         copper->pc = 0;
@@ -130,7 +128,6 @@ int next_copper_step(
             switch (inst.op)
             {
             case NEXT_COPPER_OP_MOVE:
-                copper->wrote = true;
                 next_machine_write_nextreg(machine, inst.reg, inst.value);
                 copper->pc++;
                 spent += 2;

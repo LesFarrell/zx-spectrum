@@ -213,8 +213,6 @@ static void next_sd_dispatch(NextSdCard *card)
                               ((uint32_t)card->command[3] << 8) |
                               card->command[4];
     ++card->command_count;
-    card->last_command = command;
-    card->last_argument = argument;
     if (card->app_command)
     {
         next_sd_dispatch_app(card, command);
@@ -372,11 +370,6 @@ bool next_sd_open_image(
     card->writable = writable;
     card->idle = true;
     return true;
-}
-
-void next_sd_set_high_capacity(NextSdCard *card, bool enabled)
-{
-    card->high_capacity = enabled;
 }
 
 void next_sd_write_chip_select(NextSdCard *card, uint8_t value)
