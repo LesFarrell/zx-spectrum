@@ -14,6 +14,8 @@ typedef enum TapeStopMode {
 typedef struct TapeSegment {
     uint32_t duration_ticks;
     bool level_high;
+    /* True for an explicit TAP/TZX/PZX inter-block pause rather than data. */
+    bool is_pause;
     TapeStopMode stop_after;
 } TapeSegment;
 
@@ -90,6 +92,9 @@ void tape_set_stop_mode(TapePlayer *player, bool stop_in_48k_mode);
 void tape_start(TapePlayer *player, uint64_t tick_count);
 void tape_stop(TapePlayer *player);
 bool tape_input_level(TapePlayer *player, uint64_t tick_count);
+/* Synchronizes playback and reports whether the current waveform segment is
+   an explicit tape pause that must remain tied to real time. */
+bool tape_is_in_pause(TapePlayer *player, uint64_t tick_count);
 bool tape_has_tape(const TapePlayer *player);
 TapeAutoloadTarget tape_autoload_target(const TapePlayer *player);
 bool tape_try_fast_load(TapePlayer *player, void *machine);

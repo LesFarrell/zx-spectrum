@@ -56,6 +56,7 @@ typedef struct Spectrum {
     void *microdrive_user_data;
     zx_joystick_type_t joystick_type;
     bool kempston_mouse_enabled;
+    bool amx_mouse_enabled;
     bool fuller_audio_enabled;
     bool specdrum_enabled;
     bool covox_enabled;
@@ -178,7 +179,9 @@ void spectrum_set_joystick_type(Spectrum *spec, zx_joystick_type_t type);
 void spectrum_set_joystick_mask(Spectrum *spec, uint8_t mask);
 
 void spectrum_set_kempston_mouse_enabled(Spectrum *spec, bool enabled);
+void spectrum_set_amx_mouse_enabled(Spectrum *spec, bool enabled);
 void spectrum_set_mouse(Spectrum *spec, uint8_t x, uint8_t y, uint8_t buttons);
+void spectrum_move_amx_mouse(Spectrum *spec, int delta_x, int delta_y);
 void spectrum_set_expansion_audio(
     Spectrum *spec,
     bool fuller_audio,

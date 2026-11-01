@@ -1,0 +1,13 @@
+48K boot                     frames    600    1444.2 ms   2407.0 us/frame     8.3x realtime  hash 074b479fdbed0f2a
+128K boot                    frames    600    1308.3 ms   2180.6 us/frame     9.2x realtime  hash fa3986fb8e4e0a3f
++2A boot                     frames    600    1221.0 ms   2035.0 us/frame     9.8x realtime  hash e7f867ebdefee8a9
++3 boot + CRT                frames    600    1340.0 ms   2233.3 us/frame     9.0x realtime  hash 25819360cd02d8f4
+48K Manic Miner.tap          frames   1500    3164.2 ms   2109.5 us/frame     9.5x realtime  hash 065b7a570b0c8ea8
+48K Manic Miner.tzx          frames   1500    3045.8 ms   2030.5 us/frame     9.8x realtime  hash 0a443e3c0b7a5b2f
+128K Rainbow Islands.tzx     frames   1909    4596.7 ms   2407.9 us/frame     8.3x realtime  hash ccce8bc6cee9c9be
+48K darkfus.tzx              frames   1963    4279.7 ms   2180.2 us/frame     9.2x realtime  hash 3a213708ee7ed84d
++3 Gauntlet.dsk              frames   3000    6380.3 ms   2126.8 us/frame     9.4x realtime  hash b60b635e49ae862d
+Next boot                    frames   1500   22574.8 ms  15049.8 us/frame     1.3x realtime  hash 3a0a47f82307c5f7  NONDETERMINISTIC
+Next Bloaters.nex            frames   1500   22795.7 ms  15197.1 us/frame     1.3x realtime  hash 1646a7be905f5d98
+Next hott.nex                frames   1500   23210.9 ms  15473.9 us/frame     1.3x realtime  hash d70ea0d3a11d0c26
+Next lom.nex                 frames   1500   23042.1 ms  15361.4 us/frame     1.3x realtime  hash d12cf7b3128447a8  NONDETERMINISTIC

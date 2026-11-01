@@ -10,11 +10,11 @@ Run commands from the repository root in PowerShell:
 
 ```powershell
 .\src\build.bat
-.\bin\zx-spectrum.exe
+.\redist\zx-spectrum.exe
 git diff --check
 ```
 
-`build.bat` compiles resources with `zig rc`, builds with `zig cc -std=c11 -O2 -Wall -Wextra`, and writes the self-contained output to `bin/` at the repository root: `zx-spectrum.exe`, `Scintilla.dll`, and a copy of the ROMs in `bin/roms/`. The executable expects ROMs in `bin/roms/` unless ROM paths are supplied on the command line. `bin/` is generated output and is not committed. There is currently no committed automated test suite; a warning-free build is the minimum validation.
+`build.bat` runs `premake5 vs2022`, locates MSBuild with Visual Studio's `vswhere.exe`, and builds the 64-bit Release configuration with MSVC. The generated solution is `build/msvc/zx-spectrum.sln`. The build uses the static MSVC runtime and writes the self-contained output to `redist/` at the repository root: `zx-spectrum.exe`, `Scintilla.dll`, and a copy of the ROMs in `redist/roms/`. The executable expects ROMs in `redist/roms/` unless ROM paths are supplied on the command line. `redist/` and `build/` are generated output and are not committed. There is currently no committed automated test suite; a warning-free build is the minimum validation.
 
 ## Coding Style & Naming Conventions
 

@@ -289,7 +289,7 @@ bool zip_extract_entry(
         snprintf(error_buffer, error_buffer_size, "Encrypted ZIP entries are not supported: %s", entry->name);
         return false;
     }
-    if ((entry->flags & (uint16_t)~0x080Eu) != 0) {
+    if ((entry->flags & UINT16_C(0xF7F1)) != 0) {
         snprintf(error_buffer, error_buffer_size, "Unsupported ZIP entry flags for %s.", entry->name);
         return false;
     }

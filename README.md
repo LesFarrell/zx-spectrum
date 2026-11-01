@@ -1,6 +1,8 @@
 # ZX Spectrum Emulator
 
-Small ZX Spectrum emulator in C for Windows. It uses the Win32 API for display, input, and audio, and currently builds with `zig rc` and `zig cc`.
+Small ZX Spectrum emulator in C for Windows. It uses the Win32 API for display,
+input, and audio, and builds with MSVC through a Premake-generated Visual
+Studio solution.
 
 It emulates the 48K, 128K, +2, +2A, and +3 Sinclair models and the ZX
 Spectrum Next, and includes a debugger, an assembler, and a poke tool.
@@ -37,7 +39,8 @@ Spectrum Next, and includes a debugger, an assembler, and a poke tool.
   interfaces for keyboard and XInput-compatible controller input, plus the
   active-low Fuller joystick interface on port `0x7F`
 - Configurable keyboard joystick presets: cursor keys, WASD, or QAOP
-- Optional Kempston mouse using the host mouse over the emulator display
+- Selectable Kempston or interrupt-driven AMX mouse using the host mouse over
+  the emulator display
 - 48K beeper sound through the Windows audio device
 - 128K AY sound through the Windows audio device
 - Optional Fuller Audio Box AY on 48K machines, SpecDrum DAC on port `0xDF`,
@@ -96,24 +99,32 @@ Next model's limitations.
 
 ## Build
 
+Install Visual Studio with the **Desktop development with C++** workload and
+put `premake5.exe` on `PATH`. Then run:
+
 ```powershell
 .\src\build.bat
 ```
 
-The build writes the self-contained output to `.\bin`: `zx-spectrum.exe`,
-`Scintilla.dll`, and a copy of the ROMs in `.\bin\roms`.
+The script runs `premake5 vs2022`, locates MSBuild through Visual Studio's
+`vswhere.exe`, and builds the 64-bit Release configuration with MSVC. The
+generated solution is `build\msvc\zx-spectrum.sln`.
+
+The build uses the static MSVC runtime and writes the self-contained output to
+`.\redist`: `zx-spectrum.exe`, `Scintilla.dll`, and a copy of the ROMs in
+`.\redist\roms`.
 
 ## Run
 
 With no arguments, the emulator looks for `plus3.rom`, `plus2a.rom`,
-`plus2.rom`, `128.rom`, and `48.rom` in `.\bin\roms`. It enables Interface 1 on
+`plus2.rom`, `128.rom`, and `48.rom` in `.\redist\roms`. It enables Interface 1 on
 48K/128K/+2 machines when `Interface1-v2.rom` is present there. When dedicated +2
 or +2A ROMs are absent, the 128K or +3 ROM set is used as a compatible
 fallback. It restores the last selected model when its ROM is available, or the ZX
 Spectrum Next if that was in use and NextZXOS is installed.
 
 The ZX Spectrum Next needs the NextZXOS emulator package unpacked into
-`.\bin\nextzxos`; see [docs/spectrum-next.md](docs/spectrum-next.md#setting-up-nextzxos).
+`.\redist\nextzxos`; see [docs/spectrum-next.md](docs/spectrum-next.md#setting-up-nextzxos).
 
 Optional Multiface ROMs are discovered in the same folder as
 `multiface1.rom`, `multiface128.rom`, and `multiface3.rom`. The matching image
@@ -121,43 +132,43 @@ must be exactly 8 KB; enable it from the Machine menu before pressing its NMI
 button.
 
 ```powershell
-.\bin\zx-spectrum.exe
+.\redist\zx-spectrum.exe
 ```
 
 48K:
 
 ```powershell
-.\bin\zx-spectrum.exe --48 path\to\48k.rom
+.\redist\zx-spectrum.exe --48 path\to\48k.rom
 ```
 
 128K with two 16 KB ROMs:
 
 ```powershell
-.\bin\zx-spectrum.exe --128 path\to\128-0.rom path\to\128-1.rom
+.\redist\zx-spectrum.exe --128 path\to\128-0.rom path\to\128-1.rom
 ```
 
 128K with one combined 32 KB ROM:
 
 ```powershell
-.\bin\zx-spectrum.exe --128 path\to\128k-combined.rom
+.\redist\zx-spectrum.exe --128 path\to\128k-combined.rom
 ```
 
 Spectrum +2 with one combined 32 KB ROM:
 
 ```powershell
-.\bin\zx-spectrum.exe --plus2 path\to\plus2.rom
+.\redist\zx-spectrum.exe --plus2 path\to\plus2.rom
 ```
 
 Spectrum +2A with one combined 64 KB ROM:
 
 ```powershell
-.\bin\zx-spectrum.exe --plus2a path\to\plus2a.rom
+.\redist\zx-spectrum.exe --plus2a path\to\plus2a.rom
 ```
 
 Spectrum +3 with one combined 64 KB ROM:
 
 ```powershell
-.\bin\zx-spectrum.exe --plus3 path\to\plus3.rom
+.\redist\zx-spectrum.exe --plus3 path\to\plus3.rom
 ```
 
 ## Keyboard
@@ -171,7 +182,10 @@ Spectrum +3 with one combined 64 KB ROM:
 - `Input -> Joystick Interface` selects Kempston, Sinclair 1, Sinclair 2,
   Cursor/Protek/AGF, or Fuller; both keyboard presets and controllers use it
 - `Input -> Kempston Mouse` exposes host movement and three buttons through
-  ports `FBDF`, `FFDF`, and `FADF`; input selections are remembered
+  ports `FBDF`, `FFDF`, and `FADF`
+- `Input -> AMX Mouse` emulates the Z80 PIO data/control ports at `1F`, `3F`,
+  `5F`, and `7F`, plus active-low buttons at `DF`; Kempston and AMX mouse modes
+  are mutually exclusive, and the selected mode is remembered
 
 ## Controller
 

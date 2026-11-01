@@ -589,10 +589,10 @@ static inline uint8_t _z80_sz_flags(uint8_t val) {
 }
 
 static inline uint8_t _z80_szyxch_flags(uint8_t acc, uint8_t val, uint32_t res) {
-    return _z80_sz_flags(res) |
+    return (uint8_t)(_z80_sz_flags((uint8_t)res) |
         (res & (Z80_YF|Z80_XF)) |
         ((res >> 8) & Z80_CF) |
-        ((acc ^ val ^ res) & Z80_HF);
+        ((acc ^ val ^ res) & Z80_HF));
 }
 
 static inline uint8_t _z80_add_flags(uint8_t acc, uint8_t val, uint32_t res) {
@@ -604,12 +604,12 @@ static inline uint8_t _z80_sub_flags(uint8_t acc, uint8_t val, uint32_t res) {
 }
 
 static inline uint8_t _z80_cp_flags(uint8_t acc, uint8_t val, uint32_t res) {
-    return Z80_NF |
-        _z80_sz_flags(res) |
+    return (uint8_t)(Z80_NF |
+        _z80_sz_flags((uint8_t)res) |
         (val & (Z80_YF|Z80_XF)) |
         ((res >> 8) & Z80_CF) |
         ((acc ^ val ^ res) & Z80_HF) |
-        ((((val ^ acc) & (res ^ acc)) >> 5) & Z80_VF);
+        ((((val ^ acc) & (res ^ acc)) >> 5) & Z80_VF));
 }
 
 static inline uint8_t _z80_sziff2_flags(z80_t* cpu, uint8_t val) {
@@ -771,7 +771,7 @@ static inline void _z80_add16(z80_t* cpu, uint16_t val) {
     const uint16_t acc = cpu->hlx[cpu->hlx_idx].hl;
     cpu->wz = acc + 1;
     const uint32_t res = acc + val;
-    cpu->hlx[cpu->hlx_idx].hl = res;
+    cpu->hlx[cpu->hlx_idx].hl = (uint16_t)res;
     cpu->f = (cpu->f & (Z80_SF|Z80_ZF|Z80_VF)) |
              (((acc ^ res ^ val)>>8)&Z80_HF) |
              ((res >> 16) & Z80_CF) |
@@ -783,7 +783,7 @@ static inline void _z80_adc16(z80_t* cpu, uint16_t val) {
     const uint16_t acc = cpu->hl;
     cpu->wz = acc + 1;
     const uint32_t res = acc + val + (cpu->f & Z80_CF);
-    cpu->hl = res;
+    cpu->hl = (uint16_t)res;
     cpu->f = (((val ^ acc ^ 0x8000) & (val ^ res) & 0x8000) >> 13) |
              (((acc ^ res ^ val) >>8 ) & Z80_HF) |
              ((res >> 16) & Z80_CF) |
@@ -796,7 +796,7 @@ static inline void _z80_sbc16(z80_t* cpu, uint16_t val) {
     const uint16_t acc = cpu->hl;
     cpu->wz = acc + 1;
     const uint32_t res = acc - val - (cpu->f & Z80_CF);
-    cpu->hl = res;
+    cpu->hl = (uint16_t)res;
     cpu->f = (Z80_NF | (((val ^ acc) & (acc ^ res) & 0x8000) >> 13)) |
              (((acc ^ res ^ val) >> 8) & Z80_HF) |
              ((res >> 16) & Z80_CF) |
@@ -854,7 +854,7 @@ static inline bool _z80_ldi_ldd(z80_t* cpu, uint8_t val) {
 static inline bool _z80_cpi_cpd(z80_t* cpu, uint8_t val) {
     uint32_t res = (uint32_t) ((int)cpu->a - (int)val);
     cpu->bc -= 1;
-    uint8_t f = (cpu->f & Z80_CF)|Z80_NF|_z80_sz_flags(res);
+    uint8_t f = (cpu->f & Z80_CF)|Z80_NF|_z80_sz_flags((uint8_t)res);
     if ((res & 0xF) > ((uint32_t)cpu->a & 0xF)) {
         f |= Z80_HF;
         res--;

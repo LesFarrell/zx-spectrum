@@ -116,6 +116,7 @@ enum
     APP_MENU_INPUT_PROTOCOL_CURSOR = 1507,
     APP_MENU_INPUT_KEMPSTON_MOUSE = 1508,
     APP_MENU_INPUT_PROTOCOL_FULLER = 1509,
+    APP_MENU_INPUT_AMX_MOUSE = 1510,
     APP_MENU_RECENT_MEDIA_BASE = 1520,
     APP_MENU_RECENT_MEDIA_CLEAR = 1530,
     APP_CTRL_DEBUG_TEXT = 2001,
@@ -535,6 +536,7 @@ struct AppState
     KeyboardJoystickPreset keyboard_joystick_preset;
     zx_joystick_type_t joystick_type;
     bool kempston_mouse_enabled;
+    bool amx_mouse_enabled;
     bool fuller_audio_enabled;
     bool specdrum_enabled;
     bool covox_enabled;
@@ -1050,6 +1052,7 @@ static HMENU app_create_menu(void)
     AppendMenuA(joystick_interface_menu, MF_STRING, APP_MENU_INPUT_PROTOCOL_FULLER, "&Fuller");
     AppendMenuA(input_menu, MF_POPUP, (UINT_PTR)joystick_interface_menu, "Joystick &Interface");
     AppendMenuA(input_menu, MF_STRING, APP_MENU_INPUT_KEMPSTON_MOUSE, "Kempston &Mouse");
+    AppendMenuA(input_menu, MF_STRING, APP_MENU_INPUT_AMX_MOUSE, "&AMX Mouse");
     AppendMenuA(sound_menu, MF_STRING, APP_MENU_SOUND_MUTE, "&Mute Sound\tCtrl+M");
     AppendMenuA(sound_menu, MF_SEPARATOR, 0, NULL);
     AppendMenuA(sound_menu, MF_STRING, APP_MENU_SOUND_FULLER_AY, "Fuller &AY (48K)");
@@ -1372,6 +1375,11 @@ static void app_update_input_menu(HWND hwnd, const AppState *app)
         APP_MENU_INPUT_KEMPSTON_MOUSE,
         MF_BYCOMMAND |
             (app->kempston_mouse_enabled ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(
+        menu,
+        APP_MENU_INPUT_AMX_MOUSE,
+        MF_BYCOMMAND |
+            (app->amx_mouse_enabled ? MF_CHECKED : MF_UNCHECKED));
 }
 
 static void app_update_recent_menu(HWND hwnd, const AppState *app)
@@ -2463,6 +2471,17 @@ static void app_release_all_keys(AppState *app)
     app_apply_joystick_mask(app);
 }
 
+/* ROM loaders execute in the small entry ranges trapped by the core; custom
+   loaders execute from RAM. Other ROM reads are normally keyboard scanning
+   and must not keep fast tape playback alive while a program waits for input. */
+static bool app_tape_read_is_loader(const AppState *app)
+{
+    const uint16_t pc = app->spec.machine.cpu.pc;
+    return pc >= 0x4000u ||
+           (pc >= 0x0500u && pc < 0x0600u) ||
+           (pc >= 0x0100u && pc < 0x0130u);
+}
+
 /* Samples the inserted tape image at the current emulated t-state so ULA
    reads can see the waveform on EAR bit 6. */
 static bool app_tape_input_callback(void *user_data, uint64_t tick_count)
@@ -2474,10 +2493,13 @@ static bool app_tape_input_callback(void *user_data, uint64_t tick_count)
     }
     if (app->tape.playing)
     {
-        app->tape_input_seen = true;
-        if (app->tape_input_reads_this_frame < UINT32_MAX)
+        if (app_tape_read_is_loader(app))
         {
-            app->tape_input_reads_this_frame++;
+            app->tape_input_seen = true;
+            if (app->tape_input_reads_this_frame < UINT32_MAX)
+            {
+                app->tape_input_reads_this_frame++;
+            }
         }
     }
     return tape_input_level(&app->tape, tick_count);
@@ -2494,6 +2516,10 @@ static bool app_tape_fast_load_trap(void *user_data, void *machine)
         app->tape_input_seen = true;
         app->tape_input_reads_this_frame = APP_TAPE_LOADER_ACTIVE_READS;
         app->tape_loader_idle_frames = 0;
+        /* A later BASIC LOAD may invoke the ROM trap after an inter-block
+           auto-stop. Re-arm completion detection now that playback resumed. */
+        app->tape_auto_stop_armed =
+            app->fast_tape_loading_enabled && app->tape.playing;
     }
     return loaded;
 }
@@ -3535,7 +3561,7 @@ static bool app_load_zip_file(
     }
     else if (_stricmp(extension, ".nex") == 0)
     {
-        NextNexLoadResult result;
+        NextNexLoadResult result = {0};
         loaded = app_prepare_next(app, false, error_buffer, error_buffer_size) &&
                  next_machine_load_nex_data(&app->next, data, data_size, &result,
                                             error_buffer, error_buffer_size);
@@ -3821,7 +3847,7 @@ static bool app_load_media_path(
         char sd_path[MAX_PATH];
         uint8_t *data = NULL;
         size_t data_size = 0;
-        NextNexLoadResult result;
+        NextNexLoadResult result = {0};
         bool loaded;
         if (_stricmp(extension, ".snx") == 0)
         {
@@ -4094,7 +4120,20 @@ static bool app_apply_loaded_snapshot(
         job->model != app->spec.model &&
         !(job->model == SPECTRUM_MODEL_128K &&
           app->spec.model == SPECTRUM_MODEL_PLUS2);
-    const Spectrum previous_spec = app->spec;
+    Spectrum *previous_spec;
+
+    /* Spectrum embeds the emulated RAM and framebuffer, so a transactional
+       rollback copy must live on the heap rather than the thread stack. */
+    previous_spec = (Spectrum *)malloc(sizeof(*previous_spec));
+    if (previous_spec == NULL)
+    {
+        snprintf(
+            error_buffer,
+            error_buffer_size,
+            "Out of memory while preparing to load snapshot.");
+        return false;
+    }
+    *previous_spec = app->spec;
 
     app_autotype_clear(app);
     app_release_all_keys(app);
@@ -4106,6 +4145,7 @@ static bool app_apply_loaded_snapshot(
         const RomSet *set = app_rom_set_for_model_const(&app->roms, job->model);
         if (!app_load_model_roms(app, job->model, set, error_buffer, error_buffer_size))
         {
+            free(previous_spec);
             return false;
         }
     }
@@ -4129,9 +4169,10 @@ static bool app_apply_loaded_snapshot(
     {
         if (model_changed)
         {
-            app->spec = previous_spec;
+            app->spec = *previous_spec;
             app_sync_tape_stop_mode(app);
         }
+        free(previous_spec);
         return false;
     }
 
@@ -4149,6 +4190,7 @@ static bool app_apply_loaded_snapshot(
     {
         tape_rewind(&app->tape, (uint32_t)app->spec.machine.freq_hz);
     }
+    free(previous_spec);
     app_update_title(hwnd, &app->spec);
     app_update_model_menu(hwnd, app->spec.model);
     app_update_microdrive_menu(hwnd, app);
@@ -4963,6 +5005,44 @@ static bool app_frame_due(AppState *app, double frame_ms, const LARGE_INTEGER *s
     return true;
 }
 
+/* Fast-forward tape data and autoload typing, but leave explicit inter-block
+   pauses at real speed. Programs use those pauses for visible loading screens
+   and slideshows while the next tape block remains queued. */
+static bool app_tape_warp_requested(AppState *app)
+{
+    bool in_pause;
+    if (!app->fast_tape_loading_enabled || app->debug.paused)
+    {
+        return false;
+    }
+    if (app->tape_autoplay_pending)
+    {
+        return true;
+    }
+    if (!app->tape.playing)
+    {
+        return false;
+    }
+    in_pause = tape_is_in_pause(
+        &app->tape,
+        app->spec.machine.tick_count);
+    if (in_pause)
+    {
+        return false;
+    }
+    /* If an explicit pause elapsed without sustained EAR reads, the loaded
+       program is using the gap rather than waiting for the next tape block.
+       Stop at that boundary so a slideshow cannot consume future images while
+       it waits for a key. The next ROM fast-load trap resumes automatically. */
+    if (app->tape_auto_stop_armed && app->tape_input_seen &&
+        app->tape_loader_idle_frames > 0)
+    {
+        app_stop_tape(app);
+        return false;
+    }
+    return true;
+}
+
 /* Runs one timing slice of the emulator and audio service. This is shared by
    the normal idle loop and the timer path used during modal menu, move, and
    size loops. */
@@ -5028,8 +5108,7 @@ static void app_tick_emulator(AppState *app)
         return;
     }
 
-    warp_requested = app->fast_tape_loading_enabled && !app->debug.paused &&
-                     (app->tape_autoplay_pending || app->tape.playing);
+    warp_requested = app_tape_warp_requested(app);
     if (warp_requested)
     {
         if (!app->tape_warp_active)
@@ -5048,7 +5127,7 @@ static void app_tick_emulator(AppState *app)
             frames_run++;
             (void)app_update_tape_loader_activity(app);
 
-            if (!app->tape_autoplay_pending && !app->tape.playing)
+            if (!app_tape_warp_requested(app))
             {
                 break;
             }
@@ -5068,7 +5147,7 @@ static void app_tick_emulator(AppState *app)
             spectrum_render_frame(&app->spec);
             InvalidateRect(app->main_hwnd, NULL, FALSE);
         }
-        if (app->debug.paused || (!app->tape_autoplay_pending && !app->tape.playing))
+        if (!app_tape_warp_requested(app))
         {
             app->tape_warp_active = false;
             app->emulation_accumulator_ms = 0.0;
@@ -5320,7 +5399,8 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         }
         break;
     case WM_MOUSEMOVE:
-        if (app != NULL && app->kempston_mouse_enabled)
+        if (app != NULL &&
+            (app->kempston_mouse_enabled || app->amx_mouse_enabled))
         {
             POINT position = {
                 (short)LOWORD(lparam),
@@ -5336,6 +5416,10 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                     app->mouse_x,
                     app->mouse_y,
                     app->mouse_buttons);
+                if (app->amx_mouse_enabled)
+                {
+                    spectrum_move_amx_mouse(&app->spec, delta_x, -delta_y);
+                }
             }
             else
             {
@@ -5359,7 +5443,8 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
     case WM_LBUTTONUP:
     case WM_RBUTTONUP:
     case WM_MBUTTONUP:
-        if (app != NULL && app->kempston_mouse_enabled)
+        if (app != NULL &&
+            (app->kempston_mouse_enabled || app->amx_mouse_enabled))
         {
             uint8_t button = msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP
                                  ? ZX_MOUSE_LEFT
@@ -6079,13 +6164,19 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                 return 0;
             case APP_MENU_INPUT_KEMPSTON_MOUSE:
                 app->kempston_mouse_enabled = !app->kempston_mouse_enabled;
+                if (app->kempston_mouse_enabled)
+                {
+                    app->amx_mouse_enabled = false;
+                }
                 app->mouse_tracking = false;
-                if (!app->kempston_mouse_enabled)
+                if (!app->kempston_mouse_enabled && !app->amx_mouse_enabled)
                 {
                     app->mouse_buttons = 0;
                 }
                 spectrum_set_kempston_mouse_enabled(
                     &app->spec, app->kempston_mouse_enabled);
+                spectrum_set_amx_mouse_enabled(
+                    &app->spec, app->amx_mouse_enabled);
                 spectrum_set_mouse(
                     &app->spec,
                     app->mouse_x,
@@ -6093,6 +6184,32 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                     app->mouse_buttons);
                 app_rewind_clear(app);
                 app_save_kempston_mouse_enabled(app->kempston_mouse_enabled);
+                app_save_toggle("amx_mouse", app->amx_mouse_enabled);
+                app_update_input_menu(hwnd, app);
+                return 0;
+            case APP_MENU_INPUT_AMX_MOUSE:
+                app->amx_mouse_enabled = !app->amx_mouse_enabled;
+                if (app->amx_mouse_enabled)
+                {
+                    app->kempston_mouse_enabled = false;
+                }
+                app->mouse_tracking = false;
+                if (!app->kempston_mouse_enabled && !app->amx_mouse_enabled)
+                {
+                    app->mouse_buttons = 0;
+                }
+                spectrum_set_kempston_mouse_enabled(
+                    &app->spec, app->kempston_mouse_enabled);
+                spectrum_set_amx_mouse_enabled(
+                    &app->spec, app->amx_mouse_enabled);
+                spectrum_set_mouse(
+                    &app->spec,
+                    app->mouse_x,
+                    app->mouse_y,
+                    app->mouse_buttons);
+                app_rewind_clear(app);
+                app_save_kempston_mouse_enabled(app->kempston_mouse_enabled);
+                app_save_toggle("amx_mouse", app->amx_mouse_enabled);
                 app_update_input_menu(hwnd, app);
                 return 0;
             case APP_MENU_RECENT_MEDIA_CLEAR:
@@ -7125,7 +7242,7 @@ static bool app_load_model_roms(
     char *error_buffer,
     size_t error_buffer_size)
 {
-    Spectrum previous_spec = app->spec;
+    Spectrum *previous_spec;
     chips_audio_callback_t audio_callback;
     int sample_rate = app->spec.audio_sample_rate > 0 ? app->spec.audio_sample_rate : APP_AUDIO_SAMPLE_RATE;
     int num_samples = app->spec.audio_num_samples > 0 ? app->spec.audio_num_samples : APP_AUDIO_CALLBACK_SAMPLES;
@@ -7137,6 +7254,20 @@ static bool app_load_model_roms(
         snprintf(error_buffer, error_buffer_size, "No ROM configured for %s mode.", app_model_name(model));
         return false;
     }
+
+    /* Spectrum embeds the emulated RAM and framebuffer, so the rollback copy
+       must live on the heap rather than the thread stack. */
+    previous_spec = (Spectrum *)malloc(sizeof(*previous_spec));
+    if (previous_spec == NULL)
+    {
+        snprintf(
+            error_buffer,
+            error_buffer_size,
+            "Out of memory while preparing %s mode.",
+            app_model_name(model));
+        return false;
+    }
+    *previous_spec = app->spec;
 
     ZeroMemory(&audio_callback, sizeof(audio_callback));
     audio_callback.func = app_audio_callback;
@@ -7173,7 +7304,8 @@ static bool app_load_model_roms(
             error_buffer,
             error_buffer_size))
     {
-        app->spec = previous_spec;
+        app->spec = *previous_spec;
+        free(previous_spec);
         return false;
     }
     if (!spectrum_load_multiface_rom(
@@ -7182,7 +7314,8 @@ static bool app_load_model_roms(
             error_buffer,
             error_buffer_size))
     {
-        app->spec = previous_spec;
+        app->spec = *previous_spec;
+        free(previous_spec);
         return false;
     }
     if (!spectrum_load_roms(
@@ -7192,13 +7325,16 @@ static bool app_load_model_roms(
             error_buffer,
             error_buffer_size))
     {
-        app->spec = previous_spec;
+        app->spec = *previous_spec;
+        free(previous_spec);
         return false;
     }
 
     spectrum_set_joystick_type(&app->spec, app->joystick_type);
     spectrum_set_kempston_mouse_enabled(
         &app->spec, app->kempston_mouse_enabled);
+    spectrum_set_amx_mouse_enabled(
+        &app->spec, app->amx_mouse_enabled);
     spectrum_set_expansion_audio(
         &app->spec,
         app->fuller_audio_enabled,
@@ -7208,6 +7344,7 @@ static bool app_load_model_roms(
     spectrum_set_mouse(
         &app->spec, app->mouse_x, app->mouse_y, app->mouse_buttons);
     app_apply_joystick_mask(app);
+    free(previous_spec);
     return true;
 }
 
@@ -7589,6 +7726,7 @@ int main(int argc, char **argv)
     KeyboardJoystickPreset saved_keyboard_joystick = APP_KEYBOARD_JOYSTICK_NONE;
     zx_joystick_type_t saved_joystick_type = ZX_JOYSTICKTYPE_KEMPSTON;
     bool saved_kempston_mouse_enabled = false;
+    bool saved_amx_mouse_enabled = false;
     bool saved_fuller_audio_enabled = false;
     bool saved_specdrum_enabled = false;
     bool saved_covox_enabled = false;
@@ -7601,6 +7739,7 @@ int main(int argc, char **argv)
     bool has_saved_keyboard_joystick;
     bool has_saved_joystick_type;
     bool has_saved_kempston_mouse_enabled;
+    bool has_saved_amx_mouse_enabled;
     bool has_saved_fuller_audio_enabled;
     bool has_saved_specdrum_enabled;
     bool has_saved_covox_enabled;
@@ -7618,6 +7757,8 @@ int main(int argc, char **argv)
     has_saved_joystick_type = app_load_saved_joystick_type(&saved_joystick_type);
     has_saved_kempston_mouse_enabled =
         app_load_saved_kempston_mouse_enabled(&saved_kempston_mouse_enabled);
+    has_saved_amx_mouse_enabled =
+        app_load_saved_toggle("amx_mouse", &saved_amx_mouse_enabled);
     has_saved_fuller_audio_enabled =
         app_load_saved_toggle("fuller_audio", &saved_fuller_audio_enabled);
     has_saved_specdrum_enabled =
@@ -7659,6 +7800,13 @@ int main(int argc, char **argv)
     app.kempston_mouse_enabled = has_saved_kempston_mouse_enabled
                                      ? saved_kempston_mouse_enabled
                                      : false;
+    app.amx_mouse_enabled = has_saved_amx_mouse_enabled
+                                ? saved_amx_mouse_enabled
+                                : false;
+    if (app.amx_mouse_enabled)
+    {
+        app.kempston_mouse_enabled = false;
+    }
     app.fuller_audio_enabled = has_saved_fuller_audio_enabled
                                    ? saved_fuller_audio_enabled
                                    : false;

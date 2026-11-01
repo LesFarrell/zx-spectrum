@@ -82,6 +82,7 @@ extern "C" {
 #define ZX_ULAPLUS_PALETTE_SIZE (64)
 #define ZX_ULAPLUS_MAX_SCANLINE_EVENTS (64)
 #define ZX_INTERFACE1_ROM_SIZE (0x2000)
+#define ZX_AMX_MOUSE_QUEUE_SIZE (256)
 #define ZX_MULTIFACE_ROM_SIZE (0x2000)
 #define ZX_MULTIFACE_RAM_SIZE (0x4000)
 #define ZX_MICRODRIVE_COUNT (2)
@@ -231,6 +232,20 @@ typedef struct {
     uint8_t mouse_y;
     uint8_t mouse_buttons;
     bool kempston_mouse_enabled;
+    bool amx_mouse_enabled;
+    uint8_t amx_vector_x;
+    uint8_t amx_vector_y;
+    uint8_t amx_data_x;
+    uint8_t amx_data_y;
+    bool amx_interrupt_enabled_x;
+    bool amx_interrupt_enabled_y;
+    bool amx_interrupt_active;
+    bool amx_interrupt_ack_active;
+    uint8_t amx_interrupt_vector;
+    uint8_t amx_event_queue[ZX_AMX_MOUSE_QUEUE_SIZE];
+    uint16_t amx_event_head;
+    uint16_t amx_event_tail;
+    uint16_t amx_event_count;
     bool fuller_audio_enabled;
     bool specdrum_enabled;
     bool covox_enabled;
@@ -378,8 +393,12 @@ zx_joystick_type_t zx_joystick_type(zx_t* sys);
 void zx_joystick(zx_t* sys, uint8_t mask);
 // enable or disable the Kempston mouse ports
 void zx_set_kempston_mouse_enabled(zx_t* sys, bool enabled);
+// enable or disable the AMX Mouse PIO ports and movement interrupts
+void zx_set_amx_mouse_enabled(zx_t* sys, bool enabled);
 // update the Kempston mouse counters and active-high button mask
 void zx_mouse(zx_t* sys, uint8_t x, uint8_t y, uint8_t buttons);
+// queue AMX Mouse movement, with positive Y moving upwards
+void zx_amx_mouse_move(zx_t* sys, int delta_x, int delta_y);
 // configure optional audio peripherals
 void zx_set_expansion_audio(zx_t* sys, bool fuller_audio, bool specdrum, bool covox);
 // enable/disable an already configured Multiface and press its red NMI button
@@ -511,32 +530,10 @@ static void _zx_ulaplus_reset(zx_t* sys) {
     _zx_ulaplus_begin_scanline(sys);
 }
 
-/* ULAplus mode-group register selection mirrors the Timex port FF display
-   controls. Values 3/7 select the bank-7 hi-colour/hi-resolution variants;
-   port FF itself continues to select the video mode without changing banks. */
+/* The register port only selects an ULAplus palette or mode register. Timex
+   video mode remains controlled independently through port FF. */
 static void _zx_ulaplus_select_register(zx_t* sys, uint8_t data) {
     sys->ulaplus_register = data;
-    if ((data >> 6) == 1) {
-        const uint8_t control = data & 0x3F;
-        const uint8_t encoded_mode = control & 7;
-        uint8_t timex_mode;
-        bool bank7;
-        switch (encoded_mode) {
-            case 0: timex_mode = 0; bank7 = false; break;
-            case 1: timex_mode = 1; bank7 = false; break;
-            case 2: timex_mode = 2; bank7 = false; break;
-            case 3: timex_mode = 2; bank7 = true; break;
-            case 4: timex_mode = 0; bank7 = true; break;
-            case 5: timex_mode = 1; bank7 = true; break;
-            case 6: timex_mode = 6; bank7 = false; break;
-            default: timex_mode = 6; bank7 = true; break;
-        }
-        sys->timex_video_mode = (uint8_t)(
-            (sys->timex_video_mode & 0xC0) | (control & 0x38) | timex_mode);
-        if (sys->type != ZX_TYPE_48K) {
-            sys->display_ram_bank = bank7 ? 7 : 5;
-        }
-    }
 }
 
 static void _zx_ulaplus_record_event(
@@ -594,6 +591,80 @@ static uint8_t _zx_ulaplus_read_data(const zx_t* sys) {
         return sys->ulaplus_mode;
     }
     return 0xFF;
+}
+
+enum {
+    _ZX_AMX_X_RIGHT = 0,
+    _ZX_AMX_X_LEFT,
+    _ZX_AMX_Y_UP,
+    _ZX_AMX_Y_DOWN
+};
+
+static void _zx_amx_reset(zx_t* sys) {
+    sys->amx_vector_x = 0;
+    sys->amx_vector_y = 0;
+    sys->amx_data_x = 0xFF;
+    sys->amx_data_y = 0xFF;
+    sys->amx_interrupt_enabled_x = false;
+    sys->amx_interrupt_enabled_y = false;
+    sys->amx_interrupt_active = false;
+    sys->amx_interrupt_ack_active = false;
+    sys->amx_interrupt_vector = 0;
+    sys->amx_event_head = 0;
+    sys->amx_event_tail = 0;
+    sys->amx_event_count = 0;
+}
+
+static bool _zx_amx_queue_event(zx_t* sys, uint8_t event) {
+    if (sys->amx_event_count >= ZX_AMX_MOUSE_QUEUE_SIZE) {
+        return false;
+    }
+    sys->amx_event_queue[sys->amx_event_tail] = event;
+    sys->amx_event_tail =
+        (uint16_t)((sys->amx_event_tail + 1) % ZX_AMX_MOUSE_QUEUE_SIZE);
+    sys->amx_event_count++;
+    return true;
+}
+
+static void _zx_amx_start_interrupt(zx_t* sys) {
+    while (!sys->amx_interrupt_active && sys->amx_event_count > 0) {
+        const uint8_t event = sys->amx_event_queue[sys->amx_event_head];
+        sys->amx_event_head =
+            (uint16_t)((sys->amx_event_head + 1) % ZX_AMX_MOUSE_QUEUE_SIZE);
+        sys->amx_event_count--;
+        if (event == _ZX_AMX_X_RIGHT || event == _ZX_AMX_X_LEFT) {
+            if (!sys->amx_interrupt_enabled_x) {
+                continue;
+            }
+            sys->amx_data_x = event == _ZX_AMX_X_RIGHT ? 0x00 : 0xFF;
+            sys->amx_interrupt_vector = sys->amx_vector_x;
+        }
+        else {
+            if (!sys->amx_interrupt_enabled_y) {
+                continue;
+            }
+            sys->amx_data_y = event == _ZX_AMX_Y_UP ? 0x00 : 0xFF;
+            sys->amx_interrupt_vector = sys->amx_vector_y;
+        }
+        sys->amx_interrupt_active = true;
+    }
+}
+
+static void _zx_amx_control(zx_t* sys, bool x_axis, uint8_t data) {
+    uint8_t* vector = x_axis ? &sys->amx_vector_x : &sys->amx_vector_y;
+    bool* interrupt_enabled = x_axis
+        ? &sys->amx_interrupt_enabled_x
+        : &sys->amx_interrupt_enabled_y;
+
+    /* Z80 PIO vector words have bit 0 clear. Interrupt-control words end in
+       7h, with bit 7 selecting whether interrupts are enabled. Other PIO
+       commands (including the 4Fh input-mode command) need no extra state. */
+    if ((data & 1) == 0) {
+        *vector = data;
+    }
+    else if ((data & 0x0F) == 0x07) {
+        *interrupt_enabled = (data & 0x80) != 0;
+    }
 }
 
 void zx_init(zx_t* sys, const zx_desc_t* desc) {
@@ -657,6 +728,7 @@ void zx_init(zx_t* sys, const zx_desc_t* desc) {
         sys->ulaplus_colors[color] = _zx_ulaplus_decode_color((uint8_t)color);
     }
     _zx_ulaplus_reset(sys);
+    _zx_amx_reset(sys);
     if (ZX_TYPE_128 == sys->type) {
         CHIPS_ASSERT(desc->roms.zx128_0.ptr && (desc->roms.zx128_0.size == 0x4000));
         CHIPS_ASSERT(desc->roms.zx128_1.ptr && (desc->roms.zx128_1.size == 0x4000));
@@ -736,8 +808,10 @@ void zx_reset(zx_t* sys) {
     sys->contention_wait_remaining = 0;
     sys->scanline_counter = sys->scanline_period;
     sys->scanline_y = 0;
+    sys->int_counter = 0;
     sys->blink_counter = 0;
     _zx_ulaplus_reset(sys);
+    _zx_amx_reset(sys);
     if (sys->type == ZX_TYPE_48K) {
         sys->display_ram_bank = 0;
     }
@@ -773,7 +847,7 @@ static bool _zx_decode_scanline(zx_t* sys) {
     const int top_decode_line = sys->top_border_scanlines - 32;
     const int btm_decode_line = sys->top_border_scanlines + 192 + 32;
     if ((sys->scanline_y >= top_decode_line) && (sys->scanline_y < btm_decode_line)) {
-        const uint16_t y = sys->scanline_y - top_decode_line;
+        const uint16_t y = (uint16_t)(sys->scanline_y - top_decode_line);
         uint8_t video_mode = sys->timex_video_mode & 7;
         const uint8_t* vidmem_bank = sys->ram[sys->display_ram_bank];
         const bool blink = 0 != (sys->blink_counter & 0x10);
@@ -2066,11 +2140,11 @@ static uint8_t _zx_fuller_joystick_value(const zx_t* sys) {
     const uint8_t mask = sys->kbd_joymask | sys->joy_joymask;
     /* Fuller inputs are active-low, unlike the active-high Kempston port. */
     uint8_t data = 0xFF;
-    if (mask & ZX_JOYSTICK_UP)    data &= (uint8_t)~(1u<<0);
-    if (mask & ZX_JOYSTICK_DOWN)  data &= (uint8_t)~(1u<<1);
-    if (mask & ZX_JOYSTICK_LEFT)  data &= (uint8_t)~(1u<<2);
-    if (mask & ZX_JOYSTICK_RIGHT) data &= (uint8_t)~(1u<<3);
-    if (mask & ZX_JOYSTICK_BTN)   data &= (uint8_t)~(1u<<7);
+    if (mask & ZX_JOYSTICK_UP)    data &= UINT8_C(0xFE);
+    if (mask & ZX_JOYSTICK_DOWN)  data &= UINT8_C(0xFD);
+    if (mask & ZX_JOYSTICK_LEFT)  data &= UINT8_C(0xFB);
+    if (mask & ZX_JOYSTICK_RIGHT) data &= UINT8_C(0xF7);
+    if (mask & ZX_JOYSTICK_BTN)   data &= UINT8_C(0x7F);
     return data;
 }
 
@@ -2087,7 +2161,12 @@ static uint8_t _zx_multiface_page_out_port(const zx_t* sys) {
     return 0xBF;
 }
 
-static inline __attribute__((always_inline)) uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
+#if defined(_MSC_VER)
+#define _ZX_FORCE_INLINE __forceinline
+#else
+#define _ZX_FORCE_INLINE inline __attribute__((always_inline))
+#endif
+static _ZX_FORCE_INLINE uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
     bool new_frame = false;
     bool cpu_stalled = false;
     const bool io_cycle =
@@ -2131,15 +2210,23 @@ static inline __attribute__((always_inline)) uint64_t _zx_tick(zx_t* sys, uint64
     if (sys->multiface_nmi_ticks > 0 && --sys->multiface_nmi_ticks == 0) {
         pins &= ~Z80_NMI;
     }
-    /*
-        The Spectrum does not place a peripheral-supplied opcode on the data
-        bus during interrupt acknowledge.  Model the resulting 0xFF bus value
-        explicitly; leaving stale data from the preceding bus cycle makes IM2
-        jump through an effectively random vector.
-    */
-    if ((pins & (Z80_M1 | Z80_IORQ)) == (Z80_M1 | Z80_IORQ)) {
-        Z80_SET_DATA(pins, 0xFF);
+    const bool interrupt_acknowledge =
+        (pins & (Z80_M1 | Z80_IORQ)) == (Z80_M1 | Z80_IORQ);
+    if (interrupt_acknowledge) {
+        /* The ULA leaves the data bus high during interrupt acknowledge. The
+           AMX PIO instead supplies the programmed even IM2 vector. */
+        Z80_SET_DATA(
+            pins,
+            sys->amx_mouse_enabled &&
+                    (sys->amx_interrupt_active || sys->amx_interrupt_ack_active)
+                ? sys->amx_interrupt_vector
+                : 0xFF);
+        if (!sys->amx_interrupt_ack_active &&
+            sys->amx_mouse_enabled && sys->amx_interrupt_active) {
+            sys->amx_interrupt_active = false;
+        }
     }
+    sys->amx_interrupt_ack_active = interrupt_acknowledge;
 
     // video decoding and vblank interrupt
     if (--sys->scanline_counter <= 0) {
@@ -2147,18 +2234,24 @@ static inline __attribute__((always_inline)) uint64_t _zx_tick(zx_t* sys, uint64
         // decode next video scanline
         if (_zx_decode_scanline(sys)) {
             // request vblank interrupt
-            pins |= Z80_INT;
             // hold the INT pin for 32 ticks
             sys->int_counter = 32;
             new_frame = true;
         }
     }
 
-    // clear INT pin after 32 ticks
-    if (pins & Z80_INT) {
-        if (--sys->int_counter < 0) {
-            pins &= ~Z80_INT;
-        }
+    if (sys->amx_mouse_enabled && !interrupt_acknowledge) {
+        _zx_amx_start_interrupt(sys);
+    }
+
+    /* Combine the ULA and AMX interrupt sources onto the CPU's INT input. */
+    pins &= ~Z80_INT;
+    if (sys->int_counter > 0) {
+        pins |= Z80_INT;
+        sys->int_counter--;
+    }
+    if (sys->amx_mouse_enabled && sys->amx_interrupt_active) {
+        pins |= Z80_INT;
     }
 
     if (!cpu_stalled && (pins & Z80_MREQ)) {
@@ -2242,6 +2335,36 @@ static inline __attribute__((always_inline)) uint64_t _zx_tick(zx_t* sys, uint64
             else if (pins & Z80_WR) {
                 sys->timex_video_mode = Z80_GET_DATA(pins);
             }
+        }
+        else if (sys->amx_mouse_enabled && (pins & Z80_RD) &&
+                 (uint8_t)io_addr == 0x1F) {
+            Z80_SET_DATA(pins, sys->amx_data_x);
+        }
+        else if (sys->amx_mouse_enabled && (pins & Z80_RD) &&
+                 (uint8_t)io_addr == 0x3F) {
+            Z80_SET_DATA(pins, sys->amx_data_y);
+        }
+        else if (sys->amx_mouse_enabled && (pins & Z80_WR) &&
+                 (uint8_t)io_addr == 0x5F) {
+            _zx_amx_control(sys, true, Z80_GET_DATA(pins));
+        }
+        else if (sys->amx_mouse_enabled && (pins & Z80_WR) &&
+                 (uint8_t)io_addr == 0x7F) {
+            _zx_amx_control(sys, false, Z80_GET_DATA(pins));
+        }
+        else if (sys->amx_mouse_enabled && (pins & Z80_RD) &&
+                 (uint8_t)io_addr == 0xDF) {
+            uint8_t buttons = 0xFF;
+            if (sys->mouse_buttons & ZX_MOUSE_LEFT) {
+                buttons &= (uint8_t)~0x80;
+            }
+            if (sys->mouse_buttons & ZX_MOUSE_RIGHT) {
+                buttons &= (uint8_t)~0x40;
+            }
+            if (sys->mouse_buttons & ZX_MOUSE_MIDDLE) {
+                buttons &= (uint8_t)~0x20;
+            }
+            Z80_SET_DATA(pins, buttons);
         }
         else if (sys->multiface_enabled && (pins & Z80_RD) &&
                  (uint8_t)io_addr == _zx_multiface_page_in_port(sys)) {
@@ -2516,11 +2639,49 @@ void zx_set_kempston_mouse_enabled(zx_t* sys, bool enabled) {
     sys->kempston_mouse_enabled = enabled;
 }
 
+void zx_set_amx_mouse_enabled(zx_t* sys, bool enabled) {
+    CHIPS_ASSERT(sys && sys->valid);
+    if (sys->amx_mouse_enabled != enabled) {
+        _zx_amx_reset(sys);
+    }
+    sys->amx_mouse_enabled = enabled;
+}
+
 void zx_mouse(zx_t* sys, uint8_t x, uint8_t y, uint8_t buttons) {
     CHIPS_ASSERT(sys && sys->valid);
     sys->mouse_x = x;
     sys->mouse_y = y;
     sys->mouse_buttons = buttons & 0x07u;
+}
+
+void zx_amx_mouse_move(zx_t* sys, int delta_x, int delta_y) {
+    CHIPS_ASSERT(sys && sys->valid);
+    if (!sys->amx_mouse_enabled) {
+        return;
+    }
+
+    while (delta_x != 0 || delta_y != 0) {
+        if (delta_x != 0) {
+            const uint8_t event = delta_x > 0
+                ? _ZX_AMX_X_RIGHT
+                : _ZX_AMX_X_LEFT;
+            if (sys->amx_interrupt_enabled_x &&
+                !_zx_amx_queue_event(sys, event)) {
+                break;
+            }
+            delta_x += delta_x > 0 ? -1 : 1;
+        }
+        if (delta_y != 0) {
+            const uint8_t event = delta_y > 0
+                ? _ZX_AMX_Y_UP
+                : _ZX_AMX_Y_DOWN;
+            if (sys->amx_interrupt_enabled_y &&
+                !_zx_amx_queue_event(sys, event)) {
+                break;
+            }
+            delta_y += delta_y > 0 ? -1 : 1;
+        }
+    }
 }
 
 void zx_set_expansion_audio(zx_t* sys, bool fuller_audio, bool specdrum, bool covox) {

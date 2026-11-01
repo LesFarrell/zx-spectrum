@@ -1900,7 +1900,12 @@ void next_machine_write_port(NextMachine *machine, uint16_t port, uint8_t value)
 
 /* One CPU clock. Inlined into the frame loop: this is the emulator's hot
    path, so rarely-changing state is tested as cheaply as possible. */
-static inline __attribute__((always_inline)) uint64_t next_machine_tick_inline(NextMachine *machine)
+#if defined(_MSC_VER)
+#define NEXT_FORCE_INLINE __forceinline
+#else
+#define NEXT_FORCE_INLINE inline __attribute__((always_inline))
+#endif
+static NEXT_FORCE_INLINE uint64_t next_machine_tick_inline(NextMachine *machine)
 {
     uint64_t pins;
 
@@ -3214,25 +3219,26 @@ bool next_machine_load_snx_data(
     char *error_buffer,
     size_t error_buffer_size)
 {
-    static const size_t header_size = 27;
-    static const size_t bank_size = 0x4000;
-    static const size_t snx_48k_size = 27 + 3 * 0x4000;
-    static const size_t snx_trailer_size = 4;
-    static const size_t snx_128k_size =
-        snx_48k_size + snx_trailer_size + 5 * 0x4000;
+    enum {
+        SNX_HEADER_SIZE = 27,
+        SNX_BANK_SIZE = 0x4000,
+        SNX_48K_SIZE = SNX_HEADER_SIZE + 3 * SNX_BANK_SIZE,
+        SNX_TRAILER_SIZE = 4,
+        SNX_128K_SIZE = SNX_48K_SIZE + SNX_TRAILER_SIZE + 5 * SNX_BANK_SIZE
+    };
     uint8_t snapshot_mmu[NEXT_MMU_SLOT_COUNT] = {
         0xFF, 0xFF, 10, 11, 4, 5, 0, 1};
     uint8_t paged_page[0x4000];
     uint16_t stack_pointer;
-    uint16_t program_counter;
+    uint16_t program_counter = 0;
     uint8_t selected_bank = 0;
     bool is_128k;
 
     /* A 128K snapshot stores the five remaining banks, or six when the paged
        bank is 2 or 5 (that bank then also appears in the 48K section). */
     if (machine == NULL || !machine->initialized || data == NULL ||
-        (data_size != snx_48k_size && data_size != snx_128k_size &&
-         data_size != snx_128k_size + bank_size))
+        (data_size != SNX_48K_SIZE && data_size != SNX_128K_SIZE &&
+         data_size != SNX_128K_SIZE + SNX_BANK_SIZE))
     {
         next_set_error(error_buffer, error_buffer_size,
                        "Unsupported or corrupt SNX snapshot.");
@@ -3252,15 +3258,15 @@ bool next_machine_load_snx_data(
         return false;
     }
 
-    is_128k = data_size != snx_48k_size;
+    is_128k = data_size != SNX_48K_SIZE;
     if (is_128k)
     {
-        const uint8_t *trailer = data + snx_48k_size;
+        const uint8_t *trailer = data + SNX_48K_SIZE;
         program_counter = next_read_u16(trailer);
         selected_bank = (uint8_t)(trailer[2] & 0x07);
         if (data_size != ((selected_bank == 2 || selected_bank == 5)
-                              ? snx_128k_size + bank_size
-                              : snx_128k_size))
+                              ? SNX_128K_SIZE + SNX_BANK_SIZE
+                              : SNX_128K_SIZE))
         {
             next_set_error(error_buffer, error_buffer_size,
                            "128K SNX snapshot has the wrong RAM-bank count.");
@@ -3274,15 +3280,15 @@ bool next_machine_load_snx_data(
        alive.  Replace only the legacy address space and CPU state; the
        SD controller, divMMC RAM and open filesystem context are preserved. */
     memcpy(machine->ram + 5 * NEXT_NEX_BANK_SIZE,
-           data + header_size, bank_size);
+           data + SNX_HEADER_SIZE, SNX_BANK_SIZE);
     memcpy(machine->ram + 4 * NEXT_MMU_SLOT_SIZE,
-           data + header_size + bank_size, bank_size);
-    memcpy(paged_page, data + header_size + 2 * bank_size, bank_size);
+           data + SNX_HEADER_SIZE + SNX_BANK_SIZE, SNX_BANK_SIZE);
+    memcpy(paged_page, data + SNX_HEADER_SIZE + 2 * SNX_BANK_SIZE, SNX_BANK_SIZE);
 
     if (is_128k)
     {
-        const uint8_t *trailer = data + snx_48k_size;
-        size_t offset = snx_48k_size + snx_trailer_size;
+        const uint8_t *trailer = data + SNX_48K_SIZE;
+        size_t offset = SNX_48K_SIZE + SNX_TRAILER_SIZE;
 
         memcpy(next_runtime_ram_page(machine, (uint8_t)(selected_bank * 2)),
                paged_page, NEXT_MMU_SLOT_SIZE);
@@ -3296,13 +3302,13 @@ bool next_machine_load_snx_data(
                    data + offset, NEXT_MMU_SLOT_SIZE);
             memcpy(next_runtime_ram_page(machine, (uint8_t)(bank * 2 + 1)),
                    data + offset + NEXT_MMU_SLOT_SIZE, NEXT_MMU_SLOT_SIZE);
-            offset += bank_size;
+            offset += SNX_BANK_SIZE;
         }
         machine->port_7ffd = trailer[2];
     }
     else
     {
-        memcpy(machine->ram, paged_page, bank_size);
+        memcpy(machine->ram, paged_page, SNX_BANK_SIZE);
         machine->port_7ffd = 0x10;
     }
 

@@ -12,7 +12,7 @@ Unpack the package into a `nextzxos` folder beside `zx-spectrum.exe`, either
 directly or in a `sn-emulator-*` sub-folder:
 
 ```text
-bin\
+redist\
   zx-spectrum.exe
   nextzxos\
     tbblue_loader.rom
@@ -33,7 +33,7 @@ Release numbers are not built into the emulator, so a newer package can be
 dropped in without rebuilding. The SD image is opened read/write so NextZXOS
 can save files; if it cannot be opened for writing it is used read-only.
 
-`src\build.bat` does not copy these files. They stay in `bin\nextzxos` between
+`src\build.bat` does not copy these files. They stay in `redist\nextzxos` between
 builds.
 
 ## Using the Next

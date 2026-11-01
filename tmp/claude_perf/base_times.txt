@@ -1,0 +1,5 @@
+48K boot                     frames    600    1234.3 ms   2057.2 us/frame     9.7x realtime  hash 074b479fdbed0f2a
+48K Manic Miner.tap          frames   1500    3134.7 ms   2089.8 us/frame     9.6x realtime  hash 065b7a570b0c8ea8
++3 Gauntlet.dsk              frames   3000    6504.9 ms   2168.3 us/frame     9.2x realtime  hash b60b635e49ae862d
+Next Bloaters.nex            frames   1500   24620.9 ms  16414.0 us/frame     1.2x realtime  hash 7defe358f4b0c504
+Next boot                    frames   1500   25533.0 ms  17022.0 us/frame     1.2x realtime  hash fb0add8f94d22e59

@@ -1,65 +1,36 @@
 @echo off
 setlocal
 
-pushd "%~dp0"
+pushd "%~dp0.."
 if errorlevel 1 exit /b 1
 
-if not exist "..\bin" mkdir "..\bin"
-if errorlevel 1 (
-    popd
-    exit /b 1
-)
+where premake5 >nul 2>nul
+if errorlevel 1 goto :missing_premake
 
-zig rc /:output-format coff /fo zxspectrum-res.o resources.rc
-if errorlevel 1 (
-    popd
-    exit /b 1
-)
+premake5 vs2022
+if errorlevel 1 goto :failed
 
-zig cc ^
-    -std=c11 ^
-    -O2 ^
-    -Wall ^
-    -Wextra ^
-    -I. ^
-    -I..\third_party\chips ^
-    -I..\third_party\scintilla\include ^
-    main.c ^
-    file_util.c ^
-    spectrum.c ^
-    next_machine.c ^
-    next_dma.c ^
-    next_copper.c ^
-    next_sprite.c ^
-    next_sd.c ^
-    next_rtc.c ^
-    next_wifi.c ^
-    szx_inflate.c ^
-    zip.c ^
-    disk.c ^
-    microdrive.c ^
-    tape.c ^
-    zxspectrum-res.o ^
-    -lgdi32 ^
-    -lcomdlg32 ^
-    -lcomctl32 ^
-    -lshell32 ^
-    -luser32 ^
-    -lwinmm ^
-    -lws2_32 ^
-    -Wl,/subsystem:windows ^
-    -o "..\bin\zx-spectrum.exe"
+set "MSBUILD_EXE="
+set "VSWHERE_EXE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+if exist "%VSWHERE_EXE%" for /f "usebackq delims=" %%I in (`"%VSWHERE_EXE%" -latest -products * -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe`) do if not defined MSBUILD_EXE set "MSBUILD_EXE=%%I"
+if not defined MSBUILD_EXE for /f "delims=" %%I in ('where msbuild 2^>nul') do if not defined MSBUILD_EXE set "MSBUILD_EXE=%%I"
+if not defined MSBUILD_EXE goto :missing_msbuild
 
-set "BUILD_RESULT=%errorlevel%"
-
-if exist "zxspectrum-res.o" del /q "zxspectrum-res.o"
-if exist "zx-spectrum.pdb" del /q "zx-spectrum.pdb"
-if exist "..\bin\zx-spectrum.pdb" del /q "..\bin\zx-spectrum.pdb"
-
-if "%BUILD_RESULT%"=="0" (
-    copy /y "..\third_party\scintilla\bin\Scintilla.dll" "..\bin\Scintilla.dll" >nul
-    xcopy /y /q /i /e "roms" "..\bin\roms" >nul
-)
+"%MSBUILD_EXE%" "build\msvc\zx-spectrum.sln" /nologo /m /p:Configuration=Release /p:Platform=x64 /verbosity:minimal
+if errorlevel 1 goto :failed
+if exist "redist\zx-spectrum.pdb" del /q "redist\zx-spectrum.pdb"
 
 popd
-exit /b %BUILD_RESULT%
+exit /b 0
+
+:missing_premake
+echo premake5.exe was not found on PATH.
+goto :failed
+
+:missing_msbuild
+echo MSBuild was not found. Install Visual Studio with Desktop development with C++.
+goto :failed
+
+:failed
+popd
+exit /b 1

@@ -509,7 +509,12 @@ static bool tape_consume_work(TapeBuilder *builder, size_t amount) {
     return true;
 }
 
-static bool tape_append_level(TapePlayer *player, uint32_t duration_ticks, bool level_high) {
+static bool tape_append_level(
+    TapePlayer *player,
+    uint32_t duration_ticks,
+    bool level_high,
+    bool is_pause)
+{
     TapeSegment *segment;
 
     if (duration_ticks == 0) {
@@ -519,7 +524,8 @@ static bool tape_append_level(TapePlayer *player, uint32_t duration_ticks, bool 
        or resuming there would skip the merged waveform. */
     if (player->segment_count > player->merge_floor) {
         segment = &player->segments[player->segment_count - 1];
-        if (segment->level_high == level_high && segment->stop_after == TAPE_STOP_NONE) {
+        if (segment->level_high == level_high && segment->is_pause == is_pause &&
+            segment->stop_after == TAPE_STOP_NONE) {
             if (segment->duration_ticks > UINT32_MAX - duration_ticks) {
                 return false;
             }
@@ -533,6 +539,7 @@ static bool tape_append_level(TapePlayer *player, uint32_t duration_ticks, bool 
     segment = &player->segments[player->segment_count++];
     segment->duration_ticks = duration_ticks;
     segment->level_high = level_high;
+    segment->is_pause = is_pause;
     segment->stop_after = TAPE_STOP_NONE;
     return true;
 }
@@ -555,6 +562,7 @@ static bool tape_mark_stop(TapePlayer *player, TapeStopMode stop_mode) {
     segment = &player->segments[player->segment_count++];
     segment->duration_ticks = 0;
     segment->level_high = false;
+    segment->is_pause = false;
     segment->stop_after = stop_mode;
     return true;
 }
@@ -572,7 +580,11 @@ static bool tape_append_pulse(TapeBuilder *builder, uint32_t duration_ticks) {
     if (!tape_tstates_to_ticks(builder->player->tick_hz, duration_ticks, &machine_ticks)) {
         return false;
     }
-    return tape_append_level(builder->player, machine_ticks, builder->current_level);
+    return tape_append_level(
+        builder->player,
+        machine_ticks,
+        builder->current_level,
+        false);
 }
 
 static bool tape_append_pause(TapeBuilder *builder, uint16_t duration_ms) {
@@ -595,11 +607,19 @@ static bool tape_append_pause(TapeBuilder *builder, uint16_t duration_ms) {
     /* TZX pauses first finish the preceding pulse at the opposite level for
        at least 1 ms, then hold EAR low for the rest of the pause. */
     builder->current_level = !builder->current_level;
-    if (!tape_append_level(builder->player, finishing_ticks, builder->current_level)) {
+    if (!tape_append_level(
+            builder->player,
+            finishing_ticks,
+            builder->current_level,
+            true)) {
         return false;
     }
     builder->current_level = false;
-    return tape_append_level(builder->player, duration_ticks - finishing_ticks, false);
+    return tape_append_level(
+        builder->player,
+        duration_ticks - finishing_ticks,
+        false,
+        true);
 }
 
 static bool tape_append_direct_samples(
@@ -623,7 +643,11 @@ static bool tape_append_direct_samples(
             builder->current_level = (data[index] & (1u << bit)) != 0;
             if (!tape_consume_work(builder, 1) ||
                 !tape_tstates_to_ticks(builder->player->tick_hz, sample_ticks, &machine_ticks) ||
-                !tape_append_level(builder->player, machine_ticks, builder->current_level)) {
+                !tape_append_level(
+                    builder->player,
+                    machine_ticks,
+                    builder->current_level,
+                    false)) {
                 return false;
             }
         }
@@ -657,7 +681,11 @@ static bool tape_append_generalized_symbol(
         }
         if (!tape_consume_work(builder, 1) ||
             !tape_tstates_to_ticks(builder->player->tick_hz, pulse_ticks, &machine_ticks) ||
-            !tape_append_level(builder->player, machine_ticks, builder->current_level)) {
+            !tape_append_level(
+                builder->player,
+                machine_ticks,
+                builder->current_level,
+                false)) {
             return false;
         }
     }
@@ -879,7 +907,10 @@ static bool tape_parse_tap(
 
 /* PZX defines the level of each pulse directly and toggles after the pulse,
    unlike the TZX helpers above which toggle before appending. */
-static bool tape_append_pzx_pulse(TapeBuilder *builder, uint32_t duration_tstates)
+static bool tape_append_pzx_pulse(
+    TapeBuilder *builder,
+    uint32_t duration_tstates,
+    bool is_pause)
 {
     uint32_t machine_ticks;
     if (!tape_consume_work(builder, 1))
@@ -895,7 +926,8 @@ static bool tape_append_pzx_pulse(TapeBuilder *builder, uint32_t duration_tstate
             !tape_append_level(
                 builder->player,
                 machine_ticks,
-                builder->current_level))
+                builder->current_level,
+                is_pause))
         {
             return false;
         }
@@ -1009,7 +1041,7 @@ static bool tape_parse_pzx(
                 }
                 for (uint32_t repeat = 0; repeat < count; ++repeat)
                 {
-                    if (!tape_append_pzx_pulse(&builder, duration)) goto decode_limit;
+                    if (!tape_append_pzx_pulse(&builder, duration, false)) goto decode_limit;
                 }
             }
         }
@@ -1056,13 +1088,14 @@ static bool tape_parse_pzx(
                 {
                     if (!tape_append_pzx_pulse(
                             &builder,
-                            tape_read_u16(sequence + ((size_t)pulse * 2u))))
+                            tape_read_u16(sequence + ((size_t)pulse * 2u)),
+                            false))
                     {
                         goto decode_limit;
                     }
                 }
             }
-            if (!tape_append_pzx_pulse(&builder, tail)) goto decode_limit;
+            if (!tape_append_pzx_pulse(&builder, tail, false)) goto decode_limit;
             resume_segment_index = player->segment_count;
             player->merge_floor = resume_segment_index;
             /* ROM fast loading is safe only for the canonical Spectrum pulse
@@ -1081,7 +1114,10 @@ static bool tape_parse_pzx(
             duration = tape_read_u32(payload);
             /* PAUS also stores its starting level in the duration's high bit. */
             builder.current_level = (duration & 0x80000000u) != 0;
-            if (!tape_append_pzx_pulse(&builder, duration & 0x7FFFFFFFu)) goto decode_limit;
+            if (!tape_append_pzx_pulse(
+                    &builder,
+                    duration & 0x7FFFFFFFu,
+                    true)) goto decode_limit;
         }
         else if (memcmp(tag, "STOP", 4) == 0)
         {
@@ -2079,6 +2115,15 @@ bool tape_input_level(TapePlayer *player, uint64_t tick_count) {
         player->segment_end_tick += player->segments[player->play_index].duration_ticks;
     }
     return player->segments[player->play_index].level_high;
+}
+
+bool tape_is_in_pause(TapePlayer *player, uint64_t tick_count) {
+    if (player == NULL || !player->playing) {
+        return false;
+    }
+    (void)tape_input_level(player, tick_count);
+    return player->playing && player->play_index < player->segment_count &&
+        player->segments[player->play_index].is_pause;
 }
 
 bool tape_has_tape(const TapePlayer *player) {

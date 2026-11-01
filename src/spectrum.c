@@ -296,6 +296,7 @@ static void spectrum_init_machine(Spectrum *spec)
         &spec->machine,
         spec->multiface_enabled && spec->multiface_rom_loaded);
     zx_set_kempston_mouse_enabled(&spec->machine, spec->kempston_mouse_enabled);
+    zx_set_amx_mouse_enabled(&spec->machine, spec->amx_mouse_enabled);
     zx_mouse(&spec->machine, spec->mouse_x, spec->mouse_y, spec->mouse_buttons);
     spec->display = zx_display_info(&spec->machine);
 
@@ -718,6 +719,15 @@ void spectrum_set_kempston_mouse_enabled(Spectrum *spec, bool enabled)
     }
 }
 
+void spectrum_set_amx_mouse_enabled(Spectrum *spec, bool enabled)
+{
+    spec->amx_mouse_enabled = enabled;
+    if (spec->machine_ready)
+    {
+        zx_set_amx_mouse_enabled(&spec->machine, enabled);
+    }
+}
+
 void spectrum_set_mouse(Spectrum *spec, uint8_t x, uint8_t y, uint8_t buttons)
 {
     spec->mouse_x = x;
@@ -726,6 +736,14 @@ void spectrum_set_mouse(Spectrum *spec, uint8_t x, uint8_t y, uint8_t buttons)
     if (spec->machine_ready)
     {
         zx_mouse(&spec->machine, spec->mouse_x, spec->mouse_y, spec->mouse_buttons);
+    }
+}
+
+void spectrum_move_amx_mouse(Spectrum *spec, int delta_x, int delta_y)
+{
+    if (spec->machine_ready)
+    {
+        zx_amx_mouse_move(&spec->machine, delta_x, delta_y);
     }
 }
 
