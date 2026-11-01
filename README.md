@@ -183,13 +183,15 @@ Spectrum +3 with one combined 64 KB ROM:
   Cursor/Protek/AGF, or Fuller; both keyboard presets and controllers use it
 - `Input -> Kempston Mouse` exposes host movement and three buttons through
   ports `FBDF`, `FFDF`, and `FADF`
-- `Input -> AMX Mouse` emulates the Z80 PIO data/control ports at `1F`, `3F`,
-  `5F`, and `7F`, plus active-low buttons at `DF`; Kempston and AMX mouse modes
-  are mutually exclusive, and the selected mode is remembered
+- `Input -> AMX Mouse` emulates the Z80 PIO X/Y data ports at `1F`/`3F`,
+  control ports at `5F`/`7F`, programmed IM2 movement vectors, and active-low
+  buttons at `DF`; Kempston and AMX mouse modes are mutually exclusive, and
+  the selected mode is remembered
 
 ## Controller
 
-- An XInput-compatible pad is exposed through the selected joystick interface
+- An XInput-compatible pad is exposed through the interface selected under
+  `Input -> Joystick Interface`; select `Kempston` for Kempston joystick games
 - D-pad or left stick maps to directions
 - `A`, `B`, `X`, `Y`, shoulders, or triggers map to fire
 
@@ -243,8 +245,10 @@ Spectrum +3 with one combined 64 KB ROM:
 - `Ctrl+1` through `Ctrl+6` select 48K, 128K, +3, +2, +2A, and the Next
 - `Machine -> Speed` selects 1x, 2x, 4x, or 8x and remembers the selection
 - `F2` pauses and `F6` cycles through the speed choices
-- `F8` or `Machine -> Rewind 2 Seconds` rewinds two emulated seconds, or to
-  the oldest available half-second checkpoint when less history exists
+- On Sinclair models, `Backspace` or `Machine -> Rewind 2 Seconds` rewinds two
+  emulated seconds, or to the oldest available half-second checkpoint when less
+  history exists. The Next has no rewind history, so Backspace remains its
+  normal Spectrum DELETE key
 - `F11` toggles fullscreen; `Escape` leaves fullscreen
 - `View -> Integer Scaling` keeps the image at a centered whole-number scale
 - `View -> Scanlines` applies a lightweight alternating-line display filter;

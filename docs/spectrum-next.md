@@ -61,6 +61,8 @@ The keyboard is mapped as on the other models (`Shift` is CAPS SHIFT and
 `Ctrl` is SYMBOL SHIFT). Keyboard joystick presets and XInput controllers
 appear as a Kempston joystick on port `1F`. Pause, the 1x-8x speed settings,
 mute, fullscreen, integer scaling, and scanlines all work on the Next.
+Backspace retains its Spectrum DELETE mapping on this model because rewind is
+only available for the Sinclair machines.
 
 ### Host networking
 

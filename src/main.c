@@ -1035,7 +1035,7 @@ static HMENU app_create_menu(void)
     AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_MULTIFACE_NMI, "Multiface &NMI\tAlt+F5");
     AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_HOST_NETWORKING,
                 "Next Host &Networking");
-    AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_REWIND, "&Rewind 2 Seconds\tF8");
+    AppendMenuA(machine_menu, MF_STRING, APP_MENU_MACHINE_REWIND, "&Rewind 2 Seconds\tBackspace");
     AppendMenuA(view_menu, MF_STRING, APP_MENU_VIEW_FULLSCREEN, "&Fullscreen\tF11");
     AppendMenuA(view_menu, MF_STRING, APP_MENU_VIEW_INTEGER_SCALING, "&Integer Scaling");
     AppendMenuA(view_menu, MF_SEPARATOR, 0, NULL);
@@ -4621,7 +4621,7 @@ static bool app_find_file_pattern(
     return false;
 }
 
-/* Finds assets downloaded under bin/nextzxos without baking a release number
+/* Finds assets downloaded under redist/nextzxos without baking a release number
    into the executable. Official emulator packages unpack as sn-emulator-* . */
 static bool app_find_next_asset(
     const char *pattern,
@@ -5592,12 +5592,19 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                 case VK_F11:
                     SendMessageA(hwnd, WM_COMMAND, APP_MENU_VIEW_FULLSCREEN, 0);
                     return 0;
-                case VK_F8:
-                    if ((lparam & (1u << 30)) == 0)
+                case VK_BACK:
+                    /* Backspace is the rewind shortcut on classic machines.
+                       The Next has no rewind history, so it keeps the normal
+                       Spectrum DELETE mapping there. */
+                    if (app->machine_kind == APP_MACHINE_CLASSIC)
                     {
-                        SendMessageA(hwnd, WM_COMMAND, APP_MENU_MACHINE_REWIND, 0);
+                        if ((lparam & (1u << 30)) == 0)
+                        {
+                            SendMessageA(hwnd, WM_COMMAND, APP_MENU_MACHINE_REWIND, 0);
+                        }
+                        return 0;
                     }
-                    return 0;
+                    break;
                 case VK_ESCAPE:
                     if (app->fullscreen)
                     {

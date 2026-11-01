@@ -178,9 +178,14 @@ void spectrum_set_joystick_type(Spectrum *spec, zx_joystick_type_t type);
 /* Updates the emulated joystick state mask presented through that interface. */
 void spectrum_set_joystick_mask(Spectrum *spec, uint8_t mask);
 
+/* Selects one of the mutually exclusive host-mouse interfaces. */
 void spectrum_set_kempston_mouse_enabled(Spectrum *spec, bool enabled);
 void spectrum_set_amx_mouse_enabled(Spectrum *spec, bool enabled);
+
+/* Updates the shared active-high host button mask and Kempston counters. */
 void spectrum_set_mouse(Spectrum *spec, uint8_t x, uint8_t y, uint8_t buttons);
+
+/* Converts relative host motion into interrupt-driven AMX movement steps. */
 void spectrum_move_amx_mouse(Spectrum *spec, int delta_x, int delta_y);
 void spectrum_set_expansion_audio(
     Spectrum *spec,

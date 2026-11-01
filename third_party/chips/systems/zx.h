@@ -232,6 +232,7 @@ typedef struct {
     uint8_t mouse_y;
     uint8_t mouse_buttons;
     bool kempston_mouse_enabled;
+    // AMX Z80 PIO vectors, direction inputs, and pending movement interrupts
     bool amx_mouse_enabled;
     uint8_t amx_vector_x;
     uint8_t amx_vector_y;
@@ -393,11 +394,11 @@ zx_joystick_type_t zx_joystick_type(zx_t* sys);
 void zx_joystick(zx_t* sys, uint8_t mask);
 // enable or disable the Kempston mouse ports
 void zx_set_kempston_mouse_enabled(zx_t* sys, bool enabled);
-// enable or disable the AMX Mouse PIO ports and movement interrupts
+// enable or disable AMX PIO ports 1F/3F/5F/7F, button port DF, and IM2 movement
 void zx_set_amx_mouse_enabled(zx_t* sys, bool enabled);
-// update the Kempston mouse counters and active-high button mask
+// update Kempston counters and the active-high button mask shared with AMX
 void zx_mouse(zx_t* sys, uint8_t x, uint8_t y, uint8_t buttons);
-// queue AMX Mouse movement, with positive Y moving upwards
+// queue one AMX PIO interrupt per movement step, with positive Y moving upwards
 void zx_amx_mouse_move(zx_t* sys, int delta_x, int delta_y);
 // configure optional audio peripherals
 void zx_set_expansion_audio(zx_t* sys, bool fuller_audio, bool specdrum, bool covox);
