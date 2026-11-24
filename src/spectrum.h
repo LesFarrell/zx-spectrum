@@ -13,6 +13,7 @@
 #include "chips/kbd.h"
 #include "chips/clk.h"
 #include "systems/zx.h"
+#include "wd1772.h"
 
 enum {
     ZX_SCREEN_WIDTH = ZX_DISPLAY_WIDTH,
@@ -43,6 +44,8 @@ typedef struct Spectrum {
     zx_tape_input_callback_t tape_callback;
     zx_tape_load_trap_callback_t tape_load_trap;
     void *tape_user_data;
+    /* Callbacks receive the selected drive number; frontends may attach
+       multiple images even though the current Win32 UI exposes one slot. */
     zx_disk_ready_callback_t disk_ready;
     zx_disk_read_sector_callback_t disk_read_sector;
     zx_disk_write_sector_callback_t disk_write_sector;
@@ -72,6 +75,28 @@ typedef struct Spectrum {
     bool interface1_rom_loaded;
     uint8_t multiface_rom[ZX_MULTIFACE_ROM_SIZE];
     bool multiface_rom_loaded;
+    Wd1772 plusd_fdc;
+    uint8_t plusd_rom[0x2000];
+    uint8_t plusd_ram[0x2000];
+    bool plusd_rom_loaded;
+    Wd1772 disciple_fdc;
+    uint8_t disciple_rom[0x2000];
+    uint8_t disciple_ram[0x2000];
+    bool disciple_rom_loaded;
+    uint8_t printer_last_byte;
+    uint32_t printer_byte_count;
+    Wd1772 beta_fdc;
+    uint8_t beta_rom[0x4000];
+    bool beta_rom_loaded;
+    Wd1772 didaktik_fdc;
+    uint8_t didaktik_rom[0x3800];
+    uint8_t didaktik_ram[0x0800];
+    bool didaktik_rom_loaded;
+    Wd1772 opus_fdc;
+    uint8_t opus_rom[0x2000];
+    uint8_t opus_ram[0x0800];
+    uint8_t opus_pia[4];
+    bool opus_rom_loaded;
 
     uint32_t framebuffer[ZX_SCREEN_MAX_WIDTH * ZX_SCREEN_HEIGHT];
 } Spectrum;
@@ -100,6 +125,37 @@ bool spectrum_load_interface1_rom(
 );
 
 bool spectrum_load_multiface_rom(
+    Spectrum *spec,
+    const char *rom_path,
+    char *error_buffer,
+    size_t error_buffer_size
+);
+
+bool spectrum_load_plusd_rom(
+    Spectrum *spec,
+    const char *rom_path,
+    char *error_buffer,
+    size_t error_buffer_size
+);
+bool spectrum_load_disciple_rom(
+    Spectrum *spec,
+    const char *rom_path,
+    char *error_buffer,
+    size_t error_buffer_size
+);
+bool spectrum_load_beta_rom(
+    Spectrum *spec,
+    const char *rom_path,
+    char *error_buffer,
+    size_t error_buffer_size
+);
+bool spectrum_load_didaktik_rom(
+    Spectrum *spec,
+    const char *rom_path,
+    char *error_buffer,
+    size_t error_buffer_size
+);
+bool spectrum_load_opus_rom(
     Spectrum *spec,
     const char *rom_path,
     char *error_buffer,

@@ -313,6 +313,7 @@ static void next_sd_dispatch(NextSdCard *card)
 
 void next_sd_init(NextSdCard *card)
 {
+    if (card == NULL) return;
     memset(card, 0, sizeof(*card));
     card->idle = true;
 }

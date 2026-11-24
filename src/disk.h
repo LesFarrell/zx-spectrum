@@ -36,6 +36,9 @@ typedef struct DskImage {
     bool inserted;
     bool dirty;
     bool source_read_only;
+    bool raw_side_contiguous;
+    uint8_t **owned_sector_data;
+    size_t owned_sector_count;
     char path[260];
 } DskImage;
 

@@ -161,6 +161,11 @@ typedef void (*zx_microdrive_write_callback_t)(
     uint8_t drive,
     uint32_t offset,
     uint8_t value);
+typedef uint8_t (*zx_expansion_port_in_callback_t)(void *user_data, uint16_t port);
+typedef void (*zx_expansion_port_out_callback_t)(void *user_data, uint16_t port, uint8_t value);
+typedef void (*zx_printer_write_callback_t)(void *user_data, uint8_t value);
+typedef uint8_t (*zx_expansion_memory_read_callback_t)(void *user_data, uint16_t address, bool *handled);
+typedef void (*zx_expansion_memory_write_callback_t)(void *user_data, uint16_t address, uint8_t value, bool *handled);
 
 // config parameters for zx_init()
 typedef struct {
@@ -202,6 +207,37 @@ typedef struct {
         bool covox;
         bool multiface_enabled;
         chips_range_t multiface_rom;
+        bool plusd_enabled;
+        chips_range_t plusd_rom;
+        chips_range_t plusd_ram;
+        zx_expansion_port_in_callback_t plusd_port_in;
+        zx_expansion_port_out_callback_t plusd_port_out;
+        void *plusd_user_data;
+        zx_printer_write_callback_t plusd_printer_write;
+        bool disciple_enabled;
+        chips_range_t disciple_rom;
+        chips_range_t disciple_ram;
+        zx_expansion_port_in_callback_t disciple_port_in;
+        zx_expansion_port_out_callback_t disciple_port_out;
+        void *disciple_user_data;
+        zx_printer_write_callback_t disciple_printer_write;
+        bool beta_enabled;
+        chips_range_t beta_rom;
+        zx_expansion_port_in_callback_t beta_port_in;
+        zx_expansion_port_out_callback_t beta_port_out;
+        void *beta_user_data;
+        bool didaktik_enabled;
+        chips_range_t didaktik_rom;
+        chips_range_t didaktik_ram;
+        zx_expansion_port_in_callback_t didaktik_port_in;
+        zx_expansion_port_out_callback_t didaktik_port_out;
+        void *didaktik_user_data;
+        bool opus_enabled;
+        chips_range_t opus_rom;
+        chips_range_t opus_ram;
+        zx_expansion_memory_read_callback_t opus_memory_read;
+        zx_expansion_memory_write_callback_t opus_memory_write;
+        void *opus_user_data;
     } expansion;
     // ROM images
     struct {
@@ -307,6 +343,42 @@ typedef struct {
     bool multiface_16k_ram_mode;
     uint8_t multiface_nmi_ticks;
     uint8_t multiface_rom[ZX_MULTIFACE_ROM_SIZE];
+    bool plusd_enabled;
+    bool plusd_paged;
+    uint8_t *plusd_rom;
+    uint8_t *plusd_ram;
+    zx_expansion_port_in_callback_t plusd_port_in;
+    zx_expansion_port_out_callback_t plusd_port_out;
+    void *plusd_user_data;
+    zx_printer_write_callback_t plusd_printer_write;
+    bool disciple_enabled;
+    bool disciple_paged;
+    uint8_t *disciple_rom;
+    uint8_t *disciple_ram;
+    zx_expansion_port_in_callback_t disciple_port_in;
+    zx_expansion_port_out_callback_t disciple_port_out;
+    void *disciple_user_data;
+    zx_printer_write_callback_t disciple_printer_write;
+    bool beta_enabled;
+    bool beta_paged;
+    uint8_t *beta_rom;
+    zx_expansion_port_in_callback_t beta_port_in;
+    zx_expansion_port_out_callback_t beta_port_out;
+    void *beta_user_data;
+    bool didaktik_enabled;
+    bool didaktik_paged;
+    uint8_t *didaktik_rom;
+    uint8_t *didaktik_ram;
+    zx_expansion_port_in_callback_t didaktik_port_in;
+    zx_expansion_port_out_callback_t didaktik_port_out;
+    void *didaktik_user_data;
+    bool opus_enabled;
+    bool opus_paged;
+    uint8_t *opus_rom;
+    uint8_t *opus_ram;
+    zx_expansion_memory_read_callback_t opus_memory_read;
+    zx_expansion_memory_write_callback_t opus_memory_write;
+    void *opus_user_data;
     uint8_t multiface_ram[ZX_MULTIFACE_RAM_SIZE];
     zx_microdrive_ready_callback_t microdrive_ready;
     zx_microdrive_write_protected_callback_t microdrive_write_protected;
@@ -453,6 +525,15 @@ static void _zx_interface1_page(zx_t* sys);
 static void _zx_interface1_unpage(zx_t* sys);
 static uint8_t _zx_interface1_port_in(zx_t* sys, uint16_t port);
 static void _zx_interface1_port_out(zx_t* sys, uint16_t port, uint8_t value);
+static void _zx_plusd_page(zx_t* sys);
+static void _zx_plusd_unpage(zx_t* sys);
+static void _zx_disciple_page(zx_t* sys);
+static void _zx_disciple_unpage(zx_t* sys);
+static void _zx_beta_page(zx_t* sys);
+static void _zx_didaktik_page(zx_t* sys);
+static void _zx_didaktik_unpage(zx_t* sys);
+static void _zx_opus_page(zx_t* sys);
+static void _zx_opus_unpage(zx_t* sys);
 
 #define _ZX_DEFAULT(val,def) (((val) != 0) ? (val) : (def))
 
@@ -710,6 +791,65 @@ void zx_init(zx_t* sys, const zx_desc_t* desc) {
     sys->fuller_audio_enabled = desc->expansion.fuller_audio;
     sys->specdrum_enabled = desc->expansion.specdrum;
     sys->covox_enabled = desc->expansion.covox;
+    sys->plusd_enabled = desc->expansion.plusd_enabled &&
+        desc->expansion.plusd_rom.ptr != NULL &&
+        desc->expansion.plusd_rom.size == 0x2000 &&
+        desc->expansion.plusd_ram.ptr != NULL &&
+        desc->expansion.plusd_ram.size == 0x2000 &&
+        desc->type != ZX_TYPE_PLUS2A && desc->type != ZX_TYPE_PLUS3;
+    if (sys->plusd_enabled) {
+        sys->plusd_rom = (uint8_t *)desc->expansion.plusd_rom.ptr;
+        sys->plusd_ram = (uint8_t *)desc->expansion.plusd_ram.ptr;
+        sys->plusd_port_in = desc->expansion.plusd_port_in;
+        sys->plusd_port_out = desc->expansion.plusd_port_out;
+        sys->plusd_user_data = desc->expansion.plusd_user_data;
+        sys->plusd_printer_write = desc->expansion.plusd_printer_write;
+    }
+    sys->disciple_enabled = desc->expansion.disciple_enabled &&
+        desc->expansion.disciple_rom.ptr != NULL &&
+        desc->expansion.disciple_rom.size == 0x2000 &&
+        desc->expansion.disciple_ram.ptr != NULL &&
+        desc->expansion.disciple_ram.size == 0x2000 &&
+        desc->type != ZX_TYPE_PLUS2A && desc->type != ZX_TYPE_PLUS3;
+    if (sys->disciple_enabled) {
+        sys->disciple_rom = (uint8_t *)desc->expansion.disciple_rom.ptr;
+        sys->disciple_ram = (uint8_t *)desc->expansion.disciple_ram.ptr;
+        sys->disciple_port_in = desc->expansion.disciple_port_in;
+        sys->disciple_port_out = desc->expansion.disciple_port_out;
+        sys->disciple_user_data = desc->expansion.disciple_user_data;
+        sys->disciple_printer_write = desc->expansion.disciple_printer_write;
+    }
+    sys->beta_enabled = desc->expansion.beta_enabled &&
+        desc->expansion.beta_rom.ptr != NULL &&
+        desc->expansion.beta_rom.size == 0x4000 &&
+        desc->type != ZX_TYPE_PLUS2A && desc->type != ZX_TYPE_PLUS3;
+    if (sys->beta_enabled) {
+        sys->beta_rom = (uint8_t *)desc->expansion.beta_rom.ptr;
+        sys->beta_port_in = desc->expansion.beta_port_in;
+        sys->beta_port_out = desc->expansion.beta_port_out;
+        sys->beta_user_data = desc->expansion.beta_user_data;
+    }
+    sys->didaktik_enabled = desc->expansion.didaktik_enabled &&
+        desc->expansion.didaktik_rom.ptr != NULL &&
+        (desc->expansion.didaktik_rom.size == 0x3800 || desc->expansion.didaktik_rom.size == 0x4000) &&
+        desc->expansion.didaktik_ram.ptr != NULL && desc->expansion.didaktik_ram.size == 0x800;
+    if (sys->didaktik_enabled) {
+        sys->didaktik_rom = (uint8_t *)desc->expansion.didaktik_rom.ptr;
+        sys->didaktik_ram = (uint8_t *)desc->expansion.didaktik_ram.ptr;
+        sys->didaktik_port_in = desc->expansion.didaktik_port_in;
+        sys->didaktik_port_out = desc->expansion.didaktik_port_out;
+        sys->didaktik_user_data = desc->expansion.didaktik_user_data;
+    }
+    sys->opus_enabled = desc->expansion.opus_enabled &&
+        desc->expansion.opus_rom.ptr != NULL && desc->expansion.opus_rom.size == 0x2000 &&
+        desc->expansion.opus_ram.ptr != NULL && desc->expansion.opus_ram.size == 0x0800;
+    if (sys->opus_enabled) {
+        sys->opus_rom = (uint8_t *)desc->expansion.opus_rom.ptr;
+        sys->opus_ram = (uint8_t *)desc->expansion.opus_ram.ptr;
+        sys->opus_memory_read = desc->expansion.opus_memory_read;
+        sys->opus_memory_write = desc->expansion.opus_memory_write;
+        sys->opus_user_data = desc->expansion.opus_user_data;
+    }
     sys->specdrum_value = 0x80;
     sys->covox_value = 0x80;
     sys->multiface_enabled =
@@ -805,6 +945,11 @@ void zx_reset(zx_t* sys) {
     sys->multiface_paged = false;
     sys->multiface_software_lockout = false;
     sys->multiface_nmi_ticks = 0;
+    sys->plusd_paged = false;
+    sys->disciple_paged = false;
+    sys->beta_paged = false;
+    sys->didaktik_paged = false;
+    sys->opus_paged = sys->opus_enabled;
     sys->contention_cycle_active = false;
     sys->contention_wait_remaining = 0;
     sys->scanline_counter = sys->scanline_period;
@@ -2259,11 +2404,19 @@ static _ZX_FORCE_INLINE uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
         // a memory request
         const uint16_t addr = Z80_GET_ADDR(pins);
         if (pins & Z80_RD) {
-            if (sys->interface1_enabled && (pins & Z80_M1) &&
-                (addr == 0x0008 || addr == 0x1708)) {
-                _zx_interface1_page(sys);
+            bool handled = false;
+            if (sys->opus_enabled && sys->opus_paged && addr >= 0x2800 && addr < 0x3800 &&
+                sys->opus_memory_read != NULL) {
+                const uint8_t value = sys->opus_memory_read(sys->opus_user_data, addr, &handled);
+                if (handled) Z80_SET_DATA(pins, value);
             }
-            Z80_SET_DATA(pins, mem_rd(&sys->mem, addr));
+            if (!handled) {
+                if (sys->interface1_enabled && (pins & Z80_M1) &&
+                (addr == 0x0008 || addr == 0x1708)) {
+                    _zx_interface1_page(sys);
+                }
+                Z80_SET_DATA(pins, mem_rd(&sys->mem, addr));
+            }
             /* The RET opcode at 0700h is fetched from the Interface 1 ROM;
                its operands and return target must then come from the
                Spectrum's normal memory map. */
@@ -2272,12 +2425,88 @@ static _ZX_FORCE_INLINE uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
             }
         }
         else if (pins & Z80_WR) {
-            mem_wr(&sys->mem, addr, Z80_GET_DATA(pins));
+            bool handled = false;
+            if (sys->opus_enabled && sys->opus_paged && addr >= 0x2800 && addr < 0x3800 &&
+                sys->opus_memory_write != NULL) {
+                sys->opus_memory_write(sys->opus_user_data, addr, Z80_GET_DATA(pins), &handled);
+            }
+            if (!handled) mem_wr(&sys->mem, addr, Z80_GET_DATA(pins));
         }
     }
     else if (!cpu_stalled && (pins & Z80_IORQ) && !(pins & Z80_M1)) {
         const uint16_t io_addr = Z80_GET_ADDR(pins);
-        if (sys->interface1_enabled && (io_addr & 1) != 0 &&
+        if (sys->didaktik_enabled &&
+            ((io_addr & 0xFF) == 0x81 || (io_addr & 0xFF) == 0x83 ||
+             (io_addr & 0xFF) == 0x85 || (io_addr & 0xFF) == 0x87 ||
+             (io_addr & 0xFF) == 0x89 || (io_addr & 0xFF) == 0x91)) {
+            if ((uint8_t)io_addr == 0x91) {
+                if (pins & Z80_RD) _zx_didaktik_page(sys);
+                else if (pins & Z80_WR) _zx_didaktik_unpage(sys);
+            }
+            else if (pins & Z80_RD) {
+                Z80_SET_DATA(pins, sys->didaktik_port_in != NULL ?
+                    sys->didaktik_port_in(sys->didaktik_user_data, io_addr) : 0xFF);
+            }
+            else if (pins & Z80_WR && sys->didaktik_port_out != NULL) {
+                sys->didaktik_port_out(sys->didaktik_user_data, io_addr, Z80_GET_DATA(pins));
+            }
+        }
+        else if (sys->beta_enabled &&
+            ((uint8_t)io_addr == 0x1F || (uint8_t)io_addr == 0x3F ||
+             (uint8_t)io_addr == 0x5F || (uint8_t)io_addr == 0x7F ||
+             (uint8_t)io_addr == 0xFF)) {
+            if ((uint8_t)io_addr == 0xFF) _zx_beta_page(sys);
+            if (pins & Z80_RD) {
+                Z80_SET_DATA(pins, sys->beta_port_in != NULL
+                    ? sys->beta_port_in(sys->beta_user_data, io_addr) : 0xFF);
+            }
+            else if (pins & Z80_WR && sys->beta_port_out != NULL) {
+                sys->beta_port_out(sys->beta_user_data, io_addr, Z80_GET_DATA(pins));
+            }
+        }
+        else if (sys->plusd_enabled &&
+            ((uint8_t)io_addr == 0xE3 || (uint8_t)io_addr == 0xE7 ||
+             (uint8_t)io_addr == 0xEB || (uint8_t)io_addr == 0xEF ||
+             (uint8_t)io_addr == 0xF3 || (uint8_t)io_addr == 0xF7 ||
+             (uint8_t)io_addr == 0xFB)) {
+            if ((uint8_t)io_addr == 0xE7) {
+                if (pins & Z80_RD) _zx_plusd_page(sys);
+                else if (pins & Z80_WR) _zx_plusd_unpage(sys);
+            }
+            if (pins & Z80_RD) {
+                Z80_SET_DATA(pins, sys->plusd_port_in != NULL
+                    ? sys->plusd_port_in(sys->plusd_user_data, io_addr) : 0xFF);
+            }
+            else if (pins & Z80_WR && sys->plusd_port_out != NULL) {
+                sys->plusd_port_out(sys->plusd_user_data, io_addr, Z80_GET_DATA(pins));
+            }
+            if ((pins & Z80_WR) && (uint8_t)io_addr == 0xF7 &&
+                sys->plusd_printer_write != NULL) {
+                sys->plusd_printer_write(sys->plusd_user_data, Z80_GET_DATA(pins));
+            }
+        }
+        else if (sys->disciple_enabled &&
+                 ((uint8_t)io_addr == 0x1B || (uint8_t)io_addr == 0x5B ||
+                  (uint8_t)io_addr == 0x9B || (uint8_t)io_addr == 0xDB ||
+                  (uint8_t)io_addr == 0x1F || (uint8_t)io_addr == 0x7B ||
+                  (uint8_t)io_addr == 0xFB || (uint8_t)io_addr == 0xBB)) {
+            if ((uint8_t)io_addr == 0xBB) {
+                if (pins & Z80_RD) _zx_disciple_page(sys);
+                else if (pins & Z80_WR) _zx_disciple_unpage(sys);
+            }
+            if (pins & Z80_RD) {
+                Z80_SET_DATA(pins, sys->disciple_port_in != NULL
+                    ? sys->disciple_port_in(sys->disciple_user_data, io_addr) : 0xFF);
+            }
+            else if (pins & Z80_WR && sys->disciple_port_out != NULL) {
+                sys->disciple_port_out(sys->disciple_user_data, io_addr, Z80_GET_DATA(pins));
+            }
+            if ((pins & Z80_WR) && (uint8_t)io_addr == 0xFB &&
+                sys->disciple_printer_write != NULL) {
+                sys->disciple_printer_write(sys->disciple_user_data, Z80_GET_DATA(pins));
+            }
+        }
+        else if (sys->interface1_enabled && (io_addr & 1) != 0 &&
             (io_addr & 0x0018) != 0x0018) {
             if (pins & Z80_RD) {
                 Z80_SET_DATA(pins, _zx_interface1_port_in(sys, io_addr));
@@ -2776,6 +3005,74 @@ static void _zx_init_memory_map(zx_t* sys) {
         mem_map_ram(&sys->mem, 0, 0x8000, 0x4000, sys->ram[1]);
         mem_map_ram(&sys->mem, 0, 0xC000, 0x4000, sys->ram[2]);
         mem_map_rom(&sys->mem, 0, 0x0000, 0x4000, sys->rom[0]);
+    }
+    if (sys->plusd_enabled && sys->plusd_paged) {
+        mem_map_rom(&sys->mem, 0, 0x0000, 0x2000, sys->plusd_rom);
+        mem_map_ram(&sys->mem, 0, 0x2000, 0x2000, sys->plusd_ram);
+    }
+    if (sys->disciple_enabled && sys->disciple_paged) {
+        mem_map_rom(&sys->mem, 0, 0x0000, 0x2000, sys->disciple_rom);
+        mem_map_ram(&sys->mem, 0, 0x2000, 0x2000, sys->disciple_ram);
+    }
+    if (sys->beta_enabled && sys->beta_paged) {
+        mem_map_rom(&sys->mem, 0, 0x0000, 0x4000, sys->beta_rom);
+    }
+    if (sys->didaktik_enabled && sys->didaktik_paged) {
+        mem_map_rom(&sys->mem, 0, 0x0000, 0x3800, sys->didaktik_rom);
+        mem_map_ram(&sys->mem, 0, 0x3800, 0x0800, sys->didaktik_ram);
+    }
+    if (sys->opus_enabled && sys->opus_paged) {
+        mem_map_rom(&sys->mem, 0, 0x0000, 0x2000, sys->opus_rom);
+        mem_map_ram(&sys->mem, 0, 0x2000, 0x0800, sys->opus_ram);
+    }
+}
+
+static void _zx_plusd_page(zx_t* sys) {
+    if (sys->plusd_enabled && !sys->plusd_paged) {
+        sys->plusd_paged = true;
+        _zx_init_memory_map(sys);
+    }
+}
+
+static void _zx_plusd_unpage(zx_t* sys) {
+    if (sys->plusd_paged) {
+        sys->plusd_paged = false;
+        _zx_init_memory_map(sys);
+    }
+}
+
+static void _zx_disciple_page(zx_t* sys) {
+    if (sys->disciple_enabled && !sys->disciple_paged) {
+        sys->disciple_paged = true;
+        _zx_init_memory_map(sys);
+    }
+}
+
+static void _zx_disciple_unpage(zx_t* sys) {
+    if (sys->disciple_paged) {
+        sys->disciple_paged = false;
+        _zx_init_memory_map(sys);
+    }
+}
+
+static void _zx_beta_page(zx_t* sys) {
+    if (sys->beta_enabled && !sys->beta_paged) {
+        sys->beta_paged = true;
+        _zx_init_memory_map(sys);
+    }
+}
+
+static void _zx_didaktik_page(zx_t* sys) {
+    if (sys->didaktik_enabled && !sys->didaktik_paged) {
+        sys->didaktik_paged = true;
+        _zx_init_memory_map(sys);
+    }
+}
+
+static void _zx_didaktik_unpage(zx_t* sys) {
+    if (sys->didaktik_paged) {
+        sys->didaktik_paged = false;
+        _zx_init_memory_map(sys);
     }
 }
 

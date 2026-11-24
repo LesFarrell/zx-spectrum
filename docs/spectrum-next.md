@@ -73,10 +73,49 @@ by default. Once changed, the setting is remembered between launches.
 The emulated Wi-Fi network is named `HOST NETWORK`; its credentials are not
 used because Windows already owns the physical Wi-Fi, Ethernet, or VPN
 connection. Next software communicates through the real UART ports `133B`,
-`143B`, `153B`, and `163B`. The ESP-AT commands needed for station setup,
-DNS-backed TCP/UDP client connections, connection status, sending, and
-`+IPD` receive data are supported. A Next program therefore gets the same
-outbound and local-network access as the emulator process.
+`143B`, `153B`, and `163B`.
+
+The station is associated with `HOST NETWORK` by default, so `AT+CIFSR` and
+connections work without an explicit `AT+CWJAP`. `AT+CWJAP` and `AT+CWQAP`
+still model connecting and disconnecting. Supported ESP-AT behavior includes:
+
+- System commands: `AT`, `ATE0`/`ATE1`, `AT+RST`, `AT+RESTORE`, `AT+GMR`,
+  `AT+UART`, `AT+PING`, `AT+GSLP`, `AT+SLEEP`, `AT+RFPOWER`, `AT+CWHOSTNAME`,
+  `AT+SYSMSG`, `AT+SYSSTORE`, `AT+CWAUTOCONN`, `AT+CIPV6`, and the related
+  `_CUR`/`_DEF` forms.
+- Station and access point setup: `AT+CWMODE`, `AT+CWJAP`, `AT+CWQAP`,
+  `AT+CWLAP`, `AT+CWLAPOPT`, `AT+CWSAP`, `AT+CWDHCP`, `AT+CWJEAP`,
+  `AT+CWSTARTDISCOVER`/`AT+CWSTOPDISCOVER`, `AT+CIFSR`, `AT+CIPSTA`,
+  `AT+CIPAP`, `AT+CIPSTAMAC`, `AT+CIPAPMAC`, `AT+CIPDNS`, `AT+CWCOUNTRY`,
+  `AT+MDNS`, and `AT+WPS`.
+- Time services: `AT+CIPSNTPCFG` and `AT+CIPSNTPTIME`.
+- Client connections: DNS-backed `AT+CIPSTART`/`AT+CIPSTARTEX` TCP or UDP
+  (single and multiplex), `AT+CIPSEND`/`AT+CIPSENDEX`/`AT+CIPSENDBUF`,
+  `AT+CIPCLOSE`, `AT+CIPSTATUS`, `AT+CIPSTATE`, and `AT+CIPDOMAIN`.
+- Receive paths: `+IPD` delivery, `AT+CIPDINFO` remote address details,
+  passive receive through `AT+CIPRECVCFG`/`AT+CIPRECVMODE`,
+  `AT+CIPRECVDATA`, and `AT+CIPRECVLEN`.
+- Server mode: `AT+CIPSERVER` with `AT+CIPSERVERMAXCONN` and `AT+CIPSTO` for
+  accepted TCP clients, including `CONNECT`/`CLOSED` notices and `+IPD` data.
+- Transparent mode: `AT+CIPMODE=1` with `AT+CIPSEND` streaming and `+++` to
+  leave transparent transmission.
+- Link tuning: `AT+CIPCLOSEMODE`, `AT+CIPCHECKSEQ`, `AT+CIPRECONNINTV`,
+  `AT+CIPTCPOPT`, and `AT+CIPIOSET`.
+
+ESPAT is driver `N` (78), so its command channel is `OPEN #7,"D>N"`;
+`D>E` is not an ESPAT channel. The Plus pack auto-installs the driver. To do it
+manually, run `.install /nextzxos/espat.drv`, load `/nextzxos/espat.sys` into a
+bank, and initialise it with the `DRIVER 78,...` calls used by `ESPINS.BAS`.
+Only one command channel and one outbound channel are available at a time.
+
+The usual BASIC/ESPAT setup sequence therefore works unchanged: `ATE0`,
+`AT+CWMODE=1`, `AT+CWLAP`, `AT+CWJAP=...`, `AT+CIFSR`, `AT+CIPMUX`,
+`AT+CIPSTART`, `AT+CIPSEND`, and `AT+CIPCLOSE`, followed by
+`AT+CIPSERVER`/`AT+CIPRECVDATA` when acting as a server. Read forms (`?`) and
+test forms (`=?`) are implemented for most supported commands.
+
+A Next program therefore gets the same outbound and local-network access as
+the emulator process, and can also accept inbound connections on the host.
 
 These commands are classic-only and are greyed out on the Next: Save Snapshot,
 Save Screen, Save Program/RAM To Tape, Play/Stop Tape, Save/Eject Disk,
@@ -120,5 +159,13 @@ The built-in assembler accepts the Z80N instructions too; see
 - Next snapshots cannot be saved, and rewind is not available on the Next.
 - The FPGA bitstream itself is not emulated; the boot loader ROM stands in for
   it.
-- ESP transparent mode, TCP server mode, and SSL commands are not currently
-  implemented. Software using ordinary ESP-AT TCP or UDP clients is supported.
+- TLS/SSL ESP-AT connections are not implemented; use plain TCP or UDP.
+  `AT+CIPSSLSIZE` and related SSL configuration commands are accepted but do
+  not enable encryption, and `SSL` connection types fail with `ERROR`.
+- The ESP emulation presents a fixed `HOST NETWORK` access point and a fixed
+  default station address (`127.0.0.1`). `AT+CIPSTA`, `AT+CIPAP`, `AT+CWDHCP`,
+  and the MAC commands update the reported configuration, but traffic still
+  uses the host's network stack and routing. The host's real SSID, DHCP lease,
+  and Wi-Fi link state are not exposed.
+- `AT+PING` uses Windows ICMP and may be blocked by firewalls even when TCP
+  and UDP connections work.

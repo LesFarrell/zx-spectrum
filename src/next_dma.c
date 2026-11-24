@@ -70,6 +70,7 @@ static int next_dma_next_read_reg(const NextDma *dma, int cur) {
 }
 
 void next_dma_init(NextDma *dma) {
+    if (dma == NULL) return;
     for (size_t i = 0; i < sizeof(*dma); ++i) {
         ((uint8_t *)dma)[i] = 0;
     }
@@ -79,6 +80,7 @@ void next_dma_init(NextDma *dma) {
 }
 
 void next_dma_reset(NextDma *dma) {
+    if (dma == NULL) return;
     dma->wedged = false;
     dma->pending_count = 0;
     dma->active_burst = false;

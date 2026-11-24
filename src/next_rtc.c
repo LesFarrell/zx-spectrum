@@ -154,6 +154,7 @@ static void next_rtc_write_register(NextRtc *rtc, uint8_t reg, uint8_t value)
 
 void next_rtc_init(NextRtc *rtc)
 {
+    if (rtc == NULL) return;
     const time_t now = time(NULL);
     const struct tm *local = localtime(&now);
     rtc->scl = true;

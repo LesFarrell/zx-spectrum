@@ -38,6 +38,7 @@ project "zx-spectrum"
         "src/szx_inflate.c",
         "src/zip.c",
         "src/disk.c",
+        "src/wd1772.c",
         "src/microdrive.c",
         "src/tape.c",
         "src/*.h",
@@ -62,7 +63,8 @@ project "zx-spectrum"
         "shell32",
         "user32",
         "winmm",
-        "ws2_32"
+        "ws2_32",
+        "iphlpapi"
     }
 
     postbuildcommands {

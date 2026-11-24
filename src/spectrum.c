@@ -58,6 +58,211 @@ static uint32_t spectrum_read_u32(const uint8_t *data)
            ((uint32_t)data[3] << 24);
 }
 
+static bool spectrum_plusd_read_sector(
+    void *user_data, uint8_t drive, uint8_t track, uint8_t side,
+    uint8_t sector, uint8_t *buffer, uint32_t buffer_size, uint32_t *data_size)
+{
+    Spectrum *spec = (Spectrum *)user_data;
+    return spec->disk_read_sector != NULL && spec->disk_read_sector(
+        spec->disk_user_data, drive, track, side, sector, 0xFF,
+        buffer, buffer_size, data_size, NULL, NULL);
+}
+
+static bool spectrum_plusd_write_sector(
+    void *user_data, uint8_t drive, uint8_t track, uint8_t side,
+    uint8_t sector, const uint8_t *buffer, uint32_t data_size)
+{
+    Spectrum *spec = (Spectrum *)user_data;
+    return spec->disk_write_sector != NULL && spec->disk_write_sector(
+        spec->disk_user_data, drive, track, side, sector, 0xFF,
+        buffer, data_size);
+}
+
+static uint8_t spectrum_plusd_port_in(void *user_data, uint16_t port)
+{
+    Spectrum *spec = (Spectrum *)user_data;
+    switch ((uint8_t)port) {
+        case 0xE3: return spec->plusd_fdc.status;
+        case 0xEB: return wd1772_read_register(&spec->plusd_fdc, 1);
+        case 0xF3: return wd1772_read_register(&spec->plusd_fdc, 2);
+        case 0xFB: return wd1772_read_register(&spec->plusd_fdc, 3);
+        default: return 0xFF;
+    }
+}
+
+static void spectrum_plusd_port_out(void *user_data, uint16_t port, uint8_t value)
+{
+    Spectrum *spec = (Spectrum *)user_data;
+    switch ((uint8_t)port) {
+        case 0xE3: wd1772_write_register(&spec->plusd_fdc, 0, value); break;
+        case 0xEB: wd1772_write_register(&spec->plusd_fdc, 1, value); break;
+        case 0xF3: wd1772_write_register(&spec->plusd_fdc, 2, value); break;
+        case 0xFB: wd1772_write_register(&spec->plusd_fdc, 3, value); break;
+        case 0xEF:
+            wd1772_set_drive(&spec->plusd_fdc, value & 1, (value >> 7) & 1);
+            break;
+        default: break;
+    }
+}
+
+static void spectrum_printer_write(void *user_data, uint8_t value)
+{
+    Spectrum *spec = (Spectrum *)user_data;
+    spec->printer_last_byte = value;
+    ++spec->printer_byte_count;
+}
+
+static bool spectrum_disciple_read_sector(
+    void *user_data, uint8_t drive, uint8_t track, uint8_t side,
+    uint8_t sector, uint8_t *buffer, uint32_t buffer_size, uint32_t *data_size)
+{
+    Spectrum *spec = (Spectrum *)user_data;
+    return spec->disk_read_sector != NULL && spec->disk_read_sector(
+        spec->disk_user_data, drive, track, side, sector, 0xFF,
+        buffer, buffer_size, data_size, NULL, NULL);
+}
+
+static bool spectrum_disciple_write_sector(
+    void *user_data, uint8_t drive, uint8_t track, uint8_t side,
+    uint8_t sector, const uint8_t *buffer, uint32_t data_size)
+{
+    Spectrum *spec = (Spectrum *)user_data;
+    return spec->disk_write_sector != NULL && spec->disk_write_sector(
+        spec->disk_user_data, drive, track, side, sector, 0xFF,
+        buffer, data_size);
+}
+
+static uint8_t spectrum_disciple_port_in(void *user_data, uint16_t port)
+{
+    Spectrum *spec = (Spectrum *)user_data;
+    switch ((uint8_t)port) {
+        case 0x1B: return spec->disciple_fdc.status;
+        case 0x5B: return wd1772_read_register(&spec->disciple_fdc, 1);
+        case 0x9B: return wd1772_read_register(&spec->disciple_fdc, 2);
+        case 0xDB: return wd1772_read_register(&spec->disciple_fdc, 3);
+        default: return 0xFF;
+    }
+}
+
+static void spectrum_disciple_port_out(void *user_data, uint16_t port, uint8_t value)
+{
+    Spectrum *spec = (Spectrum *)user_data;
+    switch ((uint8_t)port) {
+        case 0x1B: wd1772_write_register(&spec->disciple_fdc, 0, value); break;
+        case 0x5B: wd1772_write_register(&spec->disciple_fdc, 1, value); break;
+        case 0x9B: wd1772_write_register(&spec->disciple_fdc, 2, value); break;
+        case 0xDB: wd1772_write_register(&spec->disciple_fdc, 3, value); break;
+        case 0x1F: wd1772_set_drive(&spec->disciple_fdc, value & 1, (value >> 1) & 1); break;
+        default: break;
+    }
+}
+
+static bool spectrum_beta_read_sector(
+    void *user_data, uint8_t drive, uint8_t track, uint8_t side,
+    uint8_t sector, uint8_t *buffer, uint32_t buffer_size, uint32_t *data_size)
+{
+    Spectrum *spec = (Spectrum *)user_data;
+    return spec->disk_read_sector != NULL && spec->disk_read_sector(
+        spec->disk_user_data, drive, track, side, sector, 0xFF,
+        buffer, buffer_size, data_size, NULL, NULL);
+}
+
+static bool spectrum_beta_write_sector(
+    void *user_data, uint8_t drive, uint8_t track, uint8_t side,
+    uint8_t sector, const uint8_t *buffer, uint32_t data_size)
+{
+    Spectrum *spec = (Spectrum *)user_data;
+    return spec->disk_write_sector != NULL && spec->disk_write_sector(
+        spec->disk_user_data, drive, track, side, sector, 0xFF,
+        buffer, data_size);
+}
+
+static uint8_t spectrum_beta_port_in(void *user_data, uint16_t port)
+{
+    Spectrum *spec = (Spectrum *)user_data;
+    switch ((uint8_t)port) {
+        case 0x1F: return spec->beta_fdc.status;
+        case 0x3F: return wd1772_read_register(&spec->beta_fdc, 1);
+        case 0x5F: return wd1772_read_register(&spec->beta_fdc, 2);
+        case 0x7F: return wd1772_read_register(&spec->beta_fdc, 3);
+        default: return 0xFF;
+    }
+}
+
+static void spectrum_beta_port_out(void *user_data, uint16_t port, uint8_t value)
+{
+    Spectrum *spec = (Spectrum *)user_data;
+    switch ((uint8_t)port) {
+        case 0x1F: wd1772_write_register(&spec->beta_fdc, 0, value); break;
+        case 0x3F: wd1772_write_register(&spec->beta_fdc, 1, value); break;
+        case 0x5F: wd1772_write_register(&spec->beta_fdc, 2, value); break;
+        case 0x7F: wd1772_write_register(&spec->beta_fdc, 3, value); break;
+        case 0xFF: wd1772_set_drive(&spec->beta_fdc, value & 1, (value >> 4) & 1); break;
+        default: break;
+    }
+}
+
+static bool spectrum_didaktik_read_sector(void *user_data, uint8_t drive, uint8_t c, uint8_t h, uint8_t r, uint8_t *buffer, uint32_t size, uint32_t *actual) {
+    Spectrum *spec = (Spectrum *)user_data;
+    return spec->disk_read_sector != NULL && spec->disk_read_sector(
+        spec->disk_user_data, drive, c, h, r, 0xFF, buffer, size, actual, NULL, NULL);
+}
+static bool spectrum_didaktik_write_sector(void *user_data, uint8_t drive, uint8_t c, uint8_t h, uint8_t r, const uint8_t *buffer, uint32_t size) {
+    Spectrum *spec = (Spectrum *)user_data;
+    return spec->disk_write_sector != NULL && spec->disk_write_sector(
+        spec->disk_user_data, drive, c, h, r, 0xFF, buffer, size);
+}
+static uint8_t spectrum_didaktik_port_in(void *user_data, uint16_t port) {
+    Spectrum *spec = (Spectrum *)user_data;
+    switch ((uint8_t)port) {
+        case 0x81: return spec->didaktik_fdc.status;
+        case 0x83: return wd1772_read_register(&spec->didaktik_fdc, 1);
+        case 0x85: return wd1772_read_register(&spec->didaktik_fdc, 2);
+        case 0x87: return wd1772_read_register(&spec->didaktik_fdc, 3);
+        default: return 0xFF;
+    }
+}
+static void spectrum_didaktik_port_out(void *user_data, uint16_t port, uint8_t value) {
+    Spectrum *spec = (Spectrum *)user_data;
+    switch ((uint8_t)port) {
+        case 0x81: wd1772_write_register(&spec->didaktik_fdc, 0, value); break;
+        case 0x83: wd1772_write_register(&spec->didaktik_fdc, 1, value); break;
+        case 0x85: wd1772_write_register(&spec->didaktik_fdc, 2, value); break;
+        case 0x87: wd1772_write_register(&spec->didaktik_fdc, 3, value); break;
+        case 0x89: wd1772_set_drive(&spec->didaktik_fdc, value & 1, (value >> 1) & 1); break;
+        default: break;
+    }
+}
+
+static bool spectrum_opus_read_sector(void *user_data, uint8_t drive, uint8_t track, uint8_t side, uint8_t sector, uint8_t *buffer, uint32_t buffer_size, uint32_t *data_size) {
+    Spectrum *spec = (Spectrum *)user_data;
+    return spec->disk_read_sector != NULL && spec->disk_read_sector(spec->disk_user_data, drive, track, side, sector, 0xFF, buffer, buffer_size, data_size, NULL, NULL);
+}
+static bool spectrum_opus_write_sector(void *user_data, uint8_t drive, uint8_t track, uint8_t side, uint8_t sector, const uint8_t *buffer, uint32_t data_size) {
+    Spectrum *spec = (Spectrum *)user_data;
+    return spec->disk_write_sector != NULL && spec->disk_write_sector(spec->disk_user_data, drive, track, side, sector, 0xFF, buffer, data_size);
+}
+static uint8_t spectrum_opus_memory_read(void *user_data, uint16_t address, bool *handled) {
+    Spectrum *spec = (Spectrum *)user_data;
+    *handled = true;
+    if (address >= 0x2800 && address < 0x3000) return wd1772_read_register(&spec->opus_fdc, address & 3);
+    if (address >= 0x3000 && address < 0x3800) return spec->opus_pia[address & 3];
+    *handled = false;
+    return 0xFF;
+}
+static void spectrum_opus_memory_write(void *user_data, uint16_t address, uint8_t value, bool *handled) {
+    Spectrum *spec = (Spectrum *)user_data;
+    *handled = true;
+    if (address >= 0x2800 && address < 0x3000) wd1772_write_register(&spec->opus_fdc, address & 3, value);
+    else if (address >= 0x3000 && address < 0x3800) {
+        spec->opus_pia[address & 3] = value;
+        if ((address & 3) == 0 && (spec->opus_pia[2] & 4))
+            wd1772_set_drive(&spec->opus_fdc, (value >> 1) & 1, (value >> 4) & 1);
+        if ((address & 3) == 2 && (spec->opus_pia[3] & 4))
+            spectrum_printer_write(spec, value);
+    } else *handled = false;
+}
+
 static bool spectrum_snapshot_model_compatible(
     SpectrumModel snapshot_model,
     SpectrumModel current_model)
@@ -266,6 +471,46 @@ static void spectrum_init_machine(Spectrum *spec)
     desc.expansion.multiface_rom.size = spec->multiface_rom_loaded
                                             ? sizeof(spec->multiface_rom)
                                             : 0;
+    desc.expansion.plusd_enabled = spec->plusd_rom_loaded;
+    desc.expansion.plusd_rom.ptr = spec->plusd_rom;
+    desc.expansion.plusd_rom.size = spec->plusd_rom_loaded ? sizeof(spec->plusd_rom) : 0;
+    desc.expansion.plusd_ram.ptr = spec->plusd_ram;
+    desc.expansion.plusd_ram.size = spec->plusd_rom_loaded ? sizeof(spec->plusd_ram) : 0;
+    desc.expansion.plusd_port_in = spectrum_plusd_port_in;
+    desc.expansion.plusd_port_out = spectrum_plusd_port_out;
+    desc.expansion.plusd_user_data = spec;
+    desc.expansion.plusd_printer_write = spectrum_printer_write;
+    desc.expansion.disciple_enabled = spec->disciple_rom_loaded;
+    desc.expansion.disciple_rom.ptr = spec->disciple_rom;
+    desc.expansion.disciple_rom.size = spec->disciple_rom_loaded ? sizeof(spec->disciple_rom) : 0;
+    desc.expansion.disciple_ram.ptr = spec->disciple_ram;
+    desc.expansion.disciple_ram.size = spec->disciple_rom_loaded ? sizeof(spec->disciple_ram) : 0;
+    desc.expansion.disciple_port_in = spectrum_disciple_port_in;
+    desc.expansion.disciple_port_out = spectrum_disciple_port_out;
+    desc.expansion.disciple_user_data = spec;
+    desc.expansion.beta_enabled = spec->beta_rom_loaded;
+    desc.expansion.beta_rom.ptr = spec->beta_rom;
+    desc.expansion.beta_rom.size = spec->beta_rom_loaded ? sizeof(spec->beta_rom) : 0;
+    desc.expansion.beta_port_in = spectrum_beta_port_in;
+    desc.expansion.beta_port_out = spectrum_beta_port_out;
+    desc.expansion.beta_user_data = spec;
+    desc.expansion.didaktik_enabled = spec->didaktik_rom_loaded;
+    desc.expansion.didaktik_rom.ptr = spec->didaktik_rom;
+    desc.expansion.didaktik_rom.size = spec->didaktik_rom_loaded ? sizeof(spec->didaktik_rom) : 0;
+    desc.expansion.didaktik_ram.ptr = spec->didaktik_ram;
+    desc.expansion.didaktik_ram.size = spec->didaktik_rom_loaded ? sizeof(spec->didaktik_ram) : 0;
+    desc.expansion.didaktik_port_in = spectrum_didaktik_port_in;
+    desc.expansion.didaktik_port_out = spectrum_didaktik_port_out;
+    desc.expansion.didaktik_user_data = spec;
+    desc.expansion.opus_enabled = spec->opus_rom_loaded;
+    desc.expansion.opus_rom.ptr = spec->opus_rom;
+    desc.expansion.opus_rom.size = spec->opus_rom_loaded ? sizeof(spec->opus_rom) : 0;
+    desc.expansion.opus_ram.ptr = spec->opus_ram;
+    desc.expansion.opus_ram.size = spec->opus_rom_loaded ? sizeof(spec->opus_ram) : 0;
+    desc.expansion.opus_memory_read = spectrum_opus_memory_read;
+    desc.expansion.opus_memory_write = spectrum_opus_memory_write;
+    desc.expansion.opus_user_data = spec;
+    desc.expansion.disciple_printer_write = spectrum_printer_write;
     if (spec->model == SPECTRUM_MODEL_PLUS2A ||
         spec->model == SPECTRUM_MODEL_PLUS3)
     {
@@ -292,6 +537,16 @@ static void spectrum_init_machine(Spectrum *spec)
         desc.roms.zx48k.size = sizeof(spec->rom[spec->rom48_index]);
     }
     zx_init(&spec->machine, &desc);
+    wd1772_init(&spec->plusd_fdc, spectrum_plusd_read_sector,
+                spectrum_plusd_write_sector, spec);
+    wd1772_init(&spec->disciple_fdc, spectrum_disciple_read_sector,
+                spectrum_disciple_write_sector, spec);
+    wd1772_init(&spec->beta_fdc, spectrum_beta_read_sector,
+                spectrum_beta_write_sector, spec);
+    wd1772_init(&spec->didaktik_fdc, spectrum_didaktik_read_sector,
+                spectrum_didaktik_write_sector, spec);
+    wd1772_init(&spec->opus_fdc, spectrum_opus_read_sector,
+                spectrum_opus_write_sector, spec);
     zx_set_multiface_enabled(
         &spec->machine,
         spec->multiface_enabled && spec->multiface_rom_loaded);
@@ -519,6 +774,108 @@ bool spectrum_load_multiface_rom(
     return true;
 }
 
+bool spectrum_load_plusd_rom(
+    Spectrum *spec,
+    const char *rom_path,
+    char *error_buffer,
+    size_t error_buffer_size)
+{
+    size_t file_size = 0;
+    spec->plusd_rom_loaded = false;
+    if (rom_path == NULL || rom_path[0] == '\0') return true;
+    if (!spectrum_load_file_exact(rom_path, spec->plusd_rom,
+                                  sizeof(spec->plusd_rom), &file_size) ||
+        file_size != sizeof(spec->plusd_rom)) {
+        snprintf(error_buffer, error_buffer_size,
+                 "+D ROM must be exactly 8 KB: %s", rom_path);
+        return false;
+    }
+    spec->plusd_rom_loaded = true;
+    return true;
+}
+
+bool spectrum_load_disciple_rom(
+    Spectrum *spec,
+    const char *rom_path,
+    char *error_buffer,
+    size_t error_buffer_size)
+{
+    size_t file_size = 0;
+    spec->disciple_rom_loaded = false;
+    if (rom_path == NULL || rom_path[0] == '\0') return true;
+    if (!spectrum_load_file_exact(rom_path, spec->disciple_rom,
+                                  sizeof(spec->disciple_rom), &file_size) ||
+        file_size != sizeof(spec->disciple_rom)) {
+        snprintf(error_buffer, error_buffer_size,
+                 "DISCiPLE ROM must be exactly 8 KB: %s", rom_path);
+        return false;
+    }
+    spec->disciple_rom_loaded = true;
+    return true;
+}
+
+bool spectrum_load_beta_rom(
+    Spectrum *spec,
+    const char *rom_path,
+    char *error_buffer,
+    size_t error_buffer_size)
+{
+    size_t file_size = 0;
+    spec->beta_rom_loaded = false;
+    if (rom_path == NULL || rom_path[0] == '\0') return true;
+    if (!spectrum_load_file_exact(rom_path, spec->beta_rom,
+                                  sizeof(spec->beta_rom), &file_size) ||
+        file_size != sizeof(spec->beta_rom)) {
+        snprintf(error_buffer, error_buffer_size,
+                 "TR-DOS ROM must be exactly 16 KB: %s", rom_path);
+        return false;
+    }
+    spec->beta_rom_loaded = true;
+    return true;
+}
+
+bool spectrum_load_didaktik_rom(
+    Spectrum *spec,
+    const char *rom_path,
+    char *error_buffer,
+    size_t error_buffer_size)
+{
+    uint8_t image[0x4000];
+    size_t file_size = 0;
+    spec->didaktik_rom_loaded = false;
+    memset(image, 0xFF, sizeof(image));
+    if (rom_path == NULL || rom_path[0] == '\0') return true;
+    if (!spectrum_load_file_exact(rom_path, image, sizeof(image), &file_size) ||
+        (file_size != 0x3800 && file_size != 0x4000)) {
+        snprintf(error_buffer, error_buffer_size,
+                 "Didaktik ROM must be 14 KB or 16 KB: %s", rom_path);
+        return false;
+    }
+    memcpy(spec->didaktik_rom, image, sizeof(spec->didaktik_rom));
+    spec->didaktik_rom_loaded = true;
+    return true;
+}
+
+bool spectrum_load_opus_rom(
+    Spectrum *spec,
+    const char *rom_path,
+    char *error_buffer,
+    size_t error_buffer_size)
+{
+    size_t file_size = 0;
+    spec->opus_rom_loaded = false;
+    if (rom_path == NULL || rom_path[0] == '\0') return true;
+    if (!spectrum_load_file_exact(rom_path, spec->opus_rom,
+                                  sizeof(spec->opus_rom), &file_size) ||
+        file_size != sizeof(spec->opus_rom)) {
+        snprintf(error_buffer, error_buffer_size,
+                 "Opus ROM must be exactly 8 KB: %s", rom_path);
+        return false;
+    }
+    spec->opus_rom_loaded = true;
+    return true;
+}
+
 /* Loads ROM data from disk, validates whether it matches the requested 48K,
    128K, or +3 layout, then creates and resets the embedded chips-based machine. */
 bool spectrum_load_roms(
@@ -627,6 +984,11 @@ void spectrum_reset(Spectrum *spec)
         return;
     }
     zx_reset(&spec->machine);
+    wd1772_reset(&spec->plusd_fdc);
+    wd1772_reset(&spec->disciple_fdc);
+    wd1772_reset(&spec->beta_fdc);
+    wd1772_reset(&spec->didaktik_fdc);
+    wd1772_reset(&spec->opus_fdc);
     spectrum_render_frame(spec);
 }
 

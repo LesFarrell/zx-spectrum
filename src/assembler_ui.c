@@ -1440,6 +1440,7 @@ static bool app_assembler_load_source_path(
     char *normalized;
     size_t extra_cr = 0;
     size_t normalized_index = 0;
+    size_t normalized_capacity;
 
     file = fopen(path, "rb");
     if (file == NULL) {
@@ -1480,7 +1481,14 @@ static bool app_assembler_load_source_path(
         }
     }
 
-    normalized = (char *)malloc((size_t)file_size + extra_cr + 1);
+    if (extra_cr > SIZE_MAX - (size_t)file_size - 1u)
+    {
+        free(data);
+        snprintf(status_buffer, status_buffer_size, "Source file is too large.");
+        return false;
+    }
+    normalized_capacity = (size_t)file_size + extra_cr + 1u;
+    normalized = (char *)malloc(normalized_capacity);
     if (normalized == NULL) {
         free(data);
         snprintf(status_buffer, status_buffer_size, "Out of memory.");
@@ -1488,7 +1496,19 @@ static bool app_assembler_load_source_path(
     }
     for (long i = 0; i < file_size; ++i) {
         if (data[i] == '\n' && (i == 0 || data[i - 1] != '\r')) {
+            if (normalized_index + 1u >= normalized_capacity) {
+                free(normalized);
+                free(data);
+                snprintf(status_buffer, status_buffer_size, "Source file normalization overflow.");
+                return false;
+            }
             normalized[normalized_index++] = '\r';
+        }
+        if (normalized_index + 1u >= normalized_capacity) {
+            free(normalized);
+            free(data);
+            snprintf(status_buffer, status_buffer_size, "Source file normalization overflow.");
+            return false;
         }
         normalized[normalized_index++] = data[i];
     }

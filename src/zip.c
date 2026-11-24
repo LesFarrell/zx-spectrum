@@ -59,7 +59,8 @@ void zip_discard(ZipArchive *archive) {
     }
     if (archive->entries != NULL) {
         for (size_t index = 0; index < archive->entry_count; ++index) {
-            free(archive->entries[index].name);
+            if (archive->entries[index].name != NULL)
+                free(archive->entries[index].name);
         }
     }
     free(archive->entries);

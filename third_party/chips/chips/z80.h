@@ -784,11 +784,11 @@ static inline void _z80_adc16(z80_t* cpu, uint16_t val) {
     cpu->wz = acc + 1;
     const uint32_t res = acc + val + (cpu->f & Z80_CF);
     cpu->hl = (uint16_t)res;
-    cpu->f = (((val ^ acc ^ 0x8000) & (val ^ res) & 0x8000) >> 13) |
-             (((acc ^ res ^ val) >>8 ) & Z80_HF) |
+    cpu->f = (uint8_t)((((val ^ acc ^ 0x8000) & (val ^ res) & 0x8000) >> 13) |
+             (((acc ^ res ^ val) >> 8) & Z80_HF) |
              ((res >> 16) & Z80_CF) |
              ((res >> 8) & (Z80_SF|Z80_YF|Z80_XF)) |
-             ((res & 0xFFFF) ? 0 : Z80_ZF);
+             ((res & 0xFFFF) ? 0 : Z80_ZF));
 }
 
 static inline void _z80_sbc16(z80_t* cpu, uint16_t val) {
@@ -797,11 +797,11 @@ static inline void _z80_sbc16(z80_t* cpu, uint16_t val) {
     cpu->wz = acc + 1;
     const uint32_t res = acc - val - (cpu->f & Z80_CF);
     cpu->hl = (uint16_t)res;
-    cpu->f = (Z80_NF | (((val ^ acc) & (acc ^ res) & 0x8000) >> 13)) |
+    cpu->f = (uint8_t)((Z80_NF | (((val ^ acc) & (acc ^ res) & 0x8000) >> 13)) |
              (((acc ^ res ^ val) >> 8) & Z80_HF) |
              ((res >> 16) & Z80_CF) |
              ((res >> 8) & (Z80_SF|Z80_YF|Z80_XF)) |
-             ((res & 0xFFFF) ? 0 : Z80_ZF);
+             ((res & 0xFFFF) ? 0 : Z80_ZF));
 }
 
 static inline uint8_t _z80_mirror8(uint8_t val) {

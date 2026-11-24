@@ -1605,8 +1605,13 @@ static void app_debug_refresh_window(AppState *app) {
 
         app_debug_decode_instruction(app, addr, mnemonic, sizeof(mnemonic), &len);
         for (uint16_t byte_index = 0; byte_index < len && byte_used + 4 < sizeof(bytes); ++byte_index) {
-            byte_used += (size_t)snprintf(bytes + byte_used, sizeof(bytes) - byte_used, "%02X ",
+            const int written = snprintf(bytes + byte_used, sizeof(bytes) - byte_used, "%02X ",
                 app_debug_mem_rd(app, (uint16_t)(addr + byte_index)));
+            if (written < 0 || (size_t)written >= sizeof(bytes) - byte_used) {
+                byte_used = sizeof(bytes) - 1;
+                break;
+            }
+            byte_used += (size_t)written;
         }
         bytes[byte_used] = '\0';
         app_append_textf(buffer, buffer_size, &used, "%-12s %s\r\n", bytes, mnemonic);

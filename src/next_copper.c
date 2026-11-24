@@ -36,6 +36,7 @@ static uint16_t next_copper_wait_threshold(uint8_t x)
 
 void next_copper_init(NextCopper *copper)
 {
+    if (copper == NULL) return;
     for (size_t i = 0; i < sizeof(*copper); ++i)
     {
         ((uint8_t *)copper)[i] = 0;
@@ -45,6 +46,7 @@ void next_copper_init(NextCopper *copper)
 
 void next_copper_reset(NextCopper *copper)
 {
+    if (copper == NULL) return;
     copper->write_ptr = 0;
     copper->mode = NEXT_COPPER_START_STOP;
     copper->restart_pending = false;

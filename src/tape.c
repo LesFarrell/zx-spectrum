@@ -1870,6 +1870,7 @@ finished:
 }
 
 void tape_init(TapePlayer *player) {
+    if (player == NULL) return;
     memset(player, 0, sizeof(*player));
 }
 
@@ -1877,8 +1878,10 @@ void tape_discard(TapePlayer *player) {
     if (player == NULL) {
         return;
     }
-    for (size_t i = 0; i < player->block_count; ++i) {
-        free(player->blocks[i].bytes);
+    if (player->blocks != NULL) {
+        for (size_t i = 0; i < player->block_count; ++i) {
+            free(player->blocks[i].bytes);
+        }
     }
     free(player->blocks);
     free(player->segments);

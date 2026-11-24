@@ -76,6 +76,9 @@ enum
     APP_MENU_FILE_SAVE_RAM_TAPE = 1013,
     APP_MENU_DISK_EJECT = 1010,
     APP_MENU_DISK_SAVE = 1011,
+    APP_MENU_DISK2_OPEN = 1014,
+    APP_MENU_DISK2_EJECT = 1015,
+    APP_MENU_DISK2_SAVE = 1016,
     APP_MENU_SOUND_MUTE = 1101,
     APP_MENU_SOUND_FULLER_AY = 1102,
     APP_MENU_SOUND_SPECDRUM = 1103,
@@ -491,9 +494,19 @@ struct RomSelection
     char multiface1_rom[MAX_PATH];
     char multiface128_rom[MAX_PATH];
     char multiface3_rom[MAX_PATH];
+    char plusd_rom[MAX_PATH];
+    char disciple_rom[MAX_PATH];
     bool has_multiface1_rom;
     bool has_multiface128_rom;
     bool has_multiface3_rom;
+    bool has_plusd_rom;
+    bool has_disciple_rom;
+    char beta_rom[MAX_PATH];
+    bool has_beta_rom;
+    char didaktik_rom[MAX_PATH];
+    bool has_didaktik_rom;
+    char opus_rom[MAX_PATH];
+    bool has_opus_rom;
 };
 
 struct AppState
@@ -515,6 +528,7 @@ struct AppState
     NextNexLoadState next_nexload;
     TapePlayer tape;
     DskImage disk;
+    DskImage disk2;
     MicrodriveBank microdrives;
     RewindState rewind;
     DebugState debug;
@@ -557,6 +571,43 @@ struct AppState
     bool modal_loop_timer_active;
     uint32_t *crt_framebuffer;
 };
+
+static DskImage *app_disk_for_drive(AppState *app, uint8_t drive)
+{
+    drive &= (uint8_t)~DSK_WRITE_DELETED;
+    return app != NULL && drive == 1 ? &app->disk2 : (app != NULL ? &app->disk : NULL);
+}
+
+static bool app_disk_ready(void *user_data, uint8_t drive)
+{
+    DskImage *disk = app_disk_for_drive((AppState *)user_data, drive);
+    return disk != NULL && dsk_drive_ready(disk, 0);
+}
+
+static bool app_disk_read(void *user_data, uint8_t drive, uint8_t c, uint8_t h,
+    uint8_t r, uint8_t n, uint8_t *buffer, uint32_t buffer_size,
+    uint32_t *data_size, uint8_t *st1, uint8_t *st2)
+{
+    DskImage *disk = app_disk_for_drive((AppState *)user_data, drive);
+    return disk != NULL && dsk_read_sector(disk, 0, c, h, r, n, buffer,
+        buffer_size, data_size, st1, st2);
+}
+
+static bool app_disk_write(void *user_data, uint8_t drive, uint8_t c, uint8_t h,
+    uint8_t r, uint8_t n, const uint8_t *buffer, uint32_t data_size)
+{
+    DskImage *disk = app_disk_for_drive((AppState *)user_data, drive);
+    return disk != NULL && dsk_write_sector(disk, 0, c, h, r, n, buffer, data_size);
+}
+
+static bool app_disk_sector_id(void *user_data, uint8_t drive, uint8_t c, uint8_t h,
+    uint8_t index, uint8_t *out_c, uint8_t *out_h, uint8_t *out_r,
+    uint8_t *out_n, uint8_t *st1, uint8_t *st2)
+{
+    DskImage *disk = app_disk_for_drive((AppState *)user_data, drive);
+    return disk != NULL && dsk_get_sector_id(disk, 0, c, h, index, out_c, out_h,
+        out_r, out_n, st1, st2);
+}
 
 typedef struct AssemblerSourceLocation
 {
@@ -980,6 +1031,10 @@ static HMENU app_create_menu(void)
     AppendMenuA(tape_menu, MF_STRING, APP_MENU_FILE_FAST_TAPE_LOADING, "Use &Fast Tape Loading");
     AppendMenuA(disk_menu, MF_STRING, APP_MENU_DISK_SAVE, "&Save Disk");
     AppendMenuA(disk_menu, MF_STRING, APP_MENU_DISK_EJECT, "&Eject Disk");
+    AppendMenuA(disk_menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(disk_menu, MF_STRING, APP_MENU_DISK2_OPEN, "Open Drive &2...");
+    AppendMenuA(disk_menu, MF_STRING, APP_MENU_DISK2_SAVE, "Save Drive 2");
+    AppendMenuA(disk_menu, MF_STRING, APP_MENU_DISK2_EJECT, "Eject Drive 2");
     for (int drive = 0; drive < MICRODRIVE_COUNT; ++drive)
     {
         HMENU drive_menu = CreatePopupMenu();
@@ -1073,6 +1128,41 @@ static HMENU app_create_menu(void)
     return menu_bar;
 }
 
+static bool app_load_disk2_file(AppState *app, const char *path,
+    char *error_buffer, size_t error_buffer_size)
+{
+    DskImage loaded;
+    dsk_init(&loaded);
+    if (!dsk_load_file(&loaded, path, error_buffer, error_buffer_size)) return false;
+    dsk_discard(&app->disk2);
+    app->disk2 = loaded;
+    dsk_init(&loaded);
+    spectrum_notify_disk_changed(&app->spec);
+    return true;
+}
+
+static bool app_confirm_discard_disk2_changes(HWND hwnd, AppState *app)
+{
+    char message[512];
+    char error_buffer[256];
+    int result;
+    if (app == NULL || !app->disk2.inserted || !app->disk2.dirty)
+        return true;
+    snprintf(message, sizeof(message),
+        "Drive 2 has changed.\n\nSave it to\n%s\nbefore replacing it?",
+        app->disk2.path);
+    result = MessageBoxA(hwnd, message, "Unsaved Drive 2 Changes",
+        MB_YESNOCANCEL | MB_ICONWARNING | MB_DEFBUTTON1);
+    if (result == IDCANCEL)
+        return false;
+    if (result == IDYES && !dsk_save_file(&app->disk2, error_buffer, sizeof(error_buffer)))
+    {
+        app_show_error(error_buffer);
+        return false;
+    }
+    return true;
+}
+
 /* Fullscreen detaches the menu bar from the window, so fall back to the
    application's own handle to keep check marks and lists current there. */
 static HMENU app_window_menu(HWND hwnd)
@@ -1145,6 +1235,18 @@ static void app_update_disk_menu(HWND hwnd, bool inserted, bool writable)
         menu,
         APP_MENU_DISK_SAVE,
         MF_BYCOMMAND | (inserted && writable ? MF_ENABLED : MF_GRAYED));
+}
+
+static void app_update_disk2_menu(HWND hwnd, const DskImage *disk)
+{
+    HMENU menu = app_window_menu(hwnd);
+    const bool inserted = disk != NULL && disk->inserted;
+    const bool writable = inserted && !disk->source_read_only;
+    if (menu == NULL) return;
+    EnableMenuItem(menu, APP_MENU_DISK2_SAVE,
+        MF_BYCOMMAND | (writable ? MF_ENABLED : MF_GRAYED));
+    EnableMenuItem(menu, APP_MENU_DISK2_EJECT,
+        MF_BYCOMMAND | (inserted ? MF_ENABLED : MF_GRAYED));
 }
 
 static void app_update_microdrive_menu(HWND hwnd, const AppState *app)
@@ -1275,8 +1377,9 @@ static void app_update_runtime_menu(HWND hwnd, const AppState *app)
     {
         char label[64];
         const unsigned multiplier = speed_multipliers[i];
+        const unsigned next_speed_shift = app->next.nextregs[0x07] & 3u;
         const double base_hz = app->machine_kind == APP_MACHINE_NEXT
-                                   ? 3500000.0 * (double)(1u << (app->next.nextregs[0x07] & 3))
+                                   ? 3500000.0 * (double)(1u << next_speed_shift)
                                    : (double)app->spec.machine.freq_hz;
         const double mhz = (base_hz * (double)multiplier) / 1000000.0;
         if (multiplier == 1)
@@ -1428,6 +1531,10 @@ static void app_add_recent_media(AppState *app, const char *path)
     if (app == NULL || path == NULL || path[0] == '\0')
     {
         return;
+    }
+    if (app->recent_media_count > APP_RECENT_MEDIA_COUNT)
+    {
+        app->recent_media_count = APP_RECENT_MEDIA_COUNT;
     }
     length = GetFullPathNameA(path, MAX_PATH, absolute_path, NULL);
     if (length > 0 && length < MAX_PATH)
@@ -1651,7 +1758,8 @@ static bool app_video_backbuffer_ensure(
     }
     if (backbuffer->bitmap != NULL)
     {
-        SelectObject(backbuffer->dc, backbuffer->previous_bitmap);
+        if (backbuffer->dc != NULL && backbuffer->previous_bitmap != NULL)
+            SelectObject(backbuffer->dc, backbuffer->previous_bitmap);
         DeleteObject(backbuffer->bitmap);
         backbuffer->bitmap = NULL;
         backbuffer->previous_bitmap = NULL;
@@ -2843,30 +2951,34 @@ static bool app_confirm_discard_disk_changes(HWND hwnd, AppState *app, const cha
     char message[384];
     char error_buffer[256];
     int result;
-    if (app == NULL || !app->disk.inserted || !app->disk.dirty)
+    if (app == NULL) return true;
+    if (app->disk.inserted && app->disk.dirty)
     {
-        return true;
+        snprintf(message, sizeof(message),
+            "The inserted disk has changed.\n\nSave it to\n%s\nbefore %s?",
+            app->disk.path, action);
+        result = MessageBoxA(hwnd, message, "Unsaved Disk Changes",
+            MB_YESNOCANCEL | MB_ICONWARNING | MB_DEFBUTTON1);
+        if (result == IDCANCEL) return false;
+        if (result == IDYES && !dsk_save_file(&app->disk, error_buffer, sizeof(error_buffer)))
+        {
+            app_show_error(error_buffer);
+            return false;
+        }
     }
-    snprintf(
-        message,
-        sizeof(message),
-        "The inserted disk has changed.\n\nSave it to\n%s\nbefore %s?",
-        app->disk.path,
-        action);
-    result = MessageBoxA(
-        hwnd,
-        message,
-        "Unsaved Disk Changes",
-        MB_YESNOCANCEL | MB_ICONWARNING | MB_DEFBUTTON1);
-    if (result == IDCANCEL)
+    if (app->disk2.inserted && app->disk2.dirty)
     {
-        return false;
-    }
-    if (result == IDYES &&
-        !dsk_save_file(&app->disk, error_buffer, sizeof(error_buffer)))
-    {
-        app_show_error(error_buffer);
-        return false;
+        snprintf(message, sizeof(message),
+            "Drive 2 has changed.\n\nSave it to\n%s\nbefore %s?",
+            app->disk2.path, action);
+        result = MessageBoxA(hwnd, message, "Unsaved Drive 2 Changes",
+            MB_YESNOCANCEL | MB_ICONWARNING | MB_DEFBUTTON1);
+        if (result == IDCANCEL) return false;
+        if (result == IDYES && !dsk_save_file(&app->disk2, error_buffer, sizeof(error_buffer)))
+        {
+            app_show_error(error_buffer);
+            return false;
+        }
     }
     return true;
 }
@@ -3342,6 +3454,19 @@ static bool app_is_supported_media_name(const char *name)
             _stricmp(extension, ".pzx") == 0 ||
             _stricmp(extension, ".mdr") == 0 ||
             _stricmp(extension, ".dsk") == 0 ||
+            _stricmp(extension, ".mgt") == 0 ||
+            _stricmp(extension, ".img") == 0 ||
+            _stricmp(extension, ".d40") == 0 ||
+            _stricmp(extension, ".d80") == 0 ||
+            _stricmp(extension, ".trd") == 0 ||
+            _stricmp(extension, ".scl") == 0 ||
+            _stricmp(extension, ".sad") == 0 ||
+            _stricmp(extension, ".sdf") == 0 ||
+            _stricmp(extension, ".opd") == 0 ||
+            _stricmp(extension, ".opu") == 0 ||
+            _stricmp(extension, ".fdi") == 0 ||
+            _stricmp(extension, ".udi") == 0 ||
+            _stricmp(extension, ".td0") == 0 ||
             _stricmp(extension, ".scr") == 0 ||
             _stricmp(extension, ".z80") == 0 ||
             _stricmp(extension, ".sna") == 0 ||
@@ -3583,7 +3708,20 @@ static bool app_load_zip_file(
     {
         loaded = false;
     }
-    else if (_stricmp(extension, ".dsk") == 0)
+    else if (_stricmp(extension, ".dsk") == 0 ||
+             _stricmp(extension, ".mgt") == 0 ||
+             _stricmp(extension, ".img") == 0 ||
+             _stricmp(extension, ".d40") == 0 ||
+             _stricmp(extension, ".d80") == 0 ||
+             _stricmp(extension, ".trd") == 0 ||
+             _stricmp(extension, ".scl") == 0 ||
+             _stricmp(extension, ".sad") == 0 ||
+             _stricmp(extension, ".sdf") == 0 ||
+             _stricmp(extension, ".opd") == 0 ||
+             _stricmp(extension, ".opu") == 0 ||
+             _stricmp(extension, ".fdi") == 0 ||
+             _stricmp(extension, ".udi") == 0 ||
+             _stricmp(extension, ".td0") == 0)
     {
         if (!app_confirm_discard_disk_changes(hwnd, app, "Insert another disk"))
         {
@@ -3916,7 +4054,21 @@ static bool app_load_media_path(
         return false;
     }
 
-    if (extension != NULL && _stricmp(extension, ".dsk") == 0)
+    if (extension != NULL &&
+        (_stricmp(extension, ".dsk") == 0 ||
+         _stricmp(extension, ".mgt") == 0 ||
+         _stricmp(extension, ".img") == 0 ||
+         _stricmp(extension, ".d40") == 0 ||
+         _stricmp(extension, ".d80") == 0 ||
+         _stricmp(extension, ".trd") == 0 ||
+         _stricmp(extension, ".scl") == 0 ||
+         _stricmp(extension, ".sad") == 0 ||
+         _stricmp(extension, ".sdf") == 0 ||
+         _stricmp(extension, ".opd") == 0 ||
+         _stricmp(extension, ".opu") == 0 ||
+         _stricmp(extension, ".fdi") == 0 ||
+         _stricmp(extension, ".udi") == 0 ||
+         _stricmp(extension, ".td0") == 0))
     {
         if (!app_confirm_discard_disk_changes(hwnd, app, "Insert another disk"))
         {
@@ -3998,7 +4150,7 @@ static bool app_load_media_path(
     snprintf(
         error_buffer,
         error_buffer_size,
-        "Unsupported file type. Open or drop a .nex, .snx, .zip, .tap, .tzx, .pzx, .mdr, .dsk, .scr, .z80, .sna, or .szx file.");
+        "Unsupported file type. Open or drop a .nex, .snx, .zip, .tap, .tzx, .pzx, .mdr, .dsk, .mgt, .img, .d40, .d80, .trd, .scl, .sad, .sdf, .opd, .opu, .fdi, .udi, .td0, .scr, .z80, .sna, or .szx file.");
     return false;
 }
 
@@ -5802,12 +5954,23 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                 ofn.lStructSize = sizeof(ofn);
                 ofn.hwndOwner = hwnd;
                 ofn.lpstrFilter =
-                    "ZX Spectrum Files (*.nex;*.snx;*.zip;*.tap;*.tzx;*.pzx;*.mdr;*.dsk;*.scr;*.z80;*.sna;*.szx)\0*.nex;*.snx;*.zip;*.tap;*.tzx;*.pzx;*.mdr;*.dsk;*.scr;*.z80;*.sna;*.szx\0"
+                    "ZX Spectrum Files (*.nex;*.snx;*.zip;*.tap;*.tzx;*.pzx;*.mdr;*.dsk;*.mgt;*.img;*.d40;*.d80;*.trd;*.scl;*.sad;*.sdf;*.opd;*.opu;*.fdi;*.udi;*.td0;*.scr;*.z80;*.sna;*.szx)\0*.nex;*.snx;*.zip;*.tap;*.tzx;*.pzx;*.mdr;*.dsk;*.mgt;*.img;*.d40;*.d80;*.trd;*.scl;*.sad;*.sdf;*.opd;*.opu;*.fdi;*.udi;*.td0;*.scr;*.z80;*.sna;*.szx\0"
                     "ZX Spectrum Next Programs (*.nex;*.snx)\0*.nex;*.snx\0"
                     "ZIP Archives (*.zip)\0*.zip\0"
                     "Tape Images (*.tap;*.tzx;*.pzx)\0*.tap;*.tzx;*.pzx\0"
                     "Microdrive Cartridges (*.mdr)\0*.mdr\0"
                     "Spectrum +3 Disks (*.dsk)\0*.dsk\0"
+                    "MGT/+D Disk Images (*.mgt)\0*.mgt\0"
+                    "MGT/IMG Disk Images (*.img)\0*.img\0"
+                    "Didaktik Disk Images (*.d40;*.d80)\0*.d40;*.d80\0"
+                    "TR-DOS Disk Images (*.trd)\0*.trd\0"
+                    "TR-DOS Archives (*.scl)\0*.scl\0"
+                    "SAM Disk Images (*.sad)\0*.sad\0"
+                    "SAM Track Images (*.sdf)\0*.sdf\0"
+                    "Opus Discovery Images (*.opd;*.opu)\0*.opd;*.opu\0"
+                    "FDI Disk Images (*.fdi)\0*.fdi\0"
+                    "UDI Disk Images (*.udi)\0*.udi\0"
+                    "TeleDisk Images (*.td0)\0*.td0\0"
                     "Spectrum Screens (*.scr)\0*.scr\0"
                     "ZX Spectrum Snapshots (*.z80;*.sna;*.szx)\0*.z80;*.sna;*.szx\0"
                     "All Files (*.*)\0*.*\0";
@@ -5917,6 +6080,39 @@ static LRESULT CALLBACK app_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                 }
                 return 0;
             }
+            case APP_MENU_DISK2_OPEN:
+            {
+                OPENFILENAMEA ofn;
+                char path[MAX_PATH];
+                char error_buffer[256];
+                ZeroMemory(&ofn, sizeof(ofn));
+                ZeroMemory(path, sizeof(path));
+                ZeroMemory(error_buffer, sizeof(error_buffer));
+                ofn.lStructSize = sizeof(ofn);
+                ofn.hwndOwner = hwnd;
+                ofn.lpstrFilter = "Disk Images (*.dsk;*.mgt;*.img;*.d40;*.d80;*.trd;*.scl;*.sad;*.sdf;*.opd;*.opu;*.fdi;*.udi;*.td0)\0*.dsk;*.mgt;*.img;*.d40;*.d80;*.trd;*.scl;*.sad;*.sdf;*.opd;*.opu;*.fdi;*.udi;*.td0\0All Files (*.*)\0*.*\0";
+                ofn.lpstrFile = path;
+                ofn.nMaxFile = MAX_PATH;
+                ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+                if (GetOpenFileNameA(&ofn) &&
+                    app_confirm_discard_disk2_changes(hwnd, app) &&
+                    !app_load_disk2_file(app, path, error_buffer, sizeof(error_buffer)))
+                    app_show_error(error_buffer);
+                app_update_disk2_menu(hwnd, &app->disk2);
+                return 0;
+            }
+            case APP_MENU_DISK2_SAVE:
+            {
+                char error_buffer[256];
+                if (!dsk_save_file(&app->disk2, error_buffer, sizeof(error_buffer)))
+                    app_show_error(error_buffer);
+                return 0;
+            }
+            case APP_MENU_DISK2_EJECT:
+                dsk_discard(&app->disk2);
+                spectrum_notify_disk_changed(&app->spec);
+                app_update_disk2_menu(hwnd, &app->disk2);
+                return 0;
             case APP_MENU_DISK_EJECT:
                 if (app_confirm_discard_disk_changes(hwnd, app, "Eject the disk"))
                 {
@@ -6528,17 +6724,25 @@ static bool app_parse_args(
     bool *model_explicit,
     const char **rom_a,
     const char **rom_b,
-    const char **media_path)
+    const char **media_path,
+    const char **media_path2)
 {
     *model = SPECTRUM_MODEL_48K;
     *model_explicit = false;
     *rom_a = NULL;
     *rom_b = NULL;
     *media_path = NULL;
+    *media_path2 = NULL;
 
     for (int i = 1; i < argc; ++i)
     {
         const char *extension;
+
+        if (strncmp(argv[i], "--disk2=", 8) == 0 && argv[i][8] != '\0')
+        {
+            *media_path2 = argv[i] + 8;
+            continue;
+        }
 
         if (strcmp(argv[i], "--128") == 0)
         {
@@ -6598,6 +6802,49 @@ static bool app_parse_args(
     return true;
 }
 
+/* Validates an explicitly supplied ROM path before it is copied into the
+   model selection.  This keeps a typo from being reported later as a generic
+   "no compatible ROM" startup failure. */
+static bool app_validate_rom_path(
+    const char *path,
+    char *error_buffer,
+    size_t error_buffer_size)
+{
+    DWORD attributes;
+    HANDLE file;
+
+    if (path == NULL || path[0] == '\0')
+    {
+        snprintf(error_buffer, error_buffer_size, "ROM path is empty.");
+        return false;
+    }
+
+    attributes = GetFileAttributesA(path);
+    if (attributes == INVALID_FILE_ATTRIBUTES)
+    {
+        snprintf(error_buffer, error_buffer_size,
+                 "ROM file was not found:\n%s", path);
+        return false;
+    }
+    if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+    {
+        snprintf(error_buffer, error_buffer_size,
+                 "ROM path is a directory, not a file:\n%s", path);
+        return false;
+    }
+
+    file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                       NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        snprintf(error_buffer, error_buffer_size,
+                 "ROM file could not be opened for reading:\n%s", path);
+        return false;
+    }
+    CloseHandle(file);
+    return true;
+}
+
 /* Prints the supported command line forms and the default ROM autodetection
    behavior used when the emulator is started without arguments. */
 static void app_print_usage(void)
@@ -6610,6 +6857,7 @@ static void app_print_usage(void)
     fprintf(stderr, "  zx-spectrum.exe --plus2a <plus2a-combined-64k.rom>\n");
     fprintf(stderr, "  zx-spectrum.exe --plus3 <plus3-combined-64k.rom>\n");
     fprintf(stderr, "  zx-spectrum.exe <media-file>\n");
+    fprintf(stderr, "  zx-spectrum.exe --disk2=<media-file>\n");
     fprintf(stderr, "  zx-spectrum.exe\n");
     fprintf(stderr, "\nAutodetects ROM images in the roms folder.\n");
 }
@@ -7292,11 +7540,11 @@ static bool app_load_model_roms(
     spectrum_configure_tape_load_trap(&app->spec, app_tape_fast_load_trap, app);
     spectrum_configure_disk(
         &app->spec,
-        dsk_drive_ready,
-        dsk_read_sector,
-        dsk_write_sector,
-        dsk_get_sector_id,
-        &app->disk);
+        app_disk_ready,
+        app_disk_read,
+        app_disk_write,
+        app_disk_sector_id,
+        app);
     spectrum_configure_interface1(
         &app->spec,
         microdrive_ready,
@@ -7318,6 +7566,56 @@ static bool app_load_model_roms(
     if (!spectrum_load_multiface_rom(
             &app->spec,
             app_multiface_rom_for_model(&app->roms, model),
+            error_buffer,
+            error_buffer_size))
+    {
+        app->spec = *previous_spec;
+        free(previous_spec);
+        return false;
+    }
+    if (!spectrum_load_plusd_rom(
+            &app->spec,
+            app->roms.has_plusd_rom ? app->roms.plusd_rom : NULL,
+            error_buffer,
+            error_buffer_size))
+    {
+        app->spec = *previous_spec;
+        free(previous_spec);
+        return false;
+    }
+    if (!spectrum_load_disciple_rom(
+            &app->spec,
+            app->roms.has_disciple_rom ? app->roms.disciple_rom : NULL,
+            error_buffer,
+            error_buffer_size))
+    {
+        app->spec = *previous_spec;
+        free(previous_spec);
+        return false;
+    }
+    if (!spectrum_load_beta_rom(
+            &app->spec,
+            app->roms.has_beta_rom ? app->roms.beta_rom : NULL,
+            error_buffer,
+            error_buffer_size))
+    {
+        app->spec = *previous_spec;
+        free(previous_spec);
+        return false;
+    }
+    if (!spectrum_load_didaktik_rom(
+            &app->spec,
+            app->roms.has_didaktik_rom ? app->roms.didaktik_rom : NULL,
+            error_buffer,
+            error_buffer_size))
+    {
+        app->spec = *previous_spec;
+        free(previous_spec);
+        return false;
+    }
+    if (!spectrum_load_opus_rom(
+            &app->spec,
+            app->roms.has_opus_rom ? app->roms.opus_rom : NULL,
             error_buffer,
             error_buffer_size))
     {
@@ -7583,7 +7881,10 @@ static bool app_resolve_roms(
     bool has_saved_model,
     SpectrumModel saved_model,
     RomSelection *selection,
-    const char **media_path)
+    const char **media_path,
+    const char **media_path2,
+    char *error_buffer,
+    size_t error_buffer_size)
 {
     SpectrumModel model;
     bool model_explicit;
@@ -7599,7 +7900,15 @@ static bool app_resolve_roms(
             &model_explicit,
             &rom_a,
             &rom_b,
-            media_path))
+            media_path,
+            media_path2))
+    {
+        snprintf(error_buffer, error_buffer_size,
+                 "Invalid command line. Use --help for supported ROM and media forms.");
+        return false;
+    }
+    if ((rom_a != NULL && !app_validate_rom_path(rom_a, error_buffer, error_buffer_size)) ||
+        (rom_b != NULL && !app_validate_rom_path(rom_b, error_buffer, error_buffer_size)))
     {
         return false;
     }
@@ -7629,6 +7938,31 @@ static bool app_resolve_roms(
     {
         snprintf(selection->multiface3_rom, sizeof(selection->multiface3_rom), "%s", rom_path);
         selection->has_multiface3_rom = true;
+    }
+    if (app_find_rom(rom_path, sizeof(rom_path), "plusd.rom"))
+    {
+        snprintf(selection->plusd_rom, sizeof(selection->plusd_rom), "%s", rom_path);
+        selection->has_plusd_rom = true;
+    }
+    if (app_find_rom(rom_path, sizeof(rom_path), "disciple.rom"))
+    {
+        snprintf(selection->disciple_rom, sizeof(selection->disciple_rom), "%s", rom_path);
+        selection->has_disciple_rom = true;
+    }
+    if (app_find_rom(rom_path, sizeof(rom_path), "trdos.rom"))
+    {
+        snprintf(selection->beta_rom, sizeof(selection->beta_rom), "%s", rom_path);
+        selection->has_beta_rom = true;
+    }
+    if (app_find_rom(rom_path, sizeof(rom_path), "didaktik80.rom"))
+    {
+        snprintf(selection->didaktik_rom, sizeof(selection->didaktik_rom), "%s", rom_path);
+        selection->has_didaktik_rom = true;
+    }
+    if (app_find_rom(rom_path, sizeof(rom_path), "opus.rom"))
+    {
+        snprintf(selection->opus_rom, sizeof(selection->opus_rom), "%s", rom_path);
+        selection->has_opus_rom = true;
     }
     if (rom_a != NULL)
     {
@@ -7725,6 +8059,7 @@ int main(int argc, char **argv)
 {
     RomSelection selection;
     const char *startup_media_path = NULL;
+    const char *startup_media_path2 = NULL;
     SpectrumModel saved_model = SPECTRUM_MODEL_48K;
     bool saved_tape_autoload = true;
     bool saved_fast_tape_loading = true;
@@ -7751,6 +8086,7 @@ int main(int argc, char **argv)
     bool has_saved_specdrum_enabled;
     bool has_saved_covox_enabled;
     bool has_saved_multiface_enabled;
+    char rom_error[512] = {0};
     INITCOMMONCONTROLSEX common_controls;
     ZeroMemory(&selection, sizeof(selection));
     has_saved_model = app_load_saved_model(&saved_model);
@@ -7780,10 +8116,15 @@ int main(int argc, char **argv)
             has_saved_model,
             saved_model,
             &selection,
-            &startup_media_path))
+            &startup_media_path,
+            &startup_media_path2,
+            rom_error,
+            sizeof(rom_error)))
     {
         app_print_usage();
-        app_show_error("No compatible ROM found. Place a supported 48K, 128K, +2, +2A, or +3 ROM in the roms folder.");
+        app_show_error(rom_error[0] != '\0'
+                           ? rom_error
+                           : "No compatible ROM found. Place a supported 48K, 128K, +2, +2A, or +3 ROM in the roms folder.");
         return 1;
     }
 
@@ -7839,6 +8180,7 @@ int main(int argc, char **argv)
     app_load_recent_media(&app);
     tape_init(&app.tape);
     dsk_init(&app.disk);
+    dsk_init(&app.disk2);
     microdrive_bank_init(&app.microdrives);
     app_audio_init(&app);
     app_controller_init(&app);
@@ -7951,6 +8293,7 @@ int main(int argc, char **argv)
     app_update_microdrive_menu(hwnd, &app);
     app_update_sound_menu(hwnd, &app);
     app_update_disk_menu(hwnd, app.disk.inserted, !app.disk.source_read_only);
+    app_update_disk2_menu(hwnd, &app.disk2);
     app_update_runtime_menu(hwnd, &app);
     app_update_input_menu(hwnd, &app);
     app_update_recent_menu(hwnd, &app);
@@ -7978,6 +8321,13 @@ int main(int argc, char **argv)
             sizeof(error_buffer)))
     {
         app_show_error(error_buffer);
+    }
+    if (startup_media_path2 != NULL)
+    {
+        dsk_discard(&app.disk2);
+        if (!dsk_load_file(&app.disk2, startup_media_path2, error_buffer, sizeof(error_buffer)))
+            app_show_error(error_buffer);
+        app_update_disk2_menu(hwnd, &app.disk2);
     }
 
     /* The shell keeps the Working in Background cursor active until a GUI
@@ -8063,6 +8413,7 @@ int main(int argc, char **argv)
     app_audio_shutdown(&app);
     tape_discard(&app.tape);
     dsk_discard(&app.disk);
+    dsk_discard(&app.disk2);
     microdrive_bank_discard(&app.microdrives);
     next_machine_discard(&app.next);
     app_rewind_discard(&app);

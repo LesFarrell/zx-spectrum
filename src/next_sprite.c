@@ -20,11 +20,13 @@ typedef struct NextSpriteAnchor
 
 void next_sprite_init(NextSpriteEngine *engine)
 {
+    if (engine == NULL) return;
     memset(engine, 0, sizeof(*engine));
 }
 
 void next_sprite_reset(NextSpriteEngine *engine)
 {
+    if (engine == NULL) return;
     memset(engine->attrs, 0, sizeof(engine->attrs));
     engine->sel_sprite = 0;
     engine->io_sel_sprite = 0;
@@ -332,6 +334,10 @@ void next_sprite_render_scanline(NextSpriteEngine *engine, int y,
                                  uint8_t transparent_index,
                                  uint8_t *dst, uint8_t *present, int width)
 {
+    if (engine == NULL || dst == NULL || present == NULL || width <= 0)
+        return;
+    if (width > NEXT_SPRITE_DISPLAY_WIDTH)
+        width = NEXT_SPRITE_DISPLAY_WIDTH;
     int clip_xs = 0;
     int clip_xe = width - 1;
     int clocks_left = NEXT_SPRITE_LINE_CLOCK_BUDGET;
@@ -435,7 +441,8 @@ void next_sprite_render_scanline(NextSpriteEngine *engine, int y,
                 break;
             }
             --clocks_left;
-            if (sx < 0 || sx >= width)
+            if ((unsigned)sx >= (unsigned)width ||
+                (unsigned)sx >= NEXT_SPRITE_DISPLAY_WIDTH)
                 continue;
             if (engine->clip_set && (sx < clip_xs || sx > clip_xe))
                 continue;
