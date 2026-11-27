@@ -68,7 +68,7 @@ extern "C" {
 #endif
 
 // bump this whenever the zx_t struct layout changes
-#define ZX_SNAPSHOT_VERSION (0x000B)
+#define ZX_SNAPSHOT_VERSION (0x000C)
 
 #define ZX_MAX_AUDIO_SAMPLES (1024)      // max number of audio samples in internal sample buffer
 #define ZX_DEFAULT_AUDIO_SAMPLES (128)   // default number of samples in internal sample buffer
@@ -94,6 +94,13 @@ typedef enum {
     ZX_TYPE_PLUS2A,
     ZX_TYPE_PLUS3,
 } zx_type_t;
+
+/* Ferranti ULA revisions differ by one T-state in the display fetch phase. */
+typedef enum {
+    ZX_ULA_TIMING_STANDARD,
+    ZX_ULA_TIMING_EARLY,
+    ZX_ULA_TIMING_LATE,
+} zx_ula_timing_t;
 
 // ZX Spectrum joystick types
 typedef enum {
@@ -170,6 +177,7 @@ typedef void (*zx_expansion_memory_write_callback_t)(void *user_data, uint16_t a
 // config parameters for zx_init()
 typedef struct {
     zx_type_t type;                     // default is ZX_TYPE_48K
+    zx_ula_timing_t ula_timing;         // standard, early, or late fetch phase
     zx_joystick_type_t joystick_type;   // what joystick to emulate, default is ZX_JOYSTICK_NONE
     chips_debug_t debug;                // optional debugger hook
     struct {
@@ -260,6 +268,7 @@ typedef struct {
     beeper_t beeper;
     ay38910_t ay;
     zx_type_t type;
+    zx_ula_timing_t ula_timing;
     zx_joystick_type_t joystick_type;
     bool memory_paging_disabled;
     uint8_t kbd_joymask;        // joystick mask from keyboard joystick emulation
@@ -756,6 +765,8 @@ void zx_init(zx_t* sys, const zx_desc_t* desc) {
     memset(sys, 0, sizeof(zx_t));
     sys->valid = true;
     sys->type = desc->type;
+    sys->ula_timing = desc->ula_timing <= ZX_ULA_TIMING_LATE
+        ? desc->ula_timing : ZX_ULA_TIMING_STANDARD;
     sys->joystick_type = desc->joystick_type;
     sys->freq_hz = (sys->type == ZX_TYPE_48K) ? _ZX_48K_FREQUENCY : _ZX_128_FREQUENCY;
     sys->audio.callback = desc->audio.callback;
@@ -2169,6 +2180,12 @@ static uint8_t _zx_contention_delay_at(const zx_t* sys, uint32_t tstate) {
     else {
         return 0;
     }
+    if (sys->ula_timing == ZX_ULA_TIMING_EARLY) {
+        start--;
+    }
+    else if (sys->ula_timing == ZX_ULA_TIMING_LATE) {
+        start++;
+    }
 
     if (tstate >= start) {
         const uint32_t rel = tstate - start;
@@ -2184,6 +2201,46 @@ static uint8_t _zx_contention_delay_at(const zx_t* sys, uint32_t tstate) {
 
 static uint8_t _zx_contention_delay(const zx_t* sys) {
     return _zx_contention_delay_at(sys, sys->frame_tstate);
+}
+
+/* The ULA drives the data bus with the byte it is fetching during the
+   active display area.  Port FF reads are commonly used by loaders as a
+   floating-bus probe, so return the current bitmap/attribute fetch instead
+   of the idle bus value.  This intentionally covers the standard screen
+   mode; Timex mode reads are handled by the existing mode register path. */
+static uint8_t _zx_floating_bus_value(const zx_t* sys) {
+    const uint32_t line_period = sys->type == ZX_TYPE_48K ? 224u : 228u;
+    uint32_t display_start = sys->type == ZX_TYPE_48K ? 14338u : 14364u;
+    const uint32_t tstate = sys->frame_tstate;
+    uint32_t relative;
+    uint32_t line;
+    uint32_t phase;
+    uint16_t y_offset;
+    uint16_t x;
+    uint16_t address;
+
+    if (sys->ula_timing == ZX_ULA_TIMING_EARLY)
+        display_start--;
+    else if (sys->ula_timing == ZX_ULA_TIMING_LATE)
+        display_start++;
+    if (sys->timex_video_mode != 0 || tstate < display_start)
+        return 0xFF;
+    relative = tstate - display_start;
+    line = relative / line_period;
+    phase = relative % line_period;
+    /* Two bitmap/attribute pairs, then four idle T-states per group.
+       Timing reference: Fuse spectrum_unattached_port and Ramsoft's
+       Floating bus technical guide (first fetch 14338/14364). */
+    if (line >= 192u || phase >= 128u || (phase & 7u) >= 4u)
+        return 0xFF;
+    x = (uint16_t)((phase / 8u) * 2u + ((phase & 3u) / 2u));
+    y_offset = (uint16_t)(((line & 0xC0u) << 5) |
+                          ((line & 0x07u) << 8) |
+                          ((line & 0x38u) << 2));
+    address = (uint16_t)(y_offset + x);
+    if ((phase & 1u) != 0)
+        address = (uint16_t)(0x1800u + (((line & ~7u) << 2) | x));
+    return sys->ram[sys->display_ram_bank][address];
 }
 
 /* Computes the total clock-stretching required by a complete four-T-state
@@ -2560,7 +2617,9 @@ static _ZX_FORCE_INLINE uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
         }
         else if ((uint8_t)io_addr == 0xFF) {
             if (pins & Z80_RD) {
-                Z80_SET_DATA(pins, sys->timex_video_mode);
+                Z80_SET_DATA(pins, sys->timex_video_mode != 0
+                    ? sys->timex_video_mode
+                    : _zx_floating_bus_value(sys));
             }
             else if (pins & Z80_WR) {
                 sys->timex_video_mode = Z80_GET_DATA(pins);
@@ -2708,6 +2767,11 @@ static _ZX_FORCE_INLINE uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
         else if ((pins & (Z80_RD|Z80_A7|Z80_A6|Z80_A5)) == Z80_RD) {
             // Kempston Joystick (........000.....)
             Z80_SET_DATA(pins, sys->kbd_joymask | sys->joy_joymask);
+        }
+        else if (pins & Z80_RD) {
+            /* Unattached ports on Ferranti ULA machines expose the video bus. */
+            Z80_SET_DATA(pins, (sys->type == ZX_TYPE_48K || sys->type == ZX_TYPE_128)
+                ? _zx_floating_bus_value(sys) : 0xFF);
         }
     }
 

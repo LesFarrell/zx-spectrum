@@ -34,6 +34,8 @@ Spectrum Next, and includes a debugger, an assembler, and a poke tool.
 - Native CPU and frame timing: 3.5 MHz with 69,888 T-states per 48K frame,
   and 3.546894 MHz with 70,908 T-states per 128K-family frame
 - Memory-side ULA contention timing for 48K and 128K RAM accesses
+- Standard-screen floating-bus reads from port `0xFF` during active ULA fetches
+- Selectable standard, early, and late ULA fetch timing variants in the core
 - Keyboard matrix input
 - Selectable Kempston, Sinclair 1, Sinclair 2, and Cursor/Protek/AGF joystick
   interfaces for keyboard and XInput-compatible controller input, plus the
@@ -79,12 +81,13 @@ Spectrum Next, and includes a debugger, an assembler, and a poke tool.
 - A debugger with execution, memory read/write, and port breakpoints,
   conditions, hit counts, step over/out, and breakpoints saved between runs
 - A Z80 and Z80N assembler that writes straight into emulated RAM
+- The bundled cycle-stepped Z80 core passes the available ZEXALL instruction
+  exerciser; the harness is in `tests/run_zexall.c`
 - Eight remembered recent-media paths
 
 ## Not implemented
 
 - 128K SNA snapshots captured with the TR-DOS ROM paged in
-- Floating-bus reads and selectable early/late ULA timing variants
 - Pixel-accurate mid-scanline border and screen changes (the current renderer
   is scanline-granular)
 - SZX machine variants outside the five currently emulated Sinclair models;

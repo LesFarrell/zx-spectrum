@@ -64,7 +64,8 @@ project "zx-spectrum"
         "user32",
         "winmm",
         "ws2_32",
-        "iphlpapi"
+        "iphlpapi",
+        "secur32"
     }
 
     postbuildcommands {
